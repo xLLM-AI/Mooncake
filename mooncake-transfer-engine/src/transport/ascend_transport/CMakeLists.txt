@@ -8,6 +8,10 @@ else ()
 endif ()
 
 add_library(ascend_transport OBJECT ${ASCEND_SOURCES})
+if (USE_ASCEND)
+    target_link_libraries(ascend_transport PRIVATE ascend_transport_mem glog::glog)
+endif ()
+
 
 set_target_properties(ascend_transport
                       PROPERTIES

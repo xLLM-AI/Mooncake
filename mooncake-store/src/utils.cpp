@@ -1,6 +1,6 @@
 #include "utils.h"
 
-#include <Slab.h>
+#include "cachelib_memory_allocator/Slab.h"
 #include <glog/logging.h>
 #include <netinet/in.h>
 #include <sys/socket.h>

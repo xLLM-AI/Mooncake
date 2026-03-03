@@ -20,5 +20,7 @@ include_directories(
 
 # Add subdirectories
 add_subdirectory(src)
-add_subdirectory(tests)
+if (BUILD_UNIT_TESTS)
+  add_subdirectory(tests)
+endif()
 add_subdirectory(benchmarks)

@@ -6,7 +6,7 @@
 #include <optional>
 #include <glog/logging.h>
 
-#include "mutex.h"
+#include "../mutex.h"
 
 namespace mooncake::offset_allocator {
 typedef unsigned char uint8;

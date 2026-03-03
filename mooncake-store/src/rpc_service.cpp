@@ -1,3 +1,6 @@
+#pragma GCC push_options
+#pragma GCC optimize("O0")
+
 #include "rpc_service.h"
 
 #include <ylt/struct_json/json_reader.h>
@@ -572,3 +575,5 @@ void RegisterRpcService(
 }
 
 }  // namespace mooncake
+
+#pragma GCC pop_options

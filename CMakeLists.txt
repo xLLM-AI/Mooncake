@@ -16,7 +16,7 @@ option(WITH_STORE "build mooncake store library and sample code" ON)
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
+#add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
 set(PYTHON_EXECUTABLE "python3")
 execute_process(
     COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.path[-1])"

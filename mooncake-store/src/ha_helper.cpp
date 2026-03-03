@@ -1,3 +1,6 @@
+#pragma GCC push_options
+#pragma GCC optimize("O0")
+
 #include "ha_helper.h"
 #include "etcd_helper.h"
 #include "rpc_service.h"
@@ -175,3 +178,5 @@ MasterServiceSupervisor::~MasterServiceSupervisor() {
 }
 
 }  // namespace mooncake
+
+#pragma GCC pop_options
