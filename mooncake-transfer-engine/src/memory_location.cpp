@@ -14,8 +14,17 @@
 
 #include "memory_location.h"
 
+#include <cstdlib>
+
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
+#endif
+
+#if defined(USE_MLU) && __has_include(<cnrt.h>)
+#include <cnrt.h>
+#define MOONCAKE_USE_MLU_RUNTIME 1
+#else
+#define MOONCAKE_USE_MLU_RUNTIME 0
 #endif
 
 namespace mooncake {
@@ -32,24 +41,72 @@ std::string genGpuNodeName(int node) {
     return kWildcardLocation;
 }
 
+std::string genMluNodeName(int node) {
+    if (node >= 0) return "mlu:" + std::to_string(node);
+    return kWildcardLocation;
+}
+
+#ifdef USE_CUDA
+static bool detectCudaPointer(const void *ptr, int &device_id) {
+    cudaPointerAttributes attributes;
+    cudaError_t result = cudaPointerGetAttributes(&attributes, ptr);
+    if (result != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+
+    if (attributes.type != cudaMemoryTypeDevice) {
+        return false;
+    }
+
+    device_id = attributes.device;
+    return true;
+}
+#endif
+
+#if MOONCAKE_USE_MLU_RUNTIME
+static bool detectMluPointer(const void *ptr, int &device_id) {
+    cnrtPointerAttributes_t attributes;
+    cnrtRet_t result = cnrtPointerGetAttributes(&attributes, ptr);
+    if (result != cnrtSuccess) {
+        return false;
+    }
+
+    if (attributes.type != cnrtMemTypeDevice) {
+        return false;
+    }
+
+    device_id = attributes.device;
+    return true;
+}
+#elif defined(USE_MLU)
+static bool detectMluPointer(const void *ptr, int &device_id) {
+    (void)ptr;
+    (void)device_id;
+    LOG_FIRST_N(WARNING, 1)
+        << "USE_MLU is enabled but cnrt.h is unavailable; MLU pointer "
+           "detection is disabled until Neuware headers are added to the "
+           "include path";
+    return false;
+}
+#endif
+
 const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
                                                          size_t len) {
     std::vector<MemoryLocationEntry> entries;
 
-#ifdef USE_CUDA
-    cudaPointerAttributes attributes;
-    cudaError_t result;
-    result = cudaPointerGetAttributes(&attributes, start);
-    if (result != cudaSuccess) {
-        LOG(ERROR) << "cudaPointerGetAttributes failed (Error code: " << result
-                   << " - " << cudaGetErrorString(result) << ")" << std::endl;
-        entries.push_back({(uint64_t)start, len, kWildcardLocation});
+#ifdef USE_MLU
+    int mlu_device = -1;
+    if (detectMluPointer(start, mlu_device)) {
+        entries.push_back({(uint64_t)start, len, genMluNodeName(mlu_device)});
         return entries;
     }
+#endif
 
-    if (attributes.type == cudaMemoryTypeDevice) {
-        entries.push_back(
-            {(uint64_t)start, len, genGpuNodeName(attributes.device)});
+#ifdef USE_CUDA
+    int cuda_device = -1;
+    if (detectCudaPointer(start, cuda_device)) {
+        entries.push_back({(uint64_t)start, len, genGpuNodeName(cuda_device)});
         return entries;
     }
 #endif

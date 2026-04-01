@@ -1,6 +1,11 @@
 add_executable(rdma_transport_test rdma_transport_test.cpp)
-target_link_libraries(rdma_transport_test PUBLIC transfer_engine)
+target_link_libraries(rdma_transport_test PUBLIC transfer_engine gflags::gflags glog::glog)
 # add_test(NAME rdma_transport_test COMMAND rdma_transport_test)
+
+if (USE_MLU)
+    add_executable(rdma_transport_mlu_test rdma_transport_mlu_test.cpp)
+    target_link_libraries(rdma_transport_mlu_test PUBLIC transfer_engine gflags::gflags glog::glog)
+endif()
 
 add_executable(transport_uint_test transport_uint_test.cpp)
 target_link_libraries(transport_uint_test PUBLIC transfer_engine gtest gtest_main )

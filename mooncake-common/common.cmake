@@ -57,6 +57,7 @@ option(BUILD_EXAMPLES "Build examples" ON)
 
 option(BUILD_UNIT_TESTS "Build unit tests" ON)
 option(USE_CUDA "option for enabling gpu features" OFF)
+option(USE_MLU "option for enabling Cambricon MLU features" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_ASCEND "option for using npu with HCCL" OFF)
@@ -102,6 +103,23 @@ if (USE_CUDA)
     /usr/local/cuda/lib
     /usr/local/cuda/lib64
   )
+endif()
+
+if (NOT DEFINED NEUWARE_ROOT OR NEUWARE_ROOT STREQUAL "")
+  if (DEFINED ENV{NEUWARE_HOME} AND NOT "$ENV{NEUWARE_HOME}" STREQUAL "")
+    set(NEUWARE_ROOT "$ENV{NEUWARE_HOME}" CACHE PATH "Path to Cambricon Neuware SDK" FORCE)
+  else()
+    set(NEUWARE_ROOT "/usr/local/neuware" CACHE PATH "Path to Cambricon Neuware SDK" FORCE)
+  endif()
+endif()
+
+if (USE_MLU)
+  add_compile_definitions(USE_MLU)
+  message(STATUS "MLU support is enabled")
+  include_directories(${NEUWARE_ROOT}/include)
+  if (EXISTS "${NEUWARE_ROOT}/lib64")
+    link_directories(${NEUWARE_ROOT}/lib64)
+  endif()
 endif()
 
 if (USE_CXL)

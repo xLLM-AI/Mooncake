@@ -18,6 +18,14 @@
 #include <cuda.h>
 #endif
 
+#if defined(USE_MLU) && __has_include(<cnrt.h>) && __has_include(<cn_api.h>)
+#include <cn_api.h>
+#include <cnrt.h>
+#define MOONCAKE_USE_MLU_RUNTIME 1
+#else
+#define MOONCAKE_USE_MLU_RUNTIME 0
+#endif
+
 #include <fcntl.h>
 #include <sys/epoll.h>
 
@@ -205,7 +213,51 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
         length = (size_t)globalConfig().max_mr_size;
     }
 
-    MemoryRegionMeta mrMeta;
+    MemoryRegionMeta mrMeta{.addr = addr, .mr = nullptr};
+#if MOONCAKE_USE_MLU_RUNTIME
+    cnrtPointerAttributes_t mlu_attributes;
+    cnrtRet_t mlu_ret = cnrtPointerGetAttributes(&mlu_attributes, addr);
+    if (mlu_ret == cnrtSuccess) {
+        if (mlu_attributes.type == cnrtMemTypeDevice) {
+            int dmabuf_fd = -1;
+            CNresult result = cnMemGetHandleForAddressRange(
+                &dmabuf_fd, reinterpret_cast<CNaddr>(addr), mlu_attributes.size,
+                CN_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+            if (result != CN_SUCCESS) {
+                LOG(ERROR) << "Failed to retrieve MLU dmabuf for "
+                           << reinterpret_cast<uintptr_t>(addr)
+                           << ", CN error=" << result;
+                return ERR_CONTEXT;
+            }
+            mrMeta.addr = addr;
+            mrMeta.mr = ibv_reg_dmabuf_mr(pd_, 0 /* offset */, length,
+                                          reinterpret_cast<uintptr_t>(addr),
+                                          dmabuf_fd, access);
+        } else if (mlu_attributes.type == cnrtMemTypeHost) {
+            mrMeta.addr = addr;
+            mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+        }
+    } else if (mlu_ret != cnrtErrorArgsInvalid &&
+               mlu_ret != cnrtErrorNotSupport &&
+               mlu_ret != cnrtErrorCndrvFuncCall) {
+        LOG(WARNING) << "cnrtPointerGetAttributes failed for "
+                     << reinterpret_cast<uintptr_t>(addr)
+                     << ", cnrt error=" << mlu_ret
+                     << "; falling back to non-MLU registration";
+    }
+
+    if (mrMeta.mr) {
+        RWSpinlock::WriteGuard guard(memory_regions_lock_);
+        memory_region_list_.push_back(mrMeta);
+        return 0;
+    }
+#elif defined(USE_MLU)
+    LOG_FIRST_N(WARNING, 1)
+        << "USE_MLU is enabled but cnrt/cn_api headers are unavailable; "
+           "MLU dmabuf registration is disabled until Neuware headers are "
+           "added to the include path";
+#endif
+
 #if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
     // Implement register memory in a way that does not assume the presence of
     // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory

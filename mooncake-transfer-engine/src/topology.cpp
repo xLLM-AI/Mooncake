@@ -14,6 +14,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -24,6 +25,13 @@
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
+#endif
+
+#if defined(USE_MLU) && __has_include(<cnrt.h>)
+#include <cnrt.h>
+#define MOONCAKE_USE_MLU_RUNTIME 1
+#else
+#define MOONCAKE_USE_MLU_RUNTIME 0
 #endif
 
 #include <ctype.h>
@@ -43,6 +51,12 @@ struct InfinibandDevice {
     std::string pci_bus_id;
     int numa_node;
 };
+
+static void normalizePciBusId(std::string &pci_bus_id) {
+    std::transform(
+        pci_bus_id.begin(), pci_bus_id.end(), pci_bus_id.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+}
 
 static std::vector<InfinibandDevice> listInfiniBandDevices(
     const std::vector<std::string> &filter) {
@@ -78,6 +92,7 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
             continue;
         }
         std::string pci_bus_id = basename(resolved_path);
+        normalizePciBusId(pci_bus_id);
 
         int numa_node = -1;
         snprintf(path, sizeof(path), "%s/numa_node", resolved_path);
@@ -128,8 +143,7 @@ static std::vector<TopologyEntry> discoverCpuTopology(
     return topology;
 }
 
-#ifdef USE_CUDA
-
+#if defined(USE_CUDA) || defined(USE_MLU)
 static int getPciDistance(const char *bus1, const char *bus2) {
     char buf[PATH_MAX];
     char path1[PATH_MAX];
@@ -160,6 +174,64 @@ static int getPciDistance(const char *bus1, const char *bus2) {
     return distance;
 }
 
+static TopologyEntry buildPciAwareTopologyEntry(
+    const std::string &name, std::string pci_bus_id,
+    const std::vector<InfinibandDevice> &all_hca) {
+    std::vector<std::string> preferred_hca;
+    std::vector<std::string> avail_hca;
+
+    if (pci_bus_id.empty()) {
+        for (const auto &hca : all_hca) {
+            avail_hca.push_back(hca.name);
+        }
+        return TopologyEntry{.name = name,
+                             .preferred_hca = std::move(preferred_hca),
+                             .avail_hca = std::move(avail_hca)};
+    }
+
+    normalizePciBusId(pci_bus_id);
+
+    int min_distance = INT_MAX;
+    std::vector<std::string> min_distance_hcas;
+    for (const auto &hca : all_hca) {
+        int distance = getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id.c_str());
+        if (distance < 0) {
+            continue;
+        }
+        if (distance < min_distance) {
+            min_distance = distance;
+            min_distance_hcas.clear();
+            min_distance_hcas.push_back(hca.name);
+        } else if (distance == min_distance) {
+            min_distance_hcas.push_back(hca.name);
+        }
+    }
+
+    if (min_distance == INT_MAX) {
+        for (const auto &hca : all_hca) {
+            avail_hca.push_back(hca.name);
+        }
+        return TopologyEntry{.name = name,
+                             .preferred_hca = std::move(preferred_hca),
+                             .avail_hca = std::move(avail_hca)};
+    }
+
+    for (const auto &hca : all_hca) {
+        if (std::find(min_distance_hcas.begin(), min_distance_hcas.end(),
+                      hca.name) != min_distance_hcas.end()) {
+            preferred_hca.push_back(hca.name);
+        } else {
+            avail_hca.push_back(hca.name);
+        }
+    }
+
+    return TopologyEntry{.name = name,
+                         .preferred_hca = std::move(preferred_hca),
+                         .avail_hca = std::move(avail_hca)};
+}
+#endif
+
+#ifdef USE_CUDA
 static std::vector<TopologyEntry> discoverCudaTopology(
     const std::vector<InfinibandDevice> &all_hca) {
     std::vector<TopologyEntry> topology;
@@ -173,46 +245,50 @@ static std::vector<TopologyEntry> discoverCudaTopology(
             cudaSuccess) {
             continue;
         }
-        for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
-
-        std::vector<std::string> preferred_hca;
-        std::vector<std::string> avail_hca;
-
-        // Find HCAs with minimum distance in one pass
-        int min_distance = INT_MAX;
-        std::vector<std::string> min_distance_hcas;
-
-        for (const auto &hca : all_hca) {
-            int distance = getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id);
-            if (distance >= 0) {
-                if (distance < min_distance) {
-                    min_distance = distance;
-                    min_distance_hcas.clear();
-                    min_distance_hcas.push_back(hca.name);
-                } else if (distance == min_distance) {
-                    min_distance_hcas.push_back(hca.name);
-                }
-            }
-        }
-
-        // Add HCAs with minimum distance to preferred_hca, others to avail_hca
-        for (const auto &hca : all_hca) {
-            if (std::find(min_distance_hcas.begin(), min_distance_hcas.end(),
-                          hca.name) != min_distance_hcas.end()) {
-                preferred_hca.push_back(hca.name);
-            } else {
-                avail_hca.push_back(hca.name);
-            }
-        }
-        topology.push_back(
-            TopologyEntry{.name = "cuda:" + std::to_string(i),
-                          .preferred_hca = std::move(preferred_hca),
-                          .avail_hca = std::move(avail_hca)});
+        topology.push_back(buildPciAwareTopologyEntry(
+            "cuda:" + std::to_string(i), pci_bus_id, all_hca));
     }
     return topology;
 }
-
 #endif  // USE_CUDA
+
+#if MOONCAKE_USE_MLU_RUNTIME
+static std::vector<TopologyEntry> discoverMluTopology(
+    const std::vector<InfinibandDevice> &all_hca) {
+    std::vector<TopologyEntry> topology;
+    unsigned int device_count = 0;
+    if (cnrtGetDeviceCount(&device_count) != cnrtSuccess) {
+        return topology;
+    }
+
+    for (unsigned int i = 0; i < device_count; ++i) {
+        char pci_bus_id[32] = {0};
+        if (cnrtDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), i) !=
+            cnrtSuccess) {
+            LOG(WARNING) << "discoverMluTopology: failed to get PCI bus ID for "
+                         << "mlu:" << i
+                         << ", falling back to all HCAs as available";
+            topology.push_back(buildPciAwareTopologyEntry(
+                "mlu:" + std::to_string(i), "", all_hca));
+            continue;
+        }
+
+        topology.push_back(buildPciAwareTopologyEntry(
+            "mlu:" + std::to_string(i), pci_bus_id, all_hca));
+    }
+    return topology;
+}
+#elif defined(USE_MLU)
+static std::vector<TopologyEntry> discoverMluTopology(
+    const std::vector<InfinibandDevice> &all_hca) {
+    (void)all_hca;
+    LOG_FIRST_N(WARNING, 1)
+        << "USE_MLU is enabled but cnrt.h is unavailable; MLU topology "
+           "discovery is disabled until Neuware headers are added to the "
+           "include path";
+    return {};
+}
+#endif
 
 Topology::Topology() {}
 
@@ -242,6 +318,11 @@ int Topology::discover(const std::vector<std::string> &filter) {
     }
 #ifdef USE_CUDA
     for (auto &ent : discoverCudaTopology(all_hca)) {
+        matrix_[ent.name] = ent;
+    }
+#endif
+#ifdef USE_MLU
+    for (auto &ent : discoverMluTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
 #endif
