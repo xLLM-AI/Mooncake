@@ -268,7 +268,7 @@ endif()
 
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
-add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
+add_library(mooncake_store STATIC ${MOONCAKE_STORE_SOURCES})
 if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
 endif()

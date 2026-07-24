@@ -184,8 +184,10 @@ class SCOPED_CAPABILITY MutexLocker {
 };
 
 // Tag types for selecting a constructor.
+namespace mooncake {
 struct shared_lock_t {
 } inline constexpr shared_lock = {};
+}
 
 // SharedMutexLocker is an RAII class that acquires a shared mutex in its
 // constructor, and releases it in its destructor.
@@ -205,7 +207,7 @@ class SCOPED_CAPABILITY SharedMutexLocker {
     }
 
     // Constructor: Acquire the mutex in shared mode
-    SharedMutexLocker(SharedMutex* mu, const shared_lock_t&) ACQUIRE_SHARED(mu)
+    SharedMutexLocker(SharedMutex* mu, const mooncake::shared_lock_t&) ACQUIRE_SHARED(mu)
         : mut(mu), is_exclusive(false), locked(true) {
         if (mut) {
             mut->lock_shared();

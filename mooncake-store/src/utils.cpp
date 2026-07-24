@@ -4,7 +4,7 @@
 #include "common.h"
 #include "ub_allocator.h"
 
-#include <Slab.h>
+#include "cachelib_memory_allocator/Slab.h"
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <ifaddrs.h>

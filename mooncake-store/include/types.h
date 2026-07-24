@@ -11,7 +11,10 @@
 #include <utility>
 #include <vector>
 
-#include "Slab.h"
+#include "cachelib_memory_allocator/Slab.h"
+namespace iguana {
+using std::contiguous_iterator;
+}
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
 #include "ylt/struct_pack.hpp"

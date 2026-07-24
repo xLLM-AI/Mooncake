@@ -50,7 +50,7 @@ set_target_properties(asio_shared PROPERTIES
 
 target_link_libraries(asio_shared PUBLIC pthread)
 
-add_library(mooncake_common
+add_library(mooncake_common STATIC
     ${MOONCAKE_COMMON_SOURCES}
 )
 
@@ -61,7 +61,8 @@ target_include_directories(mooncake_common PUBLIC
 
 target_link_libraries(mooncake_common PUBLIC
     yaml-cpp
-    jsoncpp
+    JsonCpp::JsonCpp
+    yalantinglibs::yalantinglibs
 )
 
 if (BUILD_SHARED_LIBS)

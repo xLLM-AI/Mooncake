@@ -22,7 +22,7 @@ if (USE_ASCEND_DIRECT OR USE_UBSHMEM)
     else()
         message(WARNING "Acl runtime header file is not exist")
     endif()
-    add_library(ascend_transport SHARED ${ASCEND_SOURCES})
+    add_library(ascend_transport STATIC ${ASCEND_SOURCES})
     find_library(
             FOUND_METADEF
             NAMES libmetadef.so

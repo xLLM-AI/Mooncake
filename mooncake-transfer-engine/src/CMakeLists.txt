@@ -10,7 +10,7 @@ if(USE_HIP)
   hipify_files(ENGINE_SOURCES)
 endif()
 
-add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+add_library(transfer_engine STATIC ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
 if(BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
