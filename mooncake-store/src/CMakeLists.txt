@@ -462,7 +462,7 @@ endif()
 
 # Complete public Store library.
 add_library(
-  mooncake_store
+  mooncake_store STATIC
   $<TARGET_OBJECTS:mooncake_store_shared_objects>
   $<TARGET_OBJECTS:mooncake_store_master_objects>
   $<TARGET_OBJECTS:mooncake_store_client_objects>)
@@ -589,9 +589,8 @@ if(WITH_STORE_C_SHARED)
                         "(got CMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}).")
   endif()
 
-  # We whole-archive mooncake_store and reuse its name, so require it to be
-  # static (add_library(mooncake_store) follows BUILD_SHARED_LIBS, which some
-  # backends force ON).
+  # We whole-archive mooncake_store and reuse its name, so require it to remain
+  # static.
   get_target_property(_mooncake_store_type mooncake_store TYPE)
   if(NOT _mooncake_store_type STREQUAL "STATIC_LIBRARY")
     message(

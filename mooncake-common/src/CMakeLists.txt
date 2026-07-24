@@ -40,7 +40,7 @@ if(WITH_STORE_C_SHARED)
   target_link_libraries(asio_static PUBLIC pthread)
 endif()
 
-add_library(mooncake_common ${MOONCAKE_COMMON_SOURCES})
+add_library(mooncake_common STATIC ${MOONCAKE_COMMON_SOURCES})
 
 target_include_directories(
   mooncake_common

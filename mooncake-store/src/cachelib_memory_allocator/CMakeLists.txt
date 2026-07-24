@@ -9,5 +9,7 @@ add_library(
 target_include_directories(
   cachelib_memory_allocator
   PUBLIC ${MOONCAKE_STORE_INCLUDE_ROOT}/cachelib_memory_allocator
-         ${MOONCAKE_STORE_INCLUDE_ROOT}/cachelib_memory_allocator/include
          ${MOONCAKE_STORE_INCLUDE_ROOT}/cachelib_memory_allocator/fake_include)
+target_include_directories(
+  cachelib_memory_allocator
+  PRIVATE ${MOONCAKE_STORE_INCLUDE_ROOT}/cachelib_memory_allocator/include)

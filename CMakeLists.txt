@@ -38,11 +38,13 @@ option(MOONCAKE_ENABLE_OPLOG_PERF_METRICS
        "Enable detailed batch OpLog performance metrics" OFF)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
-if(SKBUILD)
-  set(PYBIND11_FINDPYTHON ON)
-  find_package(pybind11 CONFIG REQUIRED)
-else()
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
+if(NOT TARGET pybind11::headers)
+  if(SKBUILD)
+    set(PYBIND11_FINDPYTHON ON)
+    find_package(pybind11 CONFIG REQUIRED)
+  else()
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
+  endif()
 endif()
 execute_process(
   COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.path[-1])"
