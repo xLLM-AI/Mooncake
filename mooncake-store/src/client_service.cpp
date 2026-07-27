@@ -1649,7 +1649,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         return tl::unexpected(finalize_decision.error);
     }
 
-    // === HA rebuild: account by owner (impl doc §2.2) ===
+    // === HA rebuild: account by owner ===
     // A replica landing on our own segment -> record locally (we are the owner).
     // A replica landing on someone else's segment -> notify that owner.
     {
@@ -1677,7 +1677,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 }
 
 // ===========================================================================
-// HA rebuild: client-side local replica table helpers (impl doc §2.6/§2.2)
+// HA rebuild: client-side local replica table helpers
 // ===========================================================================
 
 void Client::EraseByAddressLocked(uint64_t addr) {
@@ -1721,7 +1721,7 @@ bool Client::IsMyEndpoint(const std::string& ep) {
     return false;
 }
 
-// --- notify send (impl doc §2.7) ---------------------------------------------
+// --- notify send ------------------------------------------------------------
 // Tell the segment owner at `ep` "I stored `key` on your segment" with full
 // metadata, over the TE control-plane notify channel (not one-sided RDMA).
 void Client::NotifyOwnerUpsert(const std::string& ep, const std::string& key,
@@ -1739,7 +1739,7 @@ void Client::NotifyOwnerUpsert(const std::string& ep, const std::string& key,
     std::vector<KeyReplicaEntry> entries{std::move(e)};
     // Reliability: if the send fails (peer flapping / not yet up), park it for
     // the background loop to retry, so a dropped notify never silently loses a
-    // replica (design doc §9.5.7 risk #1).
+    // replica.
     if (!SendUpsertNotify(ep, entries)) {
         ParkPendingNotify(ep, entries);
     }
@@ -1802,7 +1802,7 @@ void Client::NotifyOwnerUpsertBatch(
     }
 }
 
-// --- notify receive loop (impl doc §2.8) -------------------------------------
+// --- notify receive loop -----------------------------------------------------
 // Poll getNotifies(), decode UPSERT entries, apply via RecordLocalReplica
 // (which does the address-overwrite that lazy-delete correctness depends on).
 void Client::RebuildNotifyLoop() {
@@ -1830,7 +1830,7 @@ void Client::RebuildNotifyLoop() {
     }
 }
 
-// --- reconnect resend (impl doc §2.6) ----------------------------------------
+// --- reconnect resend --------------------------------------------------------
 // On reconnect, snapshot the local table and resend it (batched) to the empty
 // new master via the RebuildMetadata RPC.
 void Client::ResendLocalReplicaTable() {
@@ -2013,7 +2013,7 @@ class PutOperation {
     std::vector<Slice> slices;
     std::vector<std::vector<Slice>> batched_slices;
 
-    // === HA rebuild: per-key metadata for local-table accounting (§2.3) ===
+    // === HA rebuild: per-key metadata for local-table accounting ===
     // PutOperation itself has no size/data_type/group_id/tenant_id; filled in
     // StartBatchPut/StartBatchUpsert from config + slice lengths.
     uint64_t meta_size{0};
@@ -2549,7 +2549,7 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         }
         if (should_succeed[i]) {
             op.SetSuccess();
-            // === HA rebuild: account by owner (impl doc §2.3) ===
+            // === HA rebuild: account by owner ===
             for (const auto& replica : op.replicas) {
                 if (!replica.is_memory_replica()) continue;
                 const std::string& ep = replica.get_memory_descriptor()

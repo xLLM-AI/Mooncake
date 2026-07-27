@@ -4,7 +4,7 @@
 // 目标:验证新方案——master 挂掉重启后,client 把持有的 key→location 元数据
 //       重发给新 master,重建完整元数据,实现零重算恢复。
 //
-// 6 个测试(覆盖矩阵见权威文档 §11.3.1):
+// 6 个测试:
 //   测试1 RebuildObjectMetadataAfterMasterRestart —— 核心重建(单client自记账,步骤1-3)
 //   测试2 RebuiltMetadataPointsToRealData         —— 防假恢复,逐字节比对(单client)
 //   测试3 LazyDelete_RemovedButNotReused_MayRevive —— 惰性删语义:删了未复用可复活(数据仍对)
@@ -17,7 +17,7 @@
 //   master 重启后 B 重建。你的新程序是多 client 的,测试4 才是主力验证。
 //   测试1/2/3 全绿 ≠ 方案完全正确(它们不触发 notify);测试4 才覆盖 notify 核心路径。
 //
-// ⚠️ 前提:这些测试要真正通过,依赖新方案代码已实现(见实现文档):
+// ⚠️ 前提:这些测试要真正通过,依赖新方案代码已实现:
 //     - client:local_replica_table_ 成员 + Put/BatchPut 记账 + Remove 清理
 //               + 重连重发 RebuildMetadata + (跨段场景) notify 收发。
 //     - master:RebuildMetadata RPC + DescriptorToReplica + 落库。
@@ -291,7 +291,7 @@ TEST_F(ClientMetadataRebuildTest, LazyDelete_RemovedButNotReused_MayRevive) {
 //   - clientA: 只 RegisterLocalMemory(本地读写缓冲),【不 MountSegment】。
 //   → PutStart 时全局池只有 B 段,数据【确定性】落 B,不 flaky。
 //
-// ⚠️ 依赖 notify 收发已实现(实现文档 2.7/2.8)。notify 未实现时:数据在 B、A 本地表
+// ⚠️ 依赖 notify 收发已实现。notify 未实现时:数据在 B、A 本地表
 //    没有这些 key、B 也没被通知 → 重启后没人重发 → 测试红。这正是"测到了 notify"的证据。
 // ⚠️ 用独立 fixture(自己起 A、B),不复用单 client 的 ClientMetadataRebuildTest。
 class ClientCrossNotifyTest : public ::testing::Test {
@@ -389,7 +389,7 @@ TEST_F(ClientCrossNotifyTest, CrossClientRebuildViaNotify) {
 }
 
 // ---------------------------------------------------------------------------
-// 测试7(notify 可靠性兜底,§9.5.7 风险#1):notify 发送失败不能静默丢 —— 失败的
+// 测试7(notify 可靠性兜底):notify 发送失败不能静默丢 —— 失败的
 // notify 挂进 pending 队列,由后台线程重试补发,直到对端收到。若无兜底,一条丢失的
 // notify 会导致 owner 漏记一份副本,master 重建时冗余静默丢失。
 // ---------------------------------------------------------------------------
@@ -461,12 +461,12 @@ TEST_F(ClientCrossNotifyTest, NotifyRetryBackstopRedeliversDroppedNotify) {
 // ---------------------------------------------------------------------------
 // 测试5(地址复用覆盖,惰性删的核心正确性保证):删除后空间被新 key 复用,
 // 重建时被删 key 不应"复活"并指向已被新 key 占用的地址(否则静默数据损坏)。
-// 对应权威文档 9.5.1。惰性删下这是【必须保证】的正确性(测试3 那种"未复用可复活"可接受,
+// 惰性删下这是【必须保证】的正确性(测试3 那种"未复用可复活"可接受,
 // 但"复用后旧 key 还在"绝不可接受)。
 // ---------------------------------------------------------------------------
 // 原理:key_A 删除(惰性删:client 本地表【不动】)→ 其段内空间进 allocator freelist →
 //      后续 Put 复用同一地址。记账时必须【按地址覆盖】——用新 key 清掉本地表里指向同一
-//      (段,地址) 的 key_A 旧条目(实现文档 §2.6 RecordLocalReplica 内置 EraseByAddressLocked)。
+//      (段,地址) 的 key_A 旧条目(RecordLocalReplica 内置 EraseByAddressLocked)。
 //      本用例是【单 client 自 Put 落自己段】,走 RecordLocalReplica 的自覆盖路径(不发 notify);
 //      跨 client 场景(A 写 B 段)则由 UPSERT notify 触发 B 侧同一套 RecordLocalReplica 覆盖。
 //      若没做地址覆盖,重启重发会把 key_A→旧地址报上去,而该地址已装新 key 数据 → 静默损坏。
@@ -521,7 +521,8 @@ TEST_F(ClientMetadataRebuildTest, RemovedKeySpaceReuseNoStaleMapping) {
 // ---------------------------------------------------------------------------
 // 测试6(多副本合并,replica_num=2):同一 key 的两份副本落在【不同段】(不同 client),
 // 由各自 owner 分别重发;master 重建时必须【合并】成"该 key 有 2 份副本",而非只保留一份。
-// 对应实现文档 §4(RebuildMetadata 已存在 key 走合并分支,而非 continue 跳过)。
+// master 重建时必须【合并】成"该 key 有 2 份副本",而非只保留一份
+// (RebuildMetadata 已存在 key 走合并分支,而非 continue 跳过)。
 // ---------------------------------------------------------------------------
 // ⚠️ 这是"多副本冗余恢复"的唯一测试(其余测试全 replica_num=1,走不到合并分支)。
 // 前提:两个 client 都 MountSegment(才有两个不同段供 replica_num=2 分散);

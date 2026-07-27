@@ -1,5 +1,4 @@
 // HA metadata rebuild: shared types for client<->master metadata rebuild.
-// See design doc Mooncake-HA-Client重建方案-权威文档.md and impl doc §1.
 #pragma once
 
 #include <cstdint>
