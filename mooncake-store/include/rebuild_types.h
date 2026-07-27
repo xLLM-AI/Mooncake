@@ -24,7 +24,8 @@ struct LocalReplicaMeta {
 };
 
 // One key's rebuild entry: key + its replica location(s). Descriptor is already
-// serializable (YLT_REFL at replica.h:477), so it travels over RPC/notify as-is.
+// serializable (YLT_REFL at replica.h:477), so it travels over RPC/notify
+// as-is.
 struct KeyReplicaEntry {
     std::string key;
     std::string tenant_id{"default"};

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live HA recovery test (乙方案 / out-of-process):
+# Live HA recovery test (out-of-process):
 #   Drives ha_recovery_live_main against a REAL, separate mooncake_master
 #   PROCESS. Verifies that after the master is killed and restarted on the same
 #   port, the standalone client re-registers its held key->location metadata so

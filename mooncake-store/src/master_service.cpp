@@ -951,10 +951,12 @@ std::optional<Replica> MasterService::DescriptorToReplica(
                     return std::nullopt;
                 }
                 // Method-1 (allocate-placeholder + rebind addr) is only safe on
-                // OffsetBufferAllocator (deallocate frees via offset_handle, not
-                // buffer_ptr). Cachelib would double-free -> refuse for now.
+                // OffsetBufferAllocator (deallocate frees via offset_handle,
+                // not buffer_ptr). Cachelib would double-free -> refuse for
+                // now.
                 auto offset_alloc =
-                    std::dynamic_pointer_cast<OffsetBufferAllocator>(base_alloc);
+                    std::dynamic_pointer_cast<OffsetBufferAllocator>(
+                        base_alloc);
                 if (!offset_alloc) {
                     LOG(WARNING) << "rebuild: segment allocator is not "
                                     "OffsetBufferAllocator; skip key rebuild";
@@ -1001,16 +1003,17 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
         if (!ok || replicas.empty()) continue;  // skip this key, keep the rest
 
         // (b) Insert or MERGE (multi-replica redundancy recovery).
-        const std::string tenant = e.tenant_id.empty() ? "default" : e.tenant_id;
+        const std::string tenant =
+            e.tenant_id.empty() ? "default" : e.tenant_id;
         const ObjectIdentity oid{tenant, e.key};
         MetadataAccessorRW accessor(this, oid);
         if (!accessor.Exists()) {
             accessor.Create(client_id, e.size, std::move(replicas),
-                            /*enable_soft_pin=*/false, /*enable_hard_pin=*/false,
-                            e.data_type, e.group_id);
+                            /*enable_soft_pin=*/false,
+                            /*enable_hard_pin=*/false, e.data_type, e.group_id);
         } else {
-            // Another owner already reported this key (replica_num>1): merge the
-            // incoming replica(s) instead of dropping them, de-duping by
+            // Another owner already reported this key (replica_num>1): merge
+            // the incoming replica(s) instead of dropping them, de-duping by
             // (endpoint,address).
             auto& meta = accessor.Get();
             for (auto& r : replicas) {

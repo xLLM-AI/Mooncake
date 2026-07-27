@@ -287,9 +287,10 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::AllocateForRebuild(
     }
     std::unique_ptr<AllocatedBuffer> allocated_buffer = nullptr;
     try {
-        // Allocate to obtain a legit ownership handle (correct accounting + safe
-        // RAII deallocation). We DISCARD the allocator's self-chosen address and
-        // instead point the buffer at `real_addr` (the client's actual address).
+        // Allocate to obtain a legit ownership handle (correct accounting +
+        // safe RAII deallocation). We DISCARD the allocator's self-chosen
+        // address and instead point the buffer at `real_addr` (the client's
+        // actual address).
         auto allocation_handle = offset_allocator_->allocate(size);
         if (!allocation_handle) {
             VLOG(1) << "rebuild_allocation_failed size=" << size
@@ -297,13 +298,14 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::AllocateForRebuild(
                     << " current_size=" << cur_size_;
             return nullptr;
         }
-        // Data address = client's real address; ownership handle = the legit one
-        // just allocated. deallocate() only touches the handle + size, never the
-        // data address, so this is safe.
+        // Data address = client's real address; ownership handle = the legit
+        // one just allocated. deallocate() only touches the handle + size,
+        // never the data address, so this is safe.
         allocated_buffer = std::make_unique<AllocatedBuffer>(
             shared_from_this(), real_addr, size, std::move(allocation_handle));
         VLOG(1) << "rebuild_allocation_succeeded size=" << size
-                << " segment=" << segment_name_ << " real_address=" << real_addr;
+                << " segment=" << segment_name_
+                << " real_address=" << real_addr;
     } catch (const std::exception& e) {
         LOG(ERROR) << "rebuild_allocation_exception error=" << e.what();
         return nullptr;
