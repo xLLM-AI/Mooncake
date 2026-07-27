@@ -299,7 +299,7 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::AllocateForRebuild(
         }
         // Data address = client's real address; ownership handle = the legit one
         // just allocated. deallocate() only touches the handle + size, never the
-        // data address, so this is safe (see impl doc §4.1).
+        // data address, so this is safe.
         allocated_buffer = std::make_unique<AllocatedBuffer>(
             shared_from_this(), real_addr, size, std::move(allocation_handle));
         VLOG(1) << "rebuild_allocation_succeeded size=" << size

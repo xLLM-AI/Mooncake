@@ -216,7 +216,7 @@ class OffsetBufferAllocator
     // HA rebuild: allocate `size` to obtain a legit ownership handle (correct
     // accounting + safe deallocation), but point the buffer's data address at
     // `real_addr` (the client's actual address where data physically lives).
-    // The self-chosen allocate address is discarded. See impl doc §4.1.
+    // The self-chosen allocate address is discarded.
     std::unique_ptr<AllocatedBuffer> AllocateForRebuild(size_t size,
                                                         void* real_addr);
 

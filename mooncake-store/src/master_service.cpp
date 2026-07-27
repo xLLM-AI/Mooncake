@@ -901,7 +901,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
 }
 
 // ===========================================================================
-// HA rebuild: master side (impl doc §4/§4.0/§4.1)
+// HA rebuild: master side
 // ===========================================================================
 
 namespace {

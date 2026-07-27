@@ -822,7 +822,7 @@ class MasterService {
    private:
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
 
-    // === HA rebuild helpers (impl doc §4/§4.0/§4.1) ===
+    // === HA rebuild helpers ===
     // Convert a serializable Replica::Descriptor back into a holding Replica.
     // The hard part is MEMORY type: it needs the owning segment's allocator,
     // looked up by the descriptor's transport_endpoint_. Returns nullopt on
@@ -1424,7 +1424,7 @@ class MasterService {
 
     // HA rebuild: is a replica with the same (endpoint,address) already present
     // in meta? Declared here (after ObjectMetadata is defined) because it takes
-    // const ObjectMetadata&. Impl doc §4.0.
+    // const ObjectMetadata&.
     bool ReplicaAlreadyPresent(const ObjectMetadata& meta,
                                const Replica& r) const;
 

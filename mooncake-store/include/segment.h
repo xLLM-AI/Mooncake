@@ -243,7 +243,7 @@ class ScopedSegmentAccess {
     // client reports by (te_endpoint, buffer_address). endpoint alone is
     // ambiguous (same host -> shared endpoint, 1:N), so disambiguate by
     // requiring buffer_address in [segment.base, base+size). Returns nullptr if
-    // no OK-status segment matches. See impl doc §4.1.
+    // no OK-status segment matches.
     std::shared_ptr<BufferAllocatorBase> FindAllocatorByEndpointAndAddr(
         const std::string& te_endpoint, uintptr_t buffer_address) const;
 

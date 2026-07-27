@@ -68,7 +68,7 @@ class Client {
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
 
-    // --- test-only helpers for the notify-reliability backstop (§9.5.7) ---
+    // --- test-only helpers for the notify-reliability backstop ---
     // Number of endpoints with parked (failed, awaiting-retry) notifies.
     size_t PendingNotifyBucketCountForTest() const {
         std::lock_guard<std::mutex> lk(pending_notifies_mutex_);
@@ -801,7 +801,7 @@ class Client {
         std::unordered_map<std::string, std::vector<Slice>>& slices);
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
 
-    // === HA rebuild: client-side helpers (impl in client_service.cpp §2.6-2.8) ===
+    // === HA rebuild: client-side helpers (impl in client_service.cpp) ===
     // Record a replica physically located in this client's own segment. Called
     // both when this client Put()s onto its own segment and when an UPSERT notify
     // arrives. Internally address-overwrites the stale key at the same address.
@@ -873,7 +873,7 @@ class Client {
     // Reliability backstop: UPSERT notifies whose send failed (peer flapping /
     // not yet up) are parked here keyed by target endpoint, and re-sent by
     // RebuildNotifyLoop each tick until they succeed. Guards against silent
-    // multi-replica loss when a notify is dropped (design doc §9.5.7 risk #1).
+    // multi-replica loss when a notify is dropped.
     mutable std::mutex pending_notifies_mutex_;
     std::unordered_map<std::string, std::vector<KeyReplicaEntry>>
         pending_notifies_;
