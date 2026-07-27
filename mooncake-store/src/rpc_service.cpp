@@ -743,7 +743,9 @@ tl::expected<void, ErrorCode> WrappedMasterService::RebuildMetadata(
                              ", client_id=", client_id);
         },
         [] { MasterMetricManager::instance().inc_rebuild_metadata_requests(); },
-        [] { MasterMetricManager::instance().inc_rebuild_metadata_failures(); });
+        [] {
+            MasterMetricManager::instance().inc_rebuild_metadata_failures();
+        });
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::ReMountNoFSegment(

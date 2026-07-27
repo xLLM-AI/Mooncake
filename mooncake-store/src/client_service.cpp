@@ -1650,8 +1650,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     // === HA rebuild: account by owner ===
-    // A replica landing on our own segment -> record locally (we are the owner).
-    // A replica landing on someone else's segment -> notify that owner.
+    // A replica landing on our own segment -> record locally (we are the
+    // owner). A replica landing on someone else's segment -> notify that owner.
     {
         uint64_t value_size = 0;
         for (auto n : slice_lengths) value_size += n;
@@ -1667,8 +1667,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                 RecordLocalReplica(key, replica, value_size, config.data_type,
                                    group_id, tenant_id);
             } else {
-                NotifyOwnerUpsert(ep, key, replica, value_size, config.data_type,
-                                  group_id, tenant_id);
+                NotifyOwnerUpsert(ep, key, replica, value_size,
+                                  config.data_type, group_id, tenant_id);
             }
         }
     }
@@ -1698,7 +1698,8 @@ void Client::RecordLocalReplica(const std::string& key,
     const uint64_t addr =
         replica.get_memory_descriptor().buffer_descriptor.buffer_address_;
     std::lock_guard<std::mutex> lk(local_replica_table_mutex_);
-    // Reuse-overwrite: evict whatever stale key currently occupies this address.
+    // Reuse-overwrite: evict whatever stale key currently occupies this
+    // address.
     EraseByAddressLocked(addr);
     // If the same key previously sat at a different address, drop that stale
     // reverse-index entry too (rare: same key relocated).
@@ -1777,7 +1778,8 @@ void Client::ParkPendingNotify(const std::string& ep,
 }
 
 void Client::FlushPendingNotifies() {
-    // Snapshot + clear under lock, retry outside lock, re-park what still fails.
+    // Snapshot + clear under lock, retry outside lock, re-park what still
+    // fails.
     std::unordered_map<std::string, std::vector<KeyReplicaEntry>> to_retry;
     {
         std::lock_guard<std::mutex> lk(pending_notifies_mutex_);
@@ -1807,7 +1809,8 @@ void Client::NotifyOwnerUpsertBatch(
 // (which does the address-overwrite that lazy-delete correctness depends on).
 void Client::RebuildNotifyLoop() {
     while (rebuild_notify_thread_running_.load()) {
-        // Reliability backstop: retry any notifies whose send previously failed.
+        // Reliability backstop: retry any notifies whose send previously
+        // failed.
         FlushPendingNotifies();
         std::vector<TransferMetadata::NotifyDesc> notifies;
         int rc = transfer_engine_->getNotifies(notifies);
@@ -1817,7 +1820,8 @@ void Client::RebuildNotifyLoop() {
                 // string back to binary, then struct_pack-deserialize.
                 std::string bin = base64::Decode(nd.notify_msg);
                 RebuildNotify n;
-                auto ec = struct_pack::deserialize_to(n, bin.data(), bin.size());
+                auto ec =
+                    struct_pack::deserialize_to(n, bin.data(), bin.size());
                 if (ec != struct_pack::errc::ok) continue;
                 for (auto& e : n.entries) {
                     if (e.replicas.empty()) continue;
@@ -1857,7 +1861,8 @@ void Client::ResendLocalReplicaTable() {
             snapshot.begin() + std::min(i + kBatch, snapshot.size()));
         auto r = master_client_.RebuildMetadata(std::move(batch));
         if (!r)
-            LOG(ERROR) << "RebuildMetadata resend failed: " << toString(r.error());
+            LOG(ERROR) << "RebuildMetadata resend failed: "
+                       << toString(r.error());
     }
 }
 
@@ -2552,8 +2557,9 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
             // === HA rebuild: account by owner ===
             for (const auto& replica : op.replicas) {
                 if (!replica.is_memory_replica()) continue;
-                const std::string& ep = replica.get_memory_descriptor()
-                                            .buffer_descriptor.transport_endpoint_;
+                const std::string& ep =
+                    replica.get_memory_descriptor()
+                        .buffer_descriptor.transport_endpoint_;
                 if (IsMyEndpoint(ep))
                     RecordLocalReplica(op.key, replica, op.meta_size,
                                        op.meta_data_type, op.meta_group_id,
@@ -3968,67 +3974,70 @@ void Client::StorageHeartbeatThreadMain() {
     int ping_fail_count = 0;
 
     auto remount_segment = [this]() {
-      {
-        // This lock must be held until the remount rpc is finished,
-        // otherwise there will be corner cases, e.g., a segment is
-        // unmounted successfully first, and then remounted again in
-        // this thread.
-        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        std::vector<Segment> segments;
-        for (auto it : mounted_segments_) {
-            auto& segment = it.second;
-            segments.emplace_back(segment);
-        }
-        auto remount_result = master_client_.ReMountSegment(segments);
-        if (!remount_result) {
-            ErrorCode err = remount_result.error();
-            LOG(ERROR) << "Failed to remount segments: " << err;
-        }
-        // Re-publish Transfer Engine segment descriptors to the HTTP
-        // metadata server.  When Master (which hosts the HTTP metadata
-        // server in the same process) is killed and restarted, all
-        // in-memory KV entries are lost.  ReMountSegment above only
-        // restores Master-side allocation state; it does NOT write back
-        // the transport-level segment descriptors.  Without this, remote
-        // peers get HTTP 404 when querying our segment descriptor and
-        // data transfers fail.
-        auto metadata = transfer_engine_->getMetadata();
-        if (metadata) {
-            int rc = metadata->updateLocalSegmentDesc();
-            if (rc != 0) {
-                LOG(ERROR) << "Failed to re-publish segment descriptor "
-                           << "to metadata server, rc=" << rc
-                           << ", will retry in next heartbeat cycle";
-                segment_desc_publish_pending_.store(true);
-            } else {
-                segment_desc_publish_pending_.store(false);
+        {
+            // This lock must be held until the remount rpc is finished,
+            // otherwise there will be corner cases, e.g., a segment is
+            // unmounted successfully first, and then remounted again in
+            // this thread.
+            std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+            std::vector<Segment> segments;
+            for (auto it : mounted_segments_) {
+                auto& segment = it.second;
+                segments.emplace_back(segment);
             }
-            // Also re-publish RPC meta entry (mooncake/rpc_meta/<hostname>).
-            // Remote peers need this to locate our RDMA RPC port for
-            // handshake.  Like segment descriptors, this entry is lost
-            // when the HTTP metadata server is cleared on Master restart.
-            rc = metadata->rePublishRpcMetaEntry(local_hostname_);
-            if (rc != 0) {
-                LOG(ERROR) << "Failed to re-publish RPC meta entry "
-                           << "to metadata server, rc=" << rc
-                           << ", will retry in next heartbeat cycle";
-                rpc_meta_publish_pending_.store(true);
-            } else {
-                rpc_meta_publish_pending_.store(false);
+            auto remount_result = master_client_.ReMountSegment(segments);
+            if (!remount_result) {
+                ErrorCode err = remount_result.error();
+                LOG(ERROR) << "Failed to remount segments: " << err;
             }
-        }
-        // Note: LOCAL_DISK segment remount is NOT done here.
-        // It is handled by FileStorage::Heartbeat() when it detects
-        // SEGMENT_NOT_FOUND, which also triggers ScanMeta to
-        // re-register offloaded object metadata.
-      }  // release mounted_segments_mutex_ before the (potentially many) rebuild RPCs
+            // Re-publish Transfer Engine segment descriptors to the HTTP
+            // metadata server.  When Master (which hosts the HTTP metadata
+            // server in the same process) is killed and restarted, all
+            // in-memory KV entries are lost.  ReMountSegment above only
+            // restores Master-side allocation state; it does NOT write back
+            // the transport-level segment descriptors.  Without this, remote
+            // peers get HTTP 404 when querying our segment descriptor and
+            // data transfers fail.
+            auto metadata = transfer_engine_->getMetadata();
+            if (metadata) {
+                int rc = metadata->updateLocalSegmentDesc();
+                if (rc != 0) {
+                    LOG(ERROR) << "Failed to re-publish segment descriptor "
+                               << "to metadata server, rc=" << rc
+                               << ", will retry in next heartbeat cycle";
+                    segment_desc_publish_pending_.store(true);
+                } else {
+                    segment_desc_publish_pending_.store(false);
+                }
+                // Also re-publish RPC meta entry
+                // (mooncake/rpc_meta/<hostname>). Remote peers need this to
+                // locate our RDMA RPC port for handshake.  Like segment
+                // descriptors, this entry is lost when the HTTP metadata server
+                // is cleared on Master restart.
+                rc = metadata->rePublishRpcMetaEntry(local_hostname_);
+                if (rc != 0) {
+                    LOG(ERROR) << "Failed to re-publish RPC meta entry "
+                               << "to metadata server, rc=" << rc
+                               << ", will retry in next heartbeat cycle";
+                    rpc_meta_publish_pending_.store(true);
+                } else {
+                    rpc_meta_publish_pending_.store(false);
+                }
+            }
+            // Note: LOCAL_DISK segment remount is NOT done here.
+            // It is handled by FileStorage::Heartbeat() when it detects
+            // SEGMENT_NOT_FOUND, which also triggers ScanMeta to
+            // re-register offloaded object metadata.
+        }  // release mounted_segments_mutex_ before the (potentially many)
+           // rebuild RPCs
 
         // === HA rebuild: after segments are re-mounted (and descriptors
         // re-published above), resend object-level metadata so the empty new
         // master rebuilds key->location. "Segment before key" is satisfied
-        // because ReMountSegment ran above. Done OUTSIDE mounted_segments_mutex_
-        // so the N batched RebuildMetadata RPCs don't block Put/Get that need
-        // that lock (ResendLocalReplicaTable takes only local_replica_table_mutex_).
+        // because ReMountSegment ran above. Done OUTSIDE
+        // mounted_segments_mutex_ so the N batched RebuildMetadata RPCs don't
+        // block Put/Get that need that lock (ResendLocalReplicaTable takes only
+        // local_replica_table_mutex_).
         ResendLocalReplicaTable();
     };
     // Use another thread to remount segments to avoid blocking the ping
