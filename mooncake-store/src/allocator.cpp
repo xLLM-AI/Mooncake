@@ -279,6 +279,49 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
     return allocated_buffer;
 }
 
+std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::AllocateForRebuild(
+    size_t size, void* real_addr) {
+    if (!offset_allocator_) {
+        LOG(ERROR) << "allocator_status=not_initialized";
+        return nullptr;
+    }
+    std::unique_ptr<AllocatedBuffer> allocated_buffer = nullptr;
+    try {
+        // Allocate to obtain a legit ownership handle (correct accounting + safe
+        // RAII deallocation). We DISCARD the allocator's self-chosen address and
+        // instead point the buffer at `real_addr` (the client's actual address).
+        auto allocation_handle = offset_allocator_->allocate(size);
+        if (!allocation_handle) {
+            VLOG(1) << "rebuild_allocation_failed size=" << size
+                    << " segment=" << segment_name_
+                    << " current_size=" << cur_size_;
+            return nullptr;
+        }
+        // Data address = client's real address; ownership handle = the legit one
+        // just allocated. deallocate() only touches the handle + size, never the
+        // data address, so this is safe (see impl doc §4.1).
+        allocated_buffer = std::make_unique<AllocatedBuffer>(
+            shared_from_this(), real_addr, size, std::move(allocation_handle));
+        VLOG(1) << "rebuild_allocation_succeeded size=" << size
+                << " segment=" << segment_name_ << " real_address=" << real_addr;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "rebuild_allocation_exception error=" << e.what();
+        return nullptr;
+    } catch (...) {
+        LOG(ERROR) << "rebuild_allocation_unknown_exception";
+        return nullptr;
+    }
+    cur_size_.fetch_add(size);
+    if (replica_type_ == ReplicaType::MEMORY) {
+        MasterMetricManager::instance().inc_allocated_mem_size(segment_name_,
+                                                               size);
+    } else if (replica_type_ == ReplicaType::NOF_SSD) {
+        MasterMetricManager::instance().inc_allocated_nof_size(segment_name_,
+                                                               size);
+    }
+    return allocated_buffer;
+}
+
 void OffsetBufferAllocator::deallocate(AllocatedBuffer* handle) {
     try {
         // The OffsetAllocator handles deallocation automatically through RAII

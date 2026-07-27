@@ -900,6 +900,140 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     return {};
 }
 
+// ===========================================================================
+// HA rebuild: master side (impl doc §4/§4.0/§4.1)
+// ===========================================================================
+
+namespace {
+// (endpoint,address) identity of a memory replica; used for merge de-dup.
+// get_descriptor() returns Descriptor BY VALUE, so bind it to a named var
+// first -- taking a reference into a temporary would dangle.
+bool RebuildSameMemoryLocation(const Replica& a, const Replica& b) {
+    if (!a.is_memory_replica() || !b.is_memory_replica()) return false;
+    const Replica::Descriptor da_desc = a.get_descriptor();
+    const Replica::Descriptor db_desc = b.get_descriptor();
+    const auto& da = da_desc.get_memory_descriptor().buffer_descriptor;
+    const auto& db = db_desc.get_memory_descriptor().buffer_descriptor;
+    return da.transport_endpoint_ == db.transport_endpoint_ &&
+           da.buffer_address_ == db.buffer_address_;
+}
+}  // namespace
+
+bool MasterService::ReplicaAlreadyPresent(const ObjectMetadata& meta,
+                                          const Replica& r) const {
+    bool found = false;
+    meta.VisitReplicas([](const Replica&) { return true; },
+                       [&](const Replica& existing) {
+                           if (RebuildSameMemoryLocation(existing, r))
+                               found = true;
+                       });
+    return found;
+}
+
+std::optional<Replica> MasterService::DescriptorToReplica(
+    const Replica::Descriptor& desc) {
+    return std::visit(
+        [&](auto&& d) -> std::optional<Replica> {
+            using T = std::decay_t<decltype(d)>;
+            if constexpr (std::is_same_v<T, MemoryDescriptor>) {
+                const auto& bd = d.buffer_descriptor;
+                // Find owning segment's allocator by endpoint + address range.
+                std::shared_ptr<BufferAllocatorBase> base_alloc;
+                {
+                    auto seg_access = segment_manager_.getSegmentAccess();
+                    base_alloc = seg_access.FindAllocatorByEndpointAndAddr(
+                        bd.transport_endpoint_, bd.buffer_address_);
+                }
+                if (!base_alloc) {
+                    LOG(WARNING) << "rebuild: no OK segment for endpoint="
+                                 << bd.transport_endpoint_
+                                 << " addr=" << bd.buffer_address_;
+                    return std::nullopt;
+                }
+                // Method-1 (allocate-placeholder + rebind addr) is only safe on
+                // OffsetBufferAllocator (deallocate frees via offset_handle, not
+                // buffer_ptr). Cachelib would double-free -> refuse for now.
+                auto offset_alloc =
+                    std::dynamic_pointer_cast<OffsetBufferAllocator>(base_alloc);
+                if (!offset_alloc) {
+                    LOG(WARNING) << "rebuild: segment allocator is not "
+                                    "OffsetBufferAllocator; skip key rebuild";
+                    return std::nullopt;
+                }
+                auto buffer = offset_alloc->AllocateForRebuild(
+                    bd.size_, reinterpret_cast<void*>(bd.buffer_address_));
+                if (!buffer) {
+                    LOG(WARNING) << "rebuild: AllocateForRebuild failed size="
+                                 << bd.size_;
+                    return std::nullopt;
+                }
+                return Replica(std::move(buffer), ReplicaStatus::COMPLETE);
+            } else if constexpr (std::is_same_v<T, DiskDescriptor>) {
+                return Replica(d.file_path, d.object_size,
+                               ReplicaStatus::COMPLETE);
+            } else if constexpr (std::is_same_v<T, LocalDiskDescriptor>) {
+                return Replica(d.client_id, d.object_size, d.transport_endpoint,
+                               ReplicaStatus::COMPLETE);
+            }
+            // NoFDescriptor or others: not rebuilt in the first version.
+            return std::nullopt;
+        },
+        desc.descriptor_variant);
+}
+
+auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
+                                    const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
+    std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);
+    for (const auto& e : entries) {
+        // (a) Descriptor -> holding Replica.
+        std::vector<Replica> replicas;
+        replicas.reserve(e.replicas.size());
+        bool ok = true;
+        for (const auto& desc : e.replicas) {
+            auto rep = DescriptorToReplica(desc);
+            if (!rep) {
+                ok = false;
+                break;
+            }
+            replicas.emplace_back(std::move(*rep));
+        }
+        if (!ok || replicas.empty()) continue;  // skip this key, keep the rest
+
+        // (b) Insert or MERGE (multi-replica redundancy recovery).
+        const std::string tenant = e.tenant_id.empty() ? "default" : e.tenant_id;
+        const ObjectIdentity oid{tenant, e.key};
+        MetadataAccessorRW accessor(this, oid);
+        if (!accessor.Exists()) {
+            accessor.Create(client_id, e.size, std::move(replicas),
+                            /*enable_soft_pin=*/false, /*enable_hard_pin=*/false,
+                            e.data_type, e.group_id);
+        } else {
+            // Another owner already reported this key (replica_num>1): merge the
+            // incoming replica(s) instead of dropping them, de-duping by
+            // (endpoint,address).
+            auto& meta = accessor.Get();
+            for (auto& r : replicas) {
+                if (!ReplicaAlreadyPresent(meta, r)) {
+                    std::vector<Replica> one;
+                    one.emplace_back(std::move(r));
+                    meta.AddReplicas(std::move(one));
+                }
+            }
+        }
+
+        // (c) Mark available: GrantLease (mirrors PutEnd). Replicas rebuilt by
+        // DescriptorToReplica are already COMPLETE, so only mark_complete the
+        // ones still PROCESSING (avoids "already marked as complete" warnings).
+        auto& meta = accessor.Get();
+        meta.VisitReplicas([](const Replica& r) { return !r.is_completed(); },
+                           [](Replica& r) { r.mark_complete(); });
+        meta.GrantLease(0, default_kv_soft_pin_ttl_);
+        SyncCacheTotalAccounting(meta);
+    }
+    return {};
+}
+
 auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
                                       const UUID& client_id)
     -> tl::expected<void, ErrorCode> {

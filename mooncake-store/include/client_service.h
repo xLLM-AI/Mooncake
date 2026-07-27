@@ -23,6 +23,7 @@
 #include "transfer_task.h"
 #include "types.h"
 #include "replica.h"
+#include "rebuild_types.h"
 #include "master_metric_manager.h"
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
@@ -66,6 +67,28 @@ class Client {
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+
+    // --- test-only helpers for the notify-reliability backstop (§9.5.7) ---
+    // Number of endpoints with parked (failed, awaiting-retry) notifies.
+    size_t PendingNotifyBucketCountForTest() const {
+        std::lock_guard<std::mutex> lk(pending_notifies_mutex_);
+        return pending_notifies_.size();
+    }
+    // Park a notify aimed at `ep` carrying `key` (used to simulate a dropped
+    // send, then verify the background loop re-delivers it).
+    void ParkNotifyForTest(const std::string& ep, const std::string& key,
+                           const Replica::Descriptor& replica, uint64_t size,
+                           ObjectDataType data_type, const std::string& group_id,
+                           const std::string& tenant_id) {
+        KeyReplicaEntry e;
+        e.key = key;
+        e.tenant_id = tenant_id;
+        e.size = size;
+        e.data_type = data_type;
+        e.group_id = group_id;
+        e.replicas = {replica};
+        ParkPendingNotify(ep, {std::move(e)});
+    }
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -778,6 +801,44 @@ class Client {
         std::unordered_map<std::string, std::vector<Slice>>& slices);
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
 
+    // === HA rebuild: client-side helpers (impl in client_service.cpp §2.6-2.8) ===
+    // Record a replica physically located in this client's own segment. Called
+    // both when this client Put()s onto its own segment and when an UPSERT notify
+    // arrives. Internally address-overwrites the stale key at the same address.
+    void RecordLocalReplica(const std::string& key,
+                            const Replica::Descriptor& replica, uint64_t size,
+                            ObjectDataType data_type, const std::string& group_id,
+                            const std::string& tenant_id);
+    // Evict the stale key occupying `addr` (it was just reused). Caller must hold
+    // local_replica_table_mutex_.
+    void EraseByAddressLocked(uint64_t addr);
+    // Is `ep` one of THIS client's mounted segments' te_endpoint? (Never compare
+    // against local_hostname_ -- a segment's te_endpoint = getLocalIpAndPort().)
+    bool IsMyEndpoint(const std::string& ep);
+    // Tell the segment owner at `ep` that we stored `key` there (full metadata).
+    void NotifyOwnerUpsert(const std::string& ep, const std::string& key,
+                           const Replica::Descriptor& replica, uint64_t size,
+                           ObjectDataType data_type, const std::string& group_id,
+                           const std::string& tenant_id);
+    // Batched notify: pack multiple keys landing on the same endpoint into one
+    // notify (BatchPut high-throughput optimization).
+    void NotifyOwnerUpsertBatch(
+        const std::unordered_map<std::string, std::vector<KeyReplicaEntry>>&
+            by_ep);
+    // On reconnect, resend the whole local table to the (empty) new master.
+    void ResendLocalReplicaTable();
+    // Background loop: poll getNotifies() and apply UPSERT entries.
+    void RebuildNotifyLoop();
+    // Send one UPSERT notify carrying `entries` to endpoint `ep`. Returns true
+    // on success. Shared by NotifyOwnerUpsert and the pending re-send path.
+    bool SendUpsertNotify(const std::string& ep,
+                          const std::vector<KeyReplicaEntry>& entries);
+    // Park a failed notify for later re-send (reliability backstop).
+    void ParkPendingNotify(const std::string& ep,
+                           const std::vector<KeyReplicaEntry>& entries);
+    // Re-send all parked notifies; drop the ones that now succeed.
+    void FlushPendingNotifies();
+
     // Client identification
     const UUID client_id_;
 
@@ -792,6 +853,30 @@ class Client {
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
+
+    // === HA rebuild: local replica table ===
+    // Maps a key physically stored in THIS client's segment -> its replica
+    // location + rebuild metadata. Filled two ways: (1) this client Put()s and a
+    // replica lands on its own segment; (2) an UPSERT notify arrives from another
+    // client. Value is LocalReplicaMeta (single replica, see rebuild_types.h):
+    // a key's multiple replicas are forced onto different segments, so from one
+    // client's view a key has at most one replica in its own segment.
+    mutable std::mutex local_replica_table_mutex_;
+    std::unordered_map<std::string, LocalReplicaMeta> local_replica_table_;
+    // Address reverse index: buffer_address_ -> key, for the same client's
+    // segments. Core of lazy-delete: when an address is reused, locate and evict
+    // the stale key entry occupying it (see RecordLocalReplica). Same mutex as
+    // local_replica_table_.
+    std::unordered_map<uint64_t, std::string> addr_index_;
+    std::atomic<bool> rebuild_notify_thread_running_{false};
+    std::thread rebuild_notify_thread_;  // polls getNotifies()
+    // Reliability backstop: UPSERT notifies whose send failed (peer flapping /
+    // not yet up) are parked here keyed by target endpoint, and re-sent by
+    // RebuildNotifyLoop each tick until they succeed. Guards against silent
+    // multi-replica loss when a notify is dropped (design doc §9.5.7 risk #1).
+    mutable std::mutex pending_notifies_mutex_;
+    std::unordered_map<std::string, std::vector<KeyReplicaEntry>>
+        pending_notifies_;
 
     // Segments in graceful unmount: readable by remote peers, not allocatable
     // locally. TE MR remains registered until master confirms removal.

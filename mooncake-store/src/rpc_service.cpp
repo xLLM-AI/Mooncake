@@ -733,6 +733,19 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReMountSegment(
         [] { MasterMetricManager::instance().inc_remount_segment_failures(); });
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::RebuildMetadata(
+    const std::vector<KeyReplicaEntry>& entries, const UUID& client_id) {
+    return execute_rpc(
+        "RebuildMetadata",
+        [&] { return master_service_.RebuildMetadata(entries, client_id); },
+        [&](auto& timer) {
+            timer.LogRequest("entries_count=", entries.size(),
+                             ", client_id=", client_id);
+        },
+        [] { MasterMetricManager::instance().inc_rebuild_metadata_requests(); },
+        [] { MasterMetricManager::instance().inc_rebuild_metadata_failures(); });
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::ReMountNoFSegment(
     const std::vector<NoFSegment>& segments, const UUID& client_id) {
     return execute_rpc(
@@ -1320,6 +1333,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::MountNoFSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReMountSegment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::RebuildMetadata>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReMountNoFSegment>(
         &wrapped_master_service);

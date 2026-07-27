@@ -126,6 +126,12 @@ MasterMetricManager::MasterMetricManager()
       remount_segment_failures_(
           "master_remount_segment_failures_total",
           "Total number of failed RemountSegment requests"),
+      rebuild_metadata_requests_(
+          "master_rebuild_metadata_requests_total",
+          "Total number of RebuildMetadata requests received"),
+      rebuild_metadata_failures_(
+          "master_rebuild_metadata_failures_total",
+          "Total number of failed RebuildMetadata requests"),
       mount_nof_segment_requests_(
           "master_mount_nof_segment_requests_total",
           "Total number of MountNoFSegment requests received"),
@@ -995,6 +1001,12 @@ void MasterMetricManager::inc_remount_segment_requests(int64_t val) {
 }
 void MasterMetricManager::inc_remount_segment_failures(int64_t val) {
     remount_segment_failures_.inc(val);
+}
+void MasterMetricManager::inc_rebuild_metadata_requests(int64_t val) {
+    rebuild_metadata_requests_.inc(val);
+}
+void MasterMetricManager::inc_rebuild_metadata_failures(int64_t val) {
+    rebuild_metadata_failures_.inc(val);
 }
 void MasterMetricManager::inc_remount_nof_segment_requests(int64_t val) {
     remount_nof_segment_requests_.inc(val);
