@@ -160,6 +160,9 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> ReMountSegment(
         const std::vector<Segment>& segments, const UUID& client_id);
 
+    tl::expected<void, ErrorCode> RebuildMetadata(
+        const std::vector<KeyReplicaEntry>& entries, const UUID& client_id);
+
     tl::expected<void, ErrorCode> ReMountNoFSegment(
         const std::vector<NoFSegment>& segments, const UUID& client_id);
 

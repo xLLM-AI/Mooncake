@@ -412,6 +412,22 @@ ErrorCode ScopedSegmentAccess::GetClientSegments(
     return ErrorCode::OK;
 }
 
+std::shared_ptr<BufferAllocatorBase>
+ScopedSegmentAccess::FindAllocatorByEndpointAndAddr(
+    const std::string& te_endpoint, uintptr_t buffer_address) const {
+    for (const auto& [id, ms] : segment_manager_->mounted_segments_) {
+        if (ms.status != SegmentStatus::OK) continue;
+        if (ms.segment.te_endpoint != te_endpoint) continue;
+        // Disambiguate 1:N endpoint sharing by address range.
+        const uintptr_t base = ms.segment.base;
+        const uintptr_t end = base + ms.segment.size;
+        if (buffer_address >= base && buffer_address < end) {
+            return ms.buf_allocator;
+        }
+    }
+    return nullptr;
+}
+
 void ScopedSegmentAccess::UnmountLocalDiskSegment(const UUID& client_id) {
     auto it = segment_manager_->client_local_disk_segment_.find(client_id);
     if (it != segment_manager_->client_local_disk_segment_.end()) {

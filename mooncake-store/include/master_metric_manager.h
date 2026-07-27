@@ -166,6 +166,8 @@ class MasterMetricManager {
     void inc_unmount_nof_segment_failures(int64_t val = 1);
     void inc_remount_segment_requests(int64_t val = 1);
     void inc_remount_segment_failures(int64_t val = 1);
+    void inc_rebuild_metadata_requests(int64_t val = 1);
+    void inc_rebuild_metadata_failures(int64_t val = 1);
     void inc_remount_nof_segment_requests(int64_t val = 1);
     void inc_remount_nof_segment_failures(int64_t val = 1);
     void inc_ping_requests(int64_t val = 1);
@@ -590,6 +592,8 @@ class MasterMetricManager {
     ylt::metric::counter_t unmount_segment_failures_;
     ylt::metric::counter_t remount_segment_requests_;
     ylt::metric::counter_t remount_segment_failures_;
+    ylt::metric::counter_t rebuild_metadata_requests_;
+    ylt::metric::counter_t rebuild_metadata_failures_;
     ylt::metric::counter_t mount_nof_segment_requests_;
     ylt::metric::counter_t mount_nof_segment_failures_;
     ylt::metric::counter_t unmount_nof_segment_requests_;
