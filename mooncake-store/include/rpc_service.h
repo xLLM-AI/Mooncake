@@ -2,6 +2,9 @@
 
 #include <csignal>
 
+#include <atomic>
+#include <mutex>
+#include <unordered_set>
 #include <string>
 #include <boost/functional/hash.hpp>
 #include <cstdint>
@@ -16,6 +19,12 @@
 #include "segment.h"
 
 namespace mooncake {
+
+enum class StoreServingState : uint8_t {
+    REBUILDING = 0,
+    SERVING = 1,
+    DEGRADED = 2,
+};
 
 // Forward declaration
 class HttpMetadataServer;
@@ -144,7 +153,7 @@ class WrappedMasterService {
         const std::string& str, bool force = false,
         const std::string& tenant_id = "default");
 
-    long RemoveAll(bool force = false,
+    tl::expected<long, ErrorCode> RemoveAll(bool force = false,
                    const std::string& tenant_id = "default");
 
     std::vector<tl::expected<void, ErrorCode>> BatchRemove(
@@ -161,7 +170,8 @@ class WrappedMasterService {
         const std::vector<Segment>& segments, const UUID& client_id);
 
     tl::expected<void, ErrorCode> RebuildMetadata(
-        const std::vector<KeyReplicaEntry>& entries, const UUID& client_id);
+        const std::vector<KeyReplicaEntry>& entries, const UUID& client_id,
+        ViewVersionId view_version);
 
     tl::expected<void, ErrorCode> ReMountNoFSegment(
         const std::vector<NoFSegment>& segments, const UUID& client_id);
@@ -306,8 +316,46 @@ class WrappedMasterService {
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
 
+    void SetServing(bool on) {
+        serving_state_.store(on ? StoreServingState::SERVING
+                                : StoreServingState::REBUILDING,
+                             std::memory_order_release);
+    }
+    bool IsServing() const {
+        return serving_state_.load(std::memory_order_acquire) !=
+               StoreServingState::REBUILDING;
+    }
+    StoreServingState GetServingState() const {
+        return serving_state_.load(std::memory_order_acquire);
+    }
+    ViewVersionId GetViewVersion() const { return view_version_; }
+
+    using ClientSet =
+        std::unordered_set<UUID, boost::hash<UUID>>;
+    ClientSet GetAliveClientsSnapshot() const;
+    void LockRebuildExpectedClients(ClientSet expected_clients);
+    tl::expected<void, ErrorCode> SignalRebuildComplete(
+        const UUID& client_id, ViewVersionId view_version);
+    void ForceServingAfterTimeout();
+    tl::expected<void, ErrorCode> SignalRebuildCompleteRpc(
+        const UUID& client_id, ViewVersionId view_version);
+
    private:
+    bool IsCurrentView(ViewVersionId view_version) const {
+        return view_version == view_version_;
+    }
+    void MaybeFinishRebuildLocked();
+    void TransitionToLocked(StoreServingState state, const char* reason);
+
     MasterService master_service_;
+    const ViewVersionId view_version_;
+    std::atomic<StoreServingState> serving_state_;
+
+    std::mutex rebuild_mu_;
+    bool rebuild_window_locked_{false};
+    ClientSet rebuild_expected_clients_;
+    ClientSet rebuild_done_before_lock_;
+    ClientSet rebuild_done_clients_;
 };
 
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,

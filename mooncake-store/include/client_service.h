@@ -832,7 +832,8 @@ class Client {
         const std::unordered_map<std::string, std::vector<KeyReplicaEntry>>&
             by_ep);
     // On reconnect, resend the whole local table to the (empty) new master.
-    void ResendLocalReplicaTable();
+    tl::expected<void, ErrorCode> ResendLocalReplicaTable(
+        ViewVersionId view_version);
     // Background loop: poll getNotifies() and apply UPSERT entries.
     void RebuildNotifyLoop();
     // Send one UPSERT notify carrying `entries` to endpoint `ep`. Returns true
@@ -935,6 +936,7 @@ class Client {
     std::atomic<bool> last_ping_success_{false};
     std::atomic<bool> segment_desc_publish_pending_{false};
     std::atomic<bool> rpc_meta_publish_pending_{false};
+    std::atomic<bool> rebuild_retry_pending_{false};
     ErrorCode SwitchLeader(const ha::MasterView& target_view);
     void LeaderMonitorThreadMain();
     void StorageHeartbeatThreadMain();

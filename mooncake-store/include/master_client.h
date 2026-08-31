@@ -354,7 +354,14 @@ class MasterClient {
      * to the (empty) new master after a restart, so it can rebuild metadata.
      */
     [[nodiscard]] tl::expected<void, ErrorCode> RebuildMetadata(
-        std::vector<KeyReplicaEntry>&& entries);
+        std::vector<KeyReplicaEntry>&& entries, ViewVersionId view_version);
+
+    /**
+     * @brief HA rebuild: 通知(空的新)master "本client已把所有metadata重发完",
+     * master 收齐所有已报到 client 的此信号后开服务。
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> SignalRebuildComplete(
+        ViewVersionId view_version);
 
     /**
      * @brief Re-mount NoF ssd segments, invoked when the client is the first

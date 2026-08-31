@@ -10,6 +10,7 @@
 #include <thread>
 
 #include <glog/logging.h>
+#include <gflags/gflags.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "ha/leadership/leader_coordinator_factory.h"
@@ -17,7 +18,35 @@
 #include "ha/standby_controller.h"
 #include "k8s_lease_helper.h"
 #include "master_admin_service.h"
+#include "master_metric_manager.h"
 #include "rpc_service.h"
+
+// [HA rebuild gate] ★功能总开关(ld 要求:本功能必须可整体关闭)。
+// false(默认)=不启用重建门控,升主后立即开服务=原生行为,生产可安全回退,
+// 不封死任何请求、不影响非HA/单master/首启。true=启用两阶段重建门控
+// (封死 store → 握手窗口收集 client → 盯传输收齐完成信号 → 开服务)。
+// 这是唯一的对外开关;下面 rebuild_collect_window_ms / force_serve_timeout_ms
+// 是可选高级旋钮,仅在本开关=true 时生效,有合理默认值,平时不必设置。
+DEFINE_bool(enable_ha_rebuild_gate, false,
+            "HA: master feature switch; when true, close store service on "
+            "promotion and only open after client metadata rebuild completes "
+            "(two-phase). false (default) = serve immediately (native behavior)");
+
+// [HA rebuild gate] 升主后"重建收集窗口"毫秒数。>0 时:新 leader 起服务后先
+// 封死 store 读写(serving_=false),放行重建流量(RebuildMetadata/ReMount),
+// 等待本窗口时长让所有故障时已存在的 client 重连+重建完,再开服务(SetServing
+// true)。<=0(默认)时:若总开关开启则回退到内置默认 7000ms;仅作高级旋钮。
+// 窗口大小建议 ≈ client 最坏重连耗时(检测3s+选主4s+重连1s≈8s)+余量。
+DEFINE_int32(rebuild_collect_window_ms, 0,
+             "HA: (advanced, only when enable_ha_rebuild_gate) phase-1 handshake "
+             "window ms to collect client ReMount before locking N; "
+             "<=0 => built-in default 7000 when gate enabled");
+
+// [HA rebuild 两阶段] 兜底上限:升主后最多封死这么久,即使没收齐所有 client 的
+// 重建完成信号也强制开服务(防某 client 传输中挂了永不发信号导致永久封死)。
+DEFINE_int32(rebuild_force_serve_timeout_ms, 120000,
+             "HA: hard upper bound; force store service open this long after "
+             "promotion even if not all clients signaled rebuild-complete");
 
 namespace mooncake {
 namespace ha {
@@ -162,6 +191,36 @@ void ActivateServingState(MasterAdminServer& admin_server,
     admin_server.SetServiceAvailable(true);
     SetRuntimeState(admin_server, MasterRuntimeState::kServing);
     label_reconciler.SetLeader(true);
+
+    // [HA rebuild gate] ★总开关:关闭(默认)→ 升主立即服务=原生行为,直接返回,
+    // 不封死、不开线程,完全不受本功能影响。只有显式打开才走两阶段门控。
+    if (!FLAGS_enable_ha_rebuild_gate) {
+        service->SetServing(true);
+        return;
+    }
+    // [HA rebuild 两阶段](仅在总开关开启时执行)升主后先封死 store,只放行重建流量。
+    // 阶段1(握手窗口,规模无关):等 window_ms 让故障时已存在的 client 重连+
+    // ReMount 报到,窗口结束锁定 N=已报到client数。阶段2(盯传输,规模相关):
+    // 等这 N 个 client 各自发 SignalRebuildComplete,收齐→开服务。兜底:force_ms
+    // 上限超时强制开服务。实现"重建完成前不提供 store 命中"(ld all-or-nothing)。
+    int window_ms = FLAGS_rebuild_collect_window_ms;
+    if (window_ms <= 0) window_ms = 7000;  // 开关开启但未设窗口 → 内置默认7s
+    LOG(INFO) << "[HA-REBUILD-GATE] store CLOSED from construction; handshake window " << window_ms
+              << " ms (phase-1: collect client ReMount)";
+    std::weak_ptr<WrappedMasterService> weak = service;
+    const int force_ms = FLAGS_rebuild_force_serve_timeout_ms;
+    // 阶段1线程:等窗口时长 → 锁定 N = 当前活跃(已ReMount)client数。
+    std::thread([weak, window_ms] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(window_ms));
+        if (auto s = weak.lock()) {
+            s->LockRebuildExpectedClients(s->GetAliveClientsSnapshot());
+        }
+    }).detach();
+    // 兜底线程:force_ms 后无论如何开服务。
+    std::thread([weak, force_ms] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(force_ms));
+        if (auto s = weak.lock()) s->ForceServingAfterTimeout();
+    }).detach();
 }
 
 void DeactivateServingState(MasterAdminServer& admin_server,
@@ -381,10 +440,12 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
         // The serving primary handles heartbeats/unmounts, so forward the
         // metadata cleanup config here like the non-HA path does.
+        auto wrapped_config = mooncake::WrappedMasterServiceConfig(
+            config, leadership_session->view.view_version);
+        wrapped_config.initially_serving = !FLAGS_enable_ha_rebuild_gate;
         auto wrapped_master_service = std::make_shared<WrappedMasterService>(
-            mooncake::WrappedMasterServiceConfig(
-                config, leadership_session->view.view_version),
-            config.http_metadata_server, config.http_metadata_remote_url);
+            wrapped_config, config.http_metadata_server,
+            config.http_metadata_remote_url);
         mooncake::RegisterRpcService(server, *wrapped_master_service);
 
         auto serve_preflight =

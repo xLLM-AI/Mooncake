@@ -130,6 +130,11 @@ target_include_directories(ha_scale_bench_main PRIVATE ${CMAKE_CURRENT_SOURCE_DI
 target_link_libraries(ha_scale_bench_main
   PUBLIC mooncake_store transfer_engine cachelib_memory_allocator
          ${ETCD_WRAPPER_LIB} glog gflags ibverbs pthread)
+add_executable(ha_scale_multi_main ha_scale_multi_main.cpp)
+target_include_directories(ha_scale_multi_main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ha_scale_multi_main
+  PUBLIC mooncake_store transfer_engine cachelib_memory_allocator
+         ${ETCD_WRAPPER_LIB} glog gflags ibverbs pthread)
 add_store_test(storage_backend_test storage_backend_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)

@@ -166,6 +166,8 @@ class MasterService {
     auto ReMountSegment(const std::vector<Segment>& segments,
                         const UUID& client_id) -> tl::expected<void, ErrorCode>;
 
+    std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
+
     /**
      * @brief HA rebuild: accept object-level metadata (key -> replica location)
      * resent by a client after the master restarted empty, and rebuild it into
@@ -864,7 +866,6 @@ class MasterService {
 
     // Helper to get a snapshot of alive clients (under client_mutex_ shared
     // lock)
-    std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 

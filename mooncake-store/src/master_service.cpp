@@ -1000,7 +1000,11 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
             }
             replicas.emplace_back(std::move(*rep));
         }
-        if (!ok || replicas.empty()) continue;  // skip this key, keep the rest
+        if (!ok || replicas.empty()) {
+            LOG(ERROR) << "rebuild: failed to restore key=" << e.key
+                       << "; rejecting batch so the client retries";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
 
         // (b) Insert or MERGE (multi-replica redundancy recovery).
         const std::string tenant =
