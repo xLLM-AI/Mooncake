@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include "allocator.h"
+#include "rebuild_retry.h"
 #include "segment.h"
 #include "utils/base64.h"
 
@@ -1863,20 +1864,13 @@ tl::expected<void, ErrorCode> Client::ResendLocalReplicaTable(
         auto result = master_client_.RebuildMetadata(std::move(batch),
                                                      view_version);
         if (!result) {
+            if (metrics_) metrics_->rebuild_failed_batches.inc();
             LOG(ERROR) << "RebuildMetadata resend failed: "
                        << toString(result.error());
             return tl::make_unexpected(result.error());
         }
     }
 
-    auto done = master_client_.SignalRebuildComplete(view_version);
-    if (!done) {
-        LOG(ERROR) << "SignalRebuildComplete failed: "
-                   << toString(done.error());
-        return tl::make_unexpected(done.error());
-    }
-    LOG(INFO) << "[HA-REBUILD] client sent rebuild-complete signal view="
-              << view_version;
     return {};
 }
 
@@ -3992,6 +3986,7 @@ void Client::StorageHeartbeatThreadMain() {
         constexpr int kMaxAttempts = 3;
         constexpr int kBackoffMs[kMaxAttempts] = {100, 500, 1000};
         auto wait_before_retry = [&](int attempt) {
+            if (metrics_) metrics_->rebuild_retries.inc();
             int remaining_ms = kBackoffMs[attempt];
             while (storage_heartbeat_running_.load() && remaining_ms > 0) {
                 const int sleep_ms = std::min(remaining_ms, 50);
@@ -4010,79 +4005,56 @@ void Client::StorageHeartbeatThreadMain() {
             }
         }
 
-        ErrorCode last_error = ErrorCode::INTERNAL_ERROR;
-        for (int attempt = 0;
-             attempt < kMaxAttempts && storage_heartbeat_running_.load();
-             ++attempt) {
-            bool remounted = false;
-            {
-                std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-                std::vector<Segment> segments;
-                segments.reserve(mounted_segments_.size());
-                for (const auto& [id, segment] : mounted_segments_) {
-                    segments.emplace_back(segment);
-                }
-                auto result = master_client_.ReMountSegment(segments);
-                if (result) {
-                    remounted = true;
-                } else {
-                    last_error = result.error();
-                    LOG(ERROR) << "Failed to remount segments: "
-                               << toString(last_error) << ", attempt="
-                               << attempt + 1 << "/" << kMaxAttempts;
-                }
+        RebuildRecoveryOps ops;
+        ops.remount = [&]() -> tl::expected<void, ErrorCode> {
+            std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+            std::vector<Segment> segments;
+            segments.reserve(mounted_segments_.size());
+            for (const auto& [id, segment] : mounted_segments_) {
+                segments.emplace_back(segment);
             }
-            if (!remounted) {
-                if (attempt + 1 < kMaxAttempts && wait_before_retry(attempt))
-                    continue;
-                break;
-            }
-
+            return master_client_.ReMountSegment(segments);
+        };
+        ops.publish_segment_descriptor = [&]() -> tl::expected<void, ErrorCode> {
             auto metadata = transfer_engine_->getMetadata();
             if (!metadata) {
-                last_error = ErrorCode::INTERNAL_ERROR;
-                LOG(ERROR) << "Failed to access transfer metadata, attempt="
-                           << attempt + 1 << "/" << kMaxAttempts;
-            } else {
-                int rc = metadata->updateLocalSegmentDesc();
-                if (rc != 0) {
-                    last_error = ErrorCode::RPC_FAIL;
-                    segment_desc_publish_pending_.store(true);
-                    LOG(ERROR) << "Failed to re-publish segment descriptor, rc="
-                               << rc << ", attempt=" << attempt + 1 << "/"
-                               << kMaxAttempts;
-                } else {
-                    segment_desc_publish_pending_.store(false);
-                    rc = metadata->rePublishRpcMetaEntry(local_hostname_);
-                    if (rc != 0) {
-                        last_error = ErrorCode::RPC_FAIL;
-                        rpc_meta_publish_pending_.store(true);
-                        LOG(ERROR) << "Failed to re-publish RPC meta entry, rc="
-                                   << rc << ", attempt=" << attempt + 1 << "/"
-                                   << kMaxAttempts;
-                    } else {
-                        rpc_meta_publish_pending_.store(false);
-                        auto rebuild_result =
-                            ResendLocalReplicaTable(view_version);
-                        if (rebuild_result) {
-                            rebuild_retry_pending_.store(false);
-                            return;
-                        }
-                        last_error = rebuild_result.error();
-                        if (last_error == ErrorCode::INVALID_VERSION) {
-                            LOG(WARNING) << "Aborting stale rebuild view="
-                                         << view_version;
-                            rebuild_retry_pending_.store(false);
-                            return;
-                        }
-                    }
-                }
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
-            if (attempt + 1 < kMaxAttempts && !wait_before_retry(attempt))
-                return;
+            int rc = metadata->updateLocalSegmentDesc();
+            segment_desc_publish_pending_.store(rc != 0);
+            if (rc != 0) return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            return {};
+        };
+        ops.publish_rpc_metadata = [&]() -> tl::expected<void, ErrorCode> {
+            auto metadata = transfer_engine_->getMetadata();
+            if (!metadata) {
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            int rc = metadata->rePublishRpcMetaEntry(local_hostname_);
+            rpc_meta_publish_pending_.store(rc != 0);
+            if (rc != 0) return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            return {};
+        };
+        ops.resend_metadata = [&] {
+            return ResendLocalReplicaTable(view_version);
+        };
+        ops.signal_complete = [&] {
+            return master_client_.SignalRebuildComplete(view_version);
+        };
+        auto result = RunRebuildRecovery(ops, kMaxAttempts, wait_before_retry);
+        if (result) {
+            rebuild_retry_pending_.store(false);
+            LOG(INFO) << "[HA-REBUILD] client sent rebuild-complete signal view="
+                      << view_version;
+            return;
+        }
+        if (result.error() == ErrorCode::INVALID_VERSION) {
+            rebuild_retry_pending_.store(false);
+            LOG(WARNING) << "Aborting stale rebuild view=" << view_version;
+            return;
         }
         LOG(ERROR) << "HA metadata rebuild attempt exhausted: "
-                   << toString(last_error)
+                   << toString(result.error())
                    << "; waiting for the next heartbeat/remount trigger";
     };
     // Use another thread to remount segments to avoid blocking the ping
@@ -4104,6 +4076,11 @@ void Client::StorageHeartbeatThreadMain() {
             ping_fail_count = 0;
             last_ping_success_.store(true);
             auto& ping_response = ping_result.value();
+            if (!leader_coordinator_) {
+                std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+                current_master_view_ = ha::MasterView{
+                    direct_master_address_, ping_response.view_version_id};
+            }
             if (ping_response.client_status == ClientStatus::NEED_REMOUNT &&
                 !remount_segment_future.valid()) {
                 // Ensure at most one remount segment thread is running

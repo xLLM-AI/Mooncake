@@ -3,6 +3,7 @@
 #include <csignal>
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <unordered_set>
 #include <string>
@@ -316,11 +317,7 @@ class WrappedMasterService {
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
 
-    void SetServing(bool on) {
-        serving_state_.store(on ? StoreServingState::SERVING
-                                : StoreServingState::REBUILDING,
-                             std::memory_order_release);
-    }
+    void SetServing(bool on);
     bool IsServing() const {
         return serving_state_.load(std::memory_order_acquire) !=
                StoreServingState::REBUILDING;
@@ -346,10 +343,12 @@ class WrappedMasterService {
     }
     void MaybeFinishRebuildLocked();
     void TransitionToLocked(StoreServingState state, const char* reason);
+    std::string MissingClientsLocked() const;
 
     MasterService master_service_;
     const ViewVersionId view_version_;
     std::atomic<StoreServingState> serving_state_;
+    const std::chrono::steady_clock::time_point rebuild_started_at_;
 
     std::mutex rebuild_mu_;
     bool rebuild_window_locked_{false};

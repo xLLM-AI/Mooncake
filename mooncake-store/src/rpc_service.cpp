@@ -1,5 +1,7 @@
 #include "rpc_service.h"
 
+#include <sstream>
+
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
@@ -19,7 +21,14 @@ WrappedMasterService::WrappedMasterService(
     : master_service_(MasterServiceConfig(config)),
       view_version_(config.view_version),
       serving_state_(config.initially_serving ? StoreServingState::SERVING
-                                              : StoreServingState::REBUILDING) {
+                                              : StoreServingState::REBUILDING),
+      rebuild_started_at_(std::chrono::steady_clock::now()) {
+    MasterMetricManager::instance().set_rebuild_state(
+        static_cast<int64_t>(serving_state_.load(std::memory_order_relaxed)));
+    MasterMetricManager::instance().set_rebuild_expected_clients(0);
+    MasterMetricManager::instance().set_rebuild_completed_clients(0);
+    MasterMetricManager::instance().set_rebuild_missing_clients(0);
+    MasterMetricManager::instance().set_rebuild_duration_ms(0);
     // Configure metadata cleanup on client timeout. Prefer the co-located
     // in-process server; otherwise fall back to a separately-deployed HTTP
     // metadata server derived from the cluster configuration.
@@ -31,6 +40,14 @@ WrappedMasterService::WrappedMasterService(
 }
 
 WrappedMasterService::~WrappedMasterService() = default;
+
+void WrappedMasterService::SetServing(bool on) {
+    const auto state = on ? StoreServingState::SERVING
+                          : StoreServingState::REBUILDING;
+    serving_state_.store(state, std::memory_order_release);
+    MasterMetricManager::instance().set_rebuild_state(
+        static_cast<int64_t>(state));
+}
 
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 WrappedMasterService::CalcCacheStats() {
@@ -798,6 +815,10 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
     const Segment& segment, const UUID& client_id) {
+    if (!IsServing()) {
+        return tl::make_unexpected(
+            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     return execute_rpc(
         "MountSegment",
         [&] { return master_service_.MountSegment(segment, client_id); },
@@ -812,6 +833,10 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountNoFSegment(
     const NoFSegment& segment, const UUID& client_id) {
+    if (!IsServing()) {
+        return tl::make_unexpected(
+            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     return execute_rpc(
         "MountNoFSegment",
         [&] { return master_service_.MountNoFSegment(segment, client_id); },
@@ -867,22 +892,46 @@ WrappedMasterService::GetAliveClientsSnapshot() const {
     return master_service_.getAliveClientsSnapshot();
 }
 
+std::string WrappedMasterService::MissingClientsLocked() const {
+    std::ostringstream missing;
+    bool first = true;
+    for (const auto& client_id : rebuild_expected_clients_) {
+        if (rebuild_done_clients_.contains(client_id)) continue;
+        if (!first) missing << ",";
+        missing << client_id.first << "-" << client_id.second;
+        first = false;
+    }
+    return missing.str();
+}
+
 void WrappedMasterService::TransitionToLocked(StoreServingState state,
                                                const char* reason) {
     const auto previous = serving_state_.load(std::memory_order_acquire);
-    if (previous == state || previous == StoreServingState::SERVING) return;
+    if (previous == state ||
+        (previous == StoreServingState::SERVING &&
+         state == StoreServingState::DEGRADED)) {
+        return;
+    }
     serving_state_.store(state, std::memory_order_release);
     MasterMetricManager::instance().set_rebuild_state(
         static_cast<int64_t>(state));
+    auto& metrics = MasterMetricManager::instance();
+    metrics.set_rebuild_duration_ms(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - rebuild_started_at_)
+            .count());
+    metrics.set_rebuild_missing_clients(static_cast<int64_t>(
+        rebuild_expected_clients_.size() - rebuild_done_clients_.size()));
     if (state == StoreServingState::DEGRADED) {
-        MasterMetricManager::instance().inc_rebuild_force_open();
+        metrics.inc_rebuild_force_open();
     }
     LOG(INFO) << "[HA-REBUILD-GATE] view=" << view_version_
               << " store state="
               << (state == StoreServingState::SERVING ? "SERVING" : "DEGRADED")
               << " reason=" << reason << " completed="
               << rebuild_done_clients_.size() << "/"
-              << rebuild_expected_clients_.size();
+              << rebuild_expected_clients_.size() << " missing_clients=["
+              << MissingClientsLocked() << "]";
 }
 
 void WrappedMasterService::MaybeFinishRebuildLocked() {
@@ -909,6 +958,9 @@ void WrappedMasterService::LockRebuildExpectedClients(
         static_cast<int64_t>(rebuild_expected_clients_.size()));
     MasterMetricManager::instance().set_rebuild_completed_clients(
         static_cast<int64_t>(rebuild_done_clients_.size()));
+    MasterMetricManager::instance().set_rebuild_missing_clients(
+        static_cast<int64_t>(rebuild_expected_clients_.size() -
+                             rebuild_done_clients_.size()));
     LOG(INFO) << "[HA-REBUILD-GATE] view=" << view_version_
               << " handshake window closed; expected_clients="
               << rebuild_expected_clients_.size() << " completed="
@@ -926,6 +978,12 @@ tl::expected<void, ErrorCode> WrappedMasterService::SignalRebuildComplete(
     }
     std::lock_guard<std::mutex> lk(rebuild_mu_);
     if (!rebuild_window_locked_) {
+        if (rebuild_done_before_lock_.size() >= 10000 &&
+            !rebuild_done_before_lock_.contains(client_id)) {
+            LOG(ERROR) << "[HA-REBUILD-GATE] too many pre-lock completion "
+                          "signals; refusing unbounded growth";
+            return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
         rebuild_done_before_lock_.insert(client_id);
         return {};
     }
@@ -938,6 +996,9 @@ tl::expected<void, ErrorCode> WrappedMasterService::SignalRebuildComplete(
     rebuild_done_clients_.insert(client_id);
     MasterMetricManager::instance().set_rebuild_completed_clients(
         static_cast<int64_t>(rebuild_done_clients_.size()));
+    MasterMetricManager::instance().set_rebuild_missing_clients(
+        static_cast<int64_t>(rebuild_expected_clients_.size() -
+                             rebuild_done_clients_.size()));
     LOG(INFO) << "[HA-REBUILD-GATE] view=" << view_version_
               << " rebuild-complete from client=(" << client_id.first << ","
               << client_id.second << "); " << rebuild_done_clients_.size()
@@ -1485,6 +1546,10 @@ WrappedMasterService::QuerySegmentForAdmin(const std::string& segment) {
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
     const UUID& client_id, bool enable_offloading) {
+    if (!IsServing()) {
+        return tl::make_unexpected(
+            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     ScopedVLogTimer timer(1, "MountLocalDiskSegment");
     timer.LogRequest("action=mount_local_disk_segment");
     LOG(INFO) << "Mount local disk segment with client id is : " << client_id

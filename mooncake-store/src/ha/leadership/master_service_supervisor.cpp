@@ -22,15 +22,15 @@
 #include "rpc_service.h"
 
 // [HA rebuild gate] ★功能总开关(ld 要求:本功能必须可整体关闭)。
-// false(默认)=不启用重建门控,升主后立即开服务=原生行为,生产可安全回退,
-// 不封死任何请求、不影响非HA/单master/首启。true=启用两阶段重建门控
+// true(默认)=启用两阶段重建门控;false=升主后立即服务,作为紧急回退,
+// 不封死任何请求；非HA/单master不受影响。启用时使用两阶段重建门控
 // (封死 store → 握手窗口收集 client → 盯传输收齐完成信号 → 开服务)。
 // 这是唯一的对外开关;下面 rebuild_collect_window_ms / force_serve_timeout_ms
 // 是可选高级旋钮,仅在本开关=true 时生效,有合理默认值,平时不必设置。
-DEFINE_bool(enable_ha_rebuild_gate, false,
+DEFINE_bool(enable_ha_rebuild_gate, true,
             "HA: master feature switch; when true, close store service on "
             "promotion and only open after client metadata rebuild completes "
-            "(two-phase). false (default) = serve immediately (native behavior)");
+            "(two-phase). true (default); false = serve immediately (rollback)");
 
 // [HA rebuild gate] 升主后"重建收集窗口"毫秒数。>0 时:新 leader 起服务后先
 // 封死 store 读写(serving_=false),放行重建流量(RebuildMetadata/ReMount),
@@ -188,16 +188,19 @@ void ActivateServingState(MasterAdminServer& admin_server,
                           const std::shared_ptr<WrappedMasterService>& service,
                           LeaderLabelReconciler& label_reconciler) {
     admin_server.SetServiceDelegate(service);
-    admin_server.SetServiceAvailable(true);
-    SetRuntimeState(admin_server, MasterRuntimeState::kServing);
-    label_reconciler.SetLeader(true);
 
     // [HA rebuild gate] ★总开关:关闭(默认)→ 升主立即服务=原生行为,直接返回,
     // 不封死、不开线程,完全不受本功能影响。只有显式打开才走两阶段门控。
     if (!FLAGS_enable_ha_rebuild_gate) {
         service->SetServing(true);
+        admin_server.SetServiceAvailable(true);
+        SetRuntimeState(admin_server, MasterRuntimeState::kServing);
+        label_reconciler.SetLeader(true);
         return;
     }
+    admin_server.SetServiceAvailable(true);
+    SetRuntimeState(admin_server, MasterRuntimeState::kLeaderWarmup);
+    label_reconciler.SetLeader(true);
     // [HA rebuild 两阶段](仅在总开关开启时执行)升主后先封死 store,只放行重建流量。
     // 阶段1(握手窗口,规模无关):等 window_ms 让故障时已存在的 client 重连+
     // ReMount 报到,窗口结束锁定 N=已报到client数。阶段2(盯传输,规模相关):
@@ -205,7 +208,8 @@ void ActivateServingState(MasterAdminServer& admin_server,
     // 上限超时强制开服务。实现"重建完成前不提供 store 命中"(ld all-or-nothing)。
     int window_ms = FLAGS_rebuild_collect_window_ms;
     if (window_ms <= 0) window_ms = 7000;  // 开关开启但未设窗口 → 内置默认7s
-    LOG(INFO) << "[HA-REBUILD-GATE] store CLOSED from construction; handshake window " << window_ms
+    LOG(INFO) << "[HA-REBUILD-GATE] store CLOSED from construction; "
+              << "handshake window " << window_ms
               << " ms (phase-1: collect client ReMount)";
     std::weak_ptr<WrappedMasterService> weak = service;
     const int force_ms = FLAGS_rebuild_force_serve_timeout_ms;

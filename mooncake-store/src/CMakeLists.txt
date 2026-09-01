@@ -21,6 +21,7 @@ set(MOONCAKE_STORE_SOURCES
     tenant_quota.cpp
     tenant_quota_policy_store.cpp
     rpc_service.cpp
+    rebuild_retry.cpp
     master_admin_service.cpp
     offset_allocator.cpp
     posix_file.cpp

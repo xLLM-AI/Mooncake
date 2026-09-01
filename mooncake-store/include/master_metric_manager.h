@@ -171,6 +171,8 @@ class MasterMetricManager {
     void set_rebuild_state(int64_t state);
     void set_rebuild_expected_clients(int64_t clients);
     void set_rebuild_completed_clients(int64_t clients);
+    void set_rebuild_missing_clients(int64_t clients);
+    void set_rebuild_duration_ms(int64_t duration_ms);
     void inc_rebuild_force_open(int64_t val = 1);
     void inc_rebuild_stale_epoch_requests(int64_t val = 1);
     void inc_remount_nof_segment_requests(int64_t val = 1);
@@ -602,6 +604,8 @@ class MasterMetricManager {
     ylt::metric::gauge_t rebuild_state_;
     ylt::metric::gauge_t rebuild_expected_clients_;
     ylt::metric::gauge_t rebuild_completed_clients_;
+    ylt::metric::gauge_t rebuild_missing_clients_;
+    ylt::metric::gauge_t rebuild_duration_ms_;
     ylt::metric::counter_t rebuild_force_open_;
     ylt::metric::counter_t rebuild_stale_epoch_requests_;
     ylt::metric::counter_t mount_nof_segment_requests_;
