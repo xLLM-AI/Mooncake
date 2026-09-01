@@ -33,6 +33,7 @@
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
+#include "rebuild_types.h"
 #include "ha/ha_types.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
@@ -164,6 +165,19 @@ class MasterService {
      */
     auto ReMountSegment(const std::vector<Segment>& segments,
                         const UUID& client_id) -> tl::expected<void, ErrorCode>;
+
+    std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
+
+    /**
+     * @brief HA rebuild: accept object-level metadata (key -> replica location)
+     * resent by a client after the master restarted empty, and rebuild it into
+     * metadata_shards_. For an existing key, MERGE the incoming replica(s)
+     * (multi-replica redundancy recovery) rather than skipping. Idempotent per
+     * (endpoint,address).
+     */
+    auto RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
+                         const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Re-mount NoF SSD segments, invoked when the client is the first
@@ -810,6 +824,15 @@ class MasterService {
    private:
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
 
+    // === HA rebuild helpers ===
+    // Convert a serializable Replica::Descriptor back into a holding Replica.
+    // The hard part is MEMORY type: it needs the owning segment's allocator,
+    // looked up by the descriptor's transport_endpoint_. Returns nullopt on
+    // failure (segment not mounted / not OK / unknown type).
+    std::optional<Replica> DescriptorToReplica(const Replica::Descriptor& desc);
+    // ReplicaAlreadyPresent is declared after ObjectMetadata is defined (it
+    // takes const ObjectMetadata&, a private nested type). See below.
+
     // Restore master state
     void RestoreState();
     void ResetStateAfterFailedRestoreAttempt();
@@ -843,7 +866,6 @@ class MasterService {
 
     // Helper to get a snapshot of alive clients (under client_mutex_ shared
     // lock)
-    std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
@@ -1400,6 +1422,12 @@ class MasterService {
         const std::string& tenant_id) const;
     bool IsTenantRegistered(const std::string& tenant_id) const;
     bool TenantHasObjects(const std::string& tenant_id) const;
+
+    // HA rebuild: is a replica with the same (endpoint,address) already present
+    // in meta? Declared here (after ObjectMetadata is defined) because it takes
+    // const ObjectMetadata&.
+    bool ReplicaAlreadyPresent(const ObjectMetadata& meta,
+                               const Replica& r) const;
 
     static std::string MakeTenantScopedKey(const std::string& tenant_id,
                                            const std::string& key) {

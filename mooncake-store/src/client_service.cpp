@@ -3,7 +3,9 @@
 #include <glog/logging.h>
 
 #include "allocator.h"
+#include "rebuild_retry.h"
 #include "segment.h"
+#include "utils/base64.h"
 
 #include <csignal>
 #include <algorithm>
@@ -313,6 +315,12 @@ Client::~Client() {
     storage_heartbeat_running_ = false;
     if (storage_heartbeat_thread_.joinable()) {
         storage_heartbeat_thread_.join();
+    }
+
+    // === HA rebuild: stop the notify-receiving loop (set flag then join).
+    rebuild_notify_thread_running_.store(false);
+    if (rebuild_notify_thread_.joinable()) {
+        rebuild_notify_thread_.join();
     }
 
     leader_monitor_running_ = false;
@@ -977,6 +985,13 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         LOG(ERROR) << "Failed to initialize local hot cache";
     }
 
+    // === HA rebuild: start the notify-receiving loop now that transfer_engine_
+    // is ready. It polls getNotifies() and applies cross-client UPSERT entries
+    // into local_replica_table_. Stopped in ~Client.
+    client->rebuild_notify_thread_running_.store(true);
+    client->rebuild_notify_thread_ =
+        std::thread(&Client::RebuildNotifyLoop, client.get());
+
     return client;
 }
 
@@ -1635,6 +1650,227 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         return tl::unexpected(finalize_decision.error);
     }
 
+    // === HA rebuild: account by owner ===
+    // A replica landing on our own segment -> record locally (we are the
+    // owner). A replica landing on someone else's segment -> notify that owner.
+    {
+        uint64_t value_size = 0;
+        for (auto n : slice_lengths) value_size += n;
+        const std::string tenant_id = master_client_.tenant_id();
+        std::string group_id;
+        if (config.group_ids && !config.group_ids->empty())
+            group_id = config.group_ids->front();
+        for (const auto& replica : start_result.value()) {
+            if (!replica.is_memory_replica()) continue;
+            const std::string& ep = replica.get_memory_descriptor()
+                                        .buffer_descriptor.transport_endpoint_;
+            if (IsMyEndpoint(ep)) {
+                RecordLocalReplica(key, replica, value_size, config.data_type,
+                                   group_id, tenant_id);
+            } else {
+                NotifyOwnerUpsert(ep, key, replica, value_size,
+                                  config.data_type, group_id, tenant_id);
+            }
+        }
+    }
+
+    return {};
+}
+
+// ===========================================================================
+// HA rebuild: client-side local replica table helpers
+// ===========================================================================
+
+void Client::EraseByAddressLocked(uint64_t addr) {
+    // Caller must hold local_replica_table_mutex_.
+    auto it = addr_index_.find(addr);
+    if (it != addr_index_.end()) {
+        local_replica_table_.erase(it->second);
+        addr_index_.erase(it);
+    }
+}
+
+void Client::RecordLocalReplica(const std::string& key,
+                                const Replica::Descriptor& replica,
+                                uint64_t size, ObjectDataType data_type,
+                                const std::string& group_id,
+                                const std::string& tenant_id) {
+    if (!replica.is_memory_replica()) return;  // only memory replicas tracked
+    const uint64_t addr =
+        replica.get_memory_descriptor().buffer_descriptor.buffer_address_;
+    std::lock_guard<std::mutex> lk(local_replica_table_mutex_);
+    // Reuse-overwrite: evict whatever stale key currently occupies this
+    // address.
+    EraseByAddressLocked(addr);
+    // If the same key previously sat at a different address, drop that stale
+    // reverse-index entry too (rare: same key relocated).
+    auto old = local_replica_table_.find(key);
+    if (old != local_replica_table_.end()) {
+        const uint64_t old_addr = old->second.replica.get_memory_descriptor()
+                                      .buffer_descriptor.buffer_address_;
+        if (old_addr != addr) addr_index_.erase(old_addr);
+    }
+    local_replica_table_[key] =
+        LocalReplicaMeta{replica, size, data_type, group_id, tenant_id};
+    addr_index_[addr] = key;
+}
+
+bool Client::IsMyEndpoint(const std::string& ep) {
+    std::lock_guard<std::mutex> lk(mounted_segments_mutex_);
+    for (const auto& [id, seg] : mounted_segments_) {
+        if (seg.te_endpoint == ep) return true;
+    }
+    return false;
+}
+
+// --- notify send ------------------------------------------------------------
+// Tell the segment owner at `ep` "I stored `key` on your segment" with full
+// metadata, over the TE control-plane notify channel (not one-sided RDMA).
+void Client::NotifyOwnerUpsert(const std::string& ep, const std::string& key,
+                               const Replica::Descriptor& replica,
+                               uint64_t size, ObjectDataType data_type,
+                               const std::string& group_id,
+                               const std::string& tenant_id) {
+    KeyReplicaEntry e;
+    e.key = key;
+    e.tenant_id = tenant_id;
+    e.size = size;
+    e.data_type = data_type;
+    e.group_id = group_id;
+    e.replicas = {replica};
+    std::vector<KeyReplicaEntry> entries{std::move(e)};
+    // Reliability: if the send fails (peer flapping / not yet up), park it for
+    // the background loop to retry, so a dropped notify never silently loses a
+    // replica.
+    if (!SendUpsertNotify(ep, entries)) {
+        ParkPendingNotify(ep, entries);
+    }
+}
+
+// Build + base64 + send one UPSERT notify. Returns true iff the peer accepted.
+bool Client::SendUpsertNotify(const std::string& ep,
+                              const std::vector<KeyReplicaEntry>& entries) {
+    RebuildNotify n;
+    n.sender_client_id = UuidToString(client_id_);
+    n.op = RebuildNotifyOp::UPSERT;
+    n.entries = entries;
+    TransferMetadata::NotifyDesc desc;
+    desc.name = n.sender_client_id;
+    {
+        // notify_msg travels as a JSON string field (UTF-8), so binary
+        // struct_pack output MUST be base64-encoded or it gets corrupted.
+        auto b = struct_pack::serialize(n);
+        desc.notify_msg = base64::Encode(std::string(b.begin(), b.end()));
+    }
+    int rc = transfer_engine_->sendNotifyByName(ep, desc);
+    if (rc != 0) {
+        LOG(WARNING) << "sendNotify UPSERT to " << ep << " rc=" << rc
+                     << " (will retry)";
+        return false;
+    }
+    return true;
+}
+
+void Client::ParkPendingNotify(const std::string& ep,
+                               const std::vector<KeyReplicaEntry>& entries) {
+    std::lock_guard<std::mutex> lk(pending_notifies_mutex_);
+    auto& bucket = pending_notifies_[ep];
+    bucket.insert(bucket.end(), entries.begin(), entries.end());
+}
+
+void Client::FlushPendingNotifies() {
+    // Snapshot + clear under lock, retry outside lock, re-park what still
+    // fails.
+    std::unordered_map<std::string, std::vector<KeyReplicaEntry>> to_retry;
+    {
+        std::lock_guard<std::mutex> lk(pending_notifies_mutex_);
+        if (pending_notifies_.empty()) return;
+        to_retry.swap(pending_notifies_);
+    }
+    for (auto& [ep, entries] : to_retry) {
+        if (!SendUpsertNotify(ep, entries)) {
+            ParkPendingNotify(ep, entries);  // still down, keep for next tick
+        }
+    }
+}
+
+void Client::NotifyOwnerUpsertBatch(
+    const std::unordered_map<std::string, std::vector<KeyReplicaEntry>>&
+        by_ep) {
+    for (const auto& [ep, entries] : by_ep) {
+        // Same reliability backstop as the singular path: park on failure.
+        if (!SendUpsertNotify(ep, entries)) {
+            ParkPendingNotify(ep, entries);
+        }
+    }
+}
+
+// --- notify receive loop -----------------------------------------------------
+// Poll getNotifies(), decode UPSERT entries, apply via RecordLocalReplica
+// (which does the address-overwrite that lazy-delete correctness depends on).
+void Client::RebuildNotifyLoop() {
+    while (rebuild_notify_thread_running_.load()) {
+        // Reliability backstop: retry any notifies whose send previously
+        // failed.
+        FlushPendingNotifies();
+        std::vector<TransferMetadata::NotifyDesc> notifies;
+        int rc = transfer_engine_->getNotifies(notifies);
+        if (rc == 0) {
+            for (auto& nd : notifies) {
+                // Reverse of the send side: base64-decode the JSON-carried
+                // string back to binary, then struct_pack-deserialize.
+                std::string bin = base64::Decode(nd.notify_msg);
+                RebuildNotify n;
+                auto ec =
+                    struct_pack::deserialize_to(n, bin.data(), bin.size());
+                if (ec != struct_pack::errc::ok) continue;
+                for (auto& e : n.entries) {
+                    if (e.replicas.empty()) continue;
+                    RecordLocalReplica(e.key, e.replicas.front(), e.size,
+                                       e.data_type, e.group_id, e.tenant_id);
+                }
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+// --- reconnect resend --------------------------------------------------------
+// On reconnect, snapshot the local table and resend it (batched) to the empty
+// new master via the RebuildMetadata RPC.
+tl::expected<void, ErrorCode> Client::ResendLocalReplicaTable(
+    ViewVersionId view_version) {
+    std::vector<KeyReplicaEntry> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(local_replica_table_mutex_);
+        snapshot.reserve(local_replica_table_.size());
+        for (const auto& [key, metadata] : local_replica_table_) {
+            KeyReplicaEntry entry;
+            entry.key = key;
+            entry.tenant_id = metadata.tenant_id;
+            entry.size = metadata.size;
+            entry.data_type = metadata.data_type;
+            entry.group_id = metadata.group_id;
+            entry.replicas = {metadata.replica};
+            snapshot.emplace_back(std::move(entry));
+        }
+    }
+
+    constexpr size_t kBatchSize = 256;
+    for (size_t i = 0; i < snapshot.size(); i += kBatchSize) {
+        std::vector<KeyReplicaEntry> batch(
+            snapshot.begin() + i,
+            snapshot.begin() + std::min(i + kBatchSize, snapshot.size()));
+        auto result = master_client_.RebuildMetadata(std::move(batch),
+                                                     view_version);
+        if (!result) {
+            if (metrics_) metrics_->rebuild_failed_batches.inc();
+            LOG(ERROR) << "RebuildMetadata resend failed: "
+                       << toString(result.error());
+            return tl::make_unexpected(result.error());
+        }
+    }
+
     return {};
 }
 
@@ -1790,6 +2026,14 @@ class PutOperation {
     std::vector<Slice> slices;
     std::vector<std::vector<Slice>> batched_slices;
 
+    // === HA rebuild: per-key metadata for local-table accounting ===
+    // PutOperation itself has no size/data_type/group_id/tenant_id; filled in
+    // StartBatchPut/StartBatchUpsert from config + slice lengths.
+    uint64_t meta_size{0};
+    ObjectDataType meta_data_type{ObjectDataType::UNKNOWN};
+    std::string meta_group_id;
+    std::string meta_tenant_id{"default"};
+
     // Enhanced state tracking
     PutOperationState state = PutOperationState::PENDING;
     tl::expected<void, ErrorCode> result;
@@ -1927,6 +2171,16 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     // Process individual responses with robust error handling
     for (size_t i = 0; i < ops.size(); ++i) {
         ops[i].InitializeRequestedReplicas(config);
+        // === HA rebuild: fill per-key metadata for local-table accounting ===
+        {
+            uint64_t sz = 0;
+            for (const auto& s : ops[i].slices) sz += s.size;
+            ops[i].meta_size = sz;
+            ops[i].meta_data_type = config.data_type;
+            ops[i].meta_tenant_id = master_client_.tenant_id();
+            if (config.group_ids && i < config.group_ids->size())
+                ops[i].meta_group_id = config.group_ids->at(i);
+        }
         if (!start_responses[i]) {
             ops[i].SetTerminalError(start_responses[i].error(),
                                     PutOperationState::MASTER_FAILED,
@@ -2308,6 +2562,21 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         }
         if (should_succeed[i]) {
             op.SetSuccess();
+            // === HA rebuild: account by owner ===
+            for (const auto& replica : op.replicas) {
+                if (!replica.is_memory_replica()) continue;
+                const std::string& ep =
+                    replica.get_memory_descriptor()
+                        .buffer_descriptor.transport_endpoint_;
+                if (IsMyEndpoint(ep))
+                    RecordLocalReplica(op.key, replica, op.meta_size,
+                                       op.meta_data_type, op.meta_group_id,
+                                       op.meta_tenant_id);
+                else
+                    NotifyOwnerUpsert(ep, op.key, replica, op.meta_size,
+                                      op.meta_data_type, op.meta_group_id,
+                                      op.meta_tenant_id);
+            }
             continue;
         }
         op.SetTerminalError(terminal_errors[i],
@@ -3713,58 +3982,80 @@ void Client::StorageHeartbeatThreadMain() {
     int ping_fail_count = 0;
 
     auto remount_segment = [this]() {
-        // This lock must be held until the remount rpc is finished,
-        // otherwise there will be corner cases, e.g., a segment is
-        // unmounted successfully first, and then remounted again in
-        // this thread.
-        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        std::vector<Segment> segments;
-        for (auto it : mounted_segments_) {
-            auto& segment = it.second;
-            segments.emplace_back(segment);
+        rebuild_retry_pending_.store(true);
+        constexpr int kMaxAttempts = 3;
+        constexpr int kBackoffMs[kMaxAttempts] = {100, 500, 1000};
+        auto wait_before_retry = [&](int attempt) {
+            if (metrics_) metrics_->rebuild_retries.inc();
+            int remaining_ms = kBackoffMs[attempt];
+            while (storage_heartbeat_running_.load() && remaining_ms > 0) {
+                const int sleep_ms = std::min(remaining_ms, 50);
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(sleep_ms));
+                remaining_ms -= sleep_ms;
+            }
+            return storage_heartbeat_running_.load();
+        };
+
+        ViewVersionId view_version = 0;
+        {
+            std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+            if (current_master_view_.has_value()) {
+                view_version = current_master_view_->view_version;
+            }
         }
-        auto remount_result = master_client_.ReMountSegment(segments);
-        if (!remount_result) {
-            ErrorCode err = remount_result.error();
-            LOG(ERROR) << "Failed to remount segments: " << err;
-        }
-        // Re-publish Transfer Engine segment descriptors to the HTTP
-        // metadata server.  When Master (which hosts the HTTP metadata
-        // server in the same process) is killed and restarted, all
-        // in-memory KV entries are lost.  ReMountSegment above only
-        // restores Master-side allocation state; it does NOT write back
-        // the transport-level segment descriptors.  Without this, remote
-        // peers get HTTP 404 when querying our segment descriptor and
-        // data transfers fail.
-        auto metadata = transfer_engine_->getMetadata();
-        if (metadata) {
+
+        RebuildRecoveryOps ops;
+        ops.remount = [&]() -> tl::expected<void, ErrorCode> {
+            std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+            std::vector<Segment> segments;
+            segments.reserve(mounted_segments_.size());
+            for (const auto& [id, segment] : mounted_segments_) {
+                segments.emplace_back(segment);
+            }
+            return master_client_.ReMountSegment(segments);
+        };
+        ops.publish_segment_descriptor = [&]() -> tl::expected<void, ErrorCode> {
+            auto metadata = transfer_engine_->getMetadata();
+            if (!metadata) {
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
             int rc = metadata->updateLocalSegmentDesc();
-            if (rc != 0) {
-                LOG(ERROR) << "Failed to re-publish segment descriptor "
-                           << "to metadata server, rc=" << rc
-                           << ", will retry in next heartbeat cycle";
-                segment_desc_publish_pending_.store(true);
-            } else {
-                segment_desc_publish_pending_.store(false);
+            segment_desc_publish_pending_.store(rc != 0);
+            if (rc != 0) return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            return {};
+        };
+        ops.publish_rpc_metadata = [&]() -> tl::expected<void, ErrorCode> {
+            auto metadata = transfer_engine_->getMetadata();
+            if (!metadata) {
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
-            // Also re-publish RPC meta entry (mooncake/rpc_meta/<hostname>).
-            // Remote peers need this to locate our RDMA RPC port for
-            // handshake.  Like segment descriptors, this entry is lost
-            // when the HTTP metadata server is cleared on Master restart.
-            rc = metadata->rePublishRpcMetaEntry(local_hostname_);
-            if (rc != 0) {
-                LOG(ERROR) << "Failed to re-publish RPC meta entry "
-                           << "to metadata server, rc=" << rc
-                           << ", will retry in next heartbeat cycle";
-                rpc_meta_publish_pending_.store(true);
-            } else {
-                rpc_meta_publish_pending_.store(false);
-            }
+            int rc = metadata->rePublishRpcMetaEntry(local_hostname_);
+            rpc_meta_publish_pending_.store(rc != 0);
+            if (rc != 0) return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            return {};
+        };
+        ops.resend_metadata = [&] {
+            return ResendLocalReplicaTable(view_version);
+        };
+        ops.signal_complete = [&] {
+            return master_client_.SignalRebuildComplete(view_version);
+        };
+        auto result = RunRebuildRecovery(ops, kMaxAttempts, wait_before_retry);
+        if (result) {
+            rebuild_retry_pending_.store(false);
+            LOG(INFO) << "[HA-REBUILD] client sent rebuild-complete signal view="
+                      << view_version;
+            return;
         }
-        // Note: LOCAL_DISK segment remount is NOT done here.
-        // It is handled by FileStorage::Heartbeat() when it detects
-        // SEGMENT_NOT_FOUND, which also triggers ScanMeta to
-        // re-register offloaded object metadata.
+        if (result.error() == ErrorCode::INVALID_VERSION) {
+            rebuild_retry_pending_.store(false);
+            LOG(WARNING) << "Aborting stale rebuild view=" << view_version;
+            return;
+        }
+        LOG(ERROR) << "HA metadata rebuild attempt exhausted: "
+                   << toString(result.error())
+                   << "; waiting for the next heartbeat/remount trigger";
     };
     // Use another thread to remount segments to avoid blocking the ping
     // thread
@@ -3785,48 +4076,23 @@ void Client::StorageHeartbeatThreadMain() {
             ping_fail_count = 0;
             last_ping_success_.store(true);
             auto& ping_response = ping_result.value();
+            if (!leader_coordinator_) {
+                std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+                current_master_view_ = ha::MasterView{
+                    direct_master_address_, ping_response.view_version_id};
+            }
             if (ping_response.client_status == ClientStatus::NEED_REMOUNT &&
                 !remount_segment_future.valid()) {
                 // Ensure at most one remount segment thread is running
                 remount_segment_future =
                     std::async(std::launch::async, remount_segment);
-            } else if (segment_desc_publish_pending_.load() &&
+            } else if ((segment_desc_publish_pending_.load() ||
+                        rpc_meta_publish_pending_.load() ||
+                        rebuild_retry_pending_.load()) &&
                        !remount_segment_future.valid()) {
-                // Previous remount succeeded but updateLocalSegmentDesc()
-                // failed (e.g. transient HTTP error).  Retry it directly
-                // without re-running ReMountSegment.
-                auto metadata = transfer_engine_->getMetadata();
-                if (metadata) {
-                    int rc = metadata->updateLocalSegmentDesc();
-                    if (rc != 0) {
-                        LOG(ERROR)
-                            << "Retry: failed to re-publish segment "
-                            << "descriptor to metadata server, rc=" << rc;
-                    } else {
-                        LOG(INFO) << "Retry: successfully re-published "
-                                  << "segment descriptor to metadata server";
-                        segment_desc_publish_pending_.store(false);
-                    }
-                }
-            } else if (rpc_meta_publish_pending_.load() &&
-                       !remount_segment_future.valid()) {
-                // Previous remount succeeded but rePublishRpcMetaEntry()
-                // failed.  Retry it directly.
-                auto metadata = transfer_engine_->getMetadata();
-                if (metadata) {
-                    int rc = metadata->rePublishRpcMetaEntry(local_hostname_);
-                    if (rc != 0) {
-                        LOG(ERROR)
-                            << "Retry: failed to re-publish RPC "
-                            << "meta entry to metadata server, rc=" << rc;
-                    } else {
-                        LOG(INFO) << "Retry: successfully re-published "
-                                  << "RPC meta entry to metadata server";
-                        rpc_meta_publish_pending_.store(false);
-                    }
-                }
+                remount_segment_future =
+                    std::async(std::launch::async, remount_segment);
             }
-
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(success_ping_interval_ms));
             continue;

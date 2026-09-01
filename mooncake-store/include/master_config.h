@@ -425,6 +425,7 @@ class WrappedMasterServiceConfig {
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
+    bool initially_serving = true;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms =

@@ -62,6 +62,8 @@ if(ENABLE_KV_EVENTS)
   endif()
 endif()
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(ha_rebuild_gate_test ha_rebuild_gate_test.cpp)
+add_store_test(rebuild_retry_test rebuild_retry_test.cpp)
 add_store_test(master_service_tenant_quota_test
                master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
@@ -115,6 +117,21 @@ add_store_test(master_snapshot_codec_test
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
+add_store_test(client_metadata_rebuild_test client_metadata_rebuild_test.cpp)
+# Live HA recovery test: standalone client (own main, no gtest) connecting to a
+# real separate mooncake_master process. Driven by ha_live_test.sh.
+add_executable(ha_recovery_live_main ha_recovery_live_main.cpp)
+target_include_directories(ha_recovery_live_main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ha_recovery_live_main
+  PUBLIC mooncake_store transfer_engine cachelib_memory_allocator
+         ${ETCD_WRAPPER_LIB} glog gflags ibverbs pthread)
+# HA scale benchmark: measures rebuild latency, scale, and recovery-window
+# latency/availability. Driven by ha_scale_bench.sh.
+add_executable(ha_scale_bench_main ha_scale_bench_main.cpp)
+target_include_directories(ha_scale_bench_main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ha_scale_bench_main
+  PUBLIC mooncake_store transfer_engine cachelib_memory_allocator
+         ${ETCD_WRAPPER_LIB} glog gflags ibverbs pthread)
 add_store_test(storage_backend_test storage_backend_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
