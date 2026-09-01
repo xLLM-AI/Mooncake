@@ -71,6 +71,46 @@ TEST(HaRebuildGateTest, EmptyRosterOpensAndTimeoutIsDegraded) {
     EXPECT_EQ(timed_out.GetServingState(), StoreServingState::DEGRADED);
     ASSERT_TRUE(timed_out.SignalRebuildComplete(UUID{1, 1}, 42).has_value());
     EXPECT_EQ(timed_out.GetServingState(), StoreServingState::SERVING);
+
+    WrappedMasterService opened(MakeConfig(false));
+    opened.LockRebuildExpectedClients({});
+    opened.SetServing(false);
+    EXPECT_EQ(opened.GetServingState(), StoreServingState::REBUILDING);
+}
+
+
+TEST(HaRebuildGateTest, ConcurrentDuplicateDoneOpensOnlyAfterExactRoster) {
+    WrappedMasterService service(MakeConfig(false));
+    const UUID first{1, 1};
+    const UUID second{2, 2};
+    service.LockRebuildExpectedClients({first, second});
+
+    std::vector<std::thread> duplicates;
+    for (int i = 0; i < 16; ++i) {
+        duplicates.emplace_back([&] {
+            EXPECT_TRUE(service.SignalRebuildComplete(first, 42).has_value());
+        });
+    }
+    for (auto& thread : duplicates) thread.join();
+    EXPECT_EQ(service.GetServingState(), StoreServingState::REBUILDING);
+
+    ASSERT_TRUE(service.SignalRebuildComplete(second, 42).has_value());
+    EXPECT_EQ(service.GetServingState(), StoreServingState::SERVING);
+}
+
+TEST(HaRebuildGateTest, TimeoutAndFinalDoneConvergeSafely) {
+    for (int iteration = 0; iteration < 5; ++iteration) {
+        WrappedMasterService service(MakeConfig(false));
+        const UUID client{1, 1};
+        service.LockRebuildExpectedClients({client});
+        std::thread timeout([&] { service.ForceServingAfterTimeout(); });
+        std::thread done([&] {
+            EXPECT_TRUE(service.SignalRebuildComplete(client, 42).has_value());
+        });
+        timeout.join();
+        done.join();
+        EXPECT_EQ(service.GetServingState(), StoreServingState::SERVING);
+    }
 }
 
 TEST(HaRebuildGateTest, RebuildingRejectsBusinessAndAllowsRecoveryRpc) {
@@ -100,10 +140,22 @@ TEST(HaRebuildGateTest, RebuildingRejectsBusinessAndAllowsRecoveryRpc) {
     ExpectUnavailable(service.RemoveByRegex(".*"));
     ExpectUnavailable(service.RemoveAll());
     ExpectUnavailable(service.BatchRemove({"key"}));
+    Segment segment;
+    segment.id = UUID{4, 4};
+    segment.name = "blocked_mount";
+    segment.size = 4096;
+    segment.base = 4096;
+    segment.te_endpoint = "127.0.0.1:1";
+    ExpectUnavailable(service.MountSegment(segment, client));
+    NoFSegment nof_segment;
+    ExpectUnavailable(service.MountNoFSegment(nof_segment, client));
+    ExpectUnavailable(service.MountLocalDiskSegment(client, true));
     ExpectUnavailable(service.CreateCopyTask("key", "default", {}));
     ExpectUnavailable(service.CreateMoveTask("key", "default", "a", "b"));
+    ExpectUnavailable(service.CopyStart(client, "key", "default", "a", {"b"}));
     ExpectUnavailable(service.CopyEnd(client, "key", "default"));
     ExpectUnavailable(service.CopyRevoke(client, "key", "default"));
+    ExpectUnavailable(service.MoveStart(client, "key", "default", "a", "b"));
     ExpectUnavailable(service.MoveEnd(client, "key", "default"));
     ExpectUnavailable(service.MoveRevoke(client, "key", "default"));
     ExpectUnavailable(service.PromotionObjectHeartbeat(client));
