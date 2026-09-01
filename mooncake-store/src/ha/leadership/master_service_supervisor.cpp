@@ -21,29 +21,30 @@
 #include "master_metric_manager.h"
 #include "rpc_service.h"
 
-// [HA rebuild gate] ★功能总开关(ld 要求:本功能必须可整体关闭)。
-// true(默认)=启用两阶段重建门控;false=升主后立即服务,作为紧急回退,
-// 不封死任何请求；非HA/单master不受影响。启用时使用两阶段重建门控
-// (封死 store → 握手窗口收集 client → 盯传输收齐完成信号 → 开服务)。
-// 这是唯一的对外开关;下面 rebuild_collect_window_ms / force_serve_timeout_ms
-// 是可选高级旋钮,仅在本开关=true 时生效,有合理默认值,平时不必设置。
+// Master switch for the HA rebuild gate. It defaults to enabled; disabling it
+// makes a promoted leader serve immediately as an emergency rollback. Non-HA
+// and single-master deployments are unaffected. When enabled, the leader closes
+// normal store traffic, collects reconnecting clients, waits for their rebuild
+// completion signals, and then opens the store. The timing flags below are
+// optional advanced settings that only apply when this switch is enabled.
 DEFINE_bool(enable_ha_rebuild_gate, true,
             "HA: master feature switch; when true, close store service on "
             "promotion and only open after client metadata rebuild completes "
             "(two-phase). true (default); false = serve immediately (rollback)");
 
-// [HA rebuild gate] 升主后"重建收集窗口"毫秒数。>0 时:新 leader 起服务后先
-// 封死 store 读写(serving_=false),放行重建流量(RebuildMetadata/ReMount),
-// 等待本窗口时长让所有故障时已存在的 client 重连+重建完,再开服务(SetServing
-// true)。<=0(默认)时:若总开关开启则回退到内置默认 7000ms;仅作高级旋钮。
-// 窗口大小建议 ≈ client 最坏重连耗时(检测3s+选主4s+重连1s≈8s)+余量。
+// Handshake window after promotion, in milliseconds. While the window is
+// active, normal store traffic remains closed and recovery RPCs such as
+// ReMountSegment and RebuildMetadata remain available. A non-positive value
+// selects the built-in 7000 ms default. This is an advanced setting; size it to
+// cover worst-case failure detection, leader election, and client reconnection.
 DEFINE_int32(rebuild_collect_window_ms, 0,
              "HA: (advanced, only when enable_ha_rebuild_gate) phase-1 handshake "
              "window ms to collect client ReMount before locking N; "
              "<=0 => built-in default 7000 when gate enabled");
 
-// [HA rebuild 两阶段] 兜底上限:升主后最多封死这么久,即使没收齐所有 client 的
-// 重建完成信号也强制开服务(防某 client 传输中挂了永不发信号导致永久封死)。
+// Maximum time to keep the store closed after promotion. On expiry, open in
+// degraded mode even if some clients never report completion, preventing a
+// failed client from blocking the entire cluster indefinitely.
 DEFINE_int32(rebuild_force_serve_timeout_ms, 120000,
              "HA: hard upper bound; force store service open this long after "
              "promotion even if not all clients signaled rebuild-complete");
@@ -189,8 +190,8 @@ void ActivateServingState(MasterAdminServer& admin_server,
                           LeaderLabelReconciler& label_reconciler) {
     admin_server.SetServiceDelegate(service);
 
-    // [HA rebuild gate] ★总开关:关闭(默认)→ 升主立即服务=原生行为,直接返回,
-    // 不封死、不开线程,完全不受本功能影响。只有显式打开才走两阶段门控。
+    // When disabled, preserve the original behavior: serve immediately and do
+    // not start any rebuild-gate timers.
     if (!FLAGS_enable_ha_rebuild_gate) {
         service->SetServing(true);
         admin_server.SetServiceAvailable(true);
@@ -201,26 +202,26 @@ void ActivateServingState(MasterAdminServer& admin_server,
     admin_server.SetServiceAvailable(true);
     SetRuntimeState(admin_server, MasterRuntimeState::kLeaderWarmup);
     label_reconciler.SetLeader(true);
-    // [HA rebuild 两阶段](仅在总开关开启时执行)升主后先封死 store,只放行重建流量。
-    // 阶段1(握手窗口,规模无关):等 window_ms 让故障时已存在的 client 重连+
-    // ReMount 报到,窗口结束锁定 N=已报到client数。阶段2(盯传输,规模相关):
-    // 等这 N 个 client 各自发 SignalRebuildComplete,收齐→开服务。兜底:force_ms
-    // 上限超时强制开服务。实现"重建完成前不提供 store 命中"(ld all-or-nothing)。
+    // Two-phase rebuild gate. Phase one allows clients to reconnect and remount
+    // during a fixed handshake window, then locks the exact expected client
+    // roster. Phase two waits for every expected client to report rebuild
+    // completion. The force timeout opens the store in degraded mode if a client
+    // never completes.
     int window_ms = FLAGS_rebuild_collect_window_ms;
-    if (window_ms <= 0) window_ms = 7000;  // 开关开启但未设窗口 → 内置默认7s
+    if (window_ms <= 0) window_ms = 7000;  // Use the built-in 7-second default.
     LOG(INFO) << "[HA-REBUILD-GATE] store CLOSED from construction; "
               << "handshake window " << window_ms
               << " ms (phase-1: collect client ReMount)";
     std::weak_ptr<WrappedMasterService> weak = service;
     const int force_ms = FLAGS_rebuild_force_serve_timeout_ms;
-    // 阶段1线程:等窗口时长 → 锁定 N = 当前活跃(已ReMount)client数。
+    // Phase one: wait for remounts, then lock the active client roster.
     std::thread([weak, window_ms] {
         std::this_thread::sleep_for(std::chrono::milliseconds(window_ms));
         if (auto s = weak.lock()) {
             s->LockRebuildExpectedClients(s->GetAliveClientsSnapshot());
         }
     }).detach();
-    // 兜底线程:force_ms 后无论如何开服务。
+    // Fallback timer: force the store open in degraded mode on timeout.
     std::thread([weak, force_ms] {
         std::this_thread::sleep_for(std::chrono::milliseconds(force_ms));
         if (auto s = weak.lock()) s->ForceServingAfterTimeout();

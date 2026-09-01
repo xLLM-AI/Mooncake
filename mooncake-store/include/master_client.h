@@ -357,8 +357,9 @@ class MasterClient {
         std::vector<KeyReplicaEntry>&& entries, ViewVersionId view_version);
 
     /**
-     * @brief HA rebuild: 通知(空的新)master "本client已把所有metadata重发完",
-     * master 收齐所有已报到 client 的此信号后开服务。
+     * @brief Tell the new empty master that this client has resent all
+     * metadata. The master starts serving after every expected client reports
+     * completion.
      */
     [[nodiscard]] tl::expected<void, ErrorCode> SignalRebuildComplete(
         ViewVersionId view_version);
