@@ -330,6 +330,19 @@ TEST_F(TransportTest, ReadEmptyFile) {
     close(fd);
 }
 
+TEST_F(TransportTest, DisableAutomaticTransportInstallation) {
+    TransferEngine engine(false);
+    engine.setAutoInstallTransport(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+
+    EXPECT_EQ(engine.getTransport("tcp"), nullptr);
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+    EXPECT_EQ(engine.getTransport("ascend"), nullptr);
+#endif
+
+    EXPECT_NE(engine.installTransport("tcp", nullptr), nullptr);
+}
+
 TEST_F(TransportTest, RegisterLocalMemoryBatchRejectsOverlappingBuffers) {
     TransferEngine engine(false);
     ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);

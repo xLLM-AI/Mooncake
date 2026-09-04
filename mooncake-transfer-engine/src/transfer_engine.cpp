@@ -286,6 +286,10 @@ void TransferEngine::setAutoDiscover(bool auto_discover) {
     impl_->setAutoDiscover(auto_discover);
 }
 
+void TransferEngine::setAutoInstallTransport(bool auto_install_transport) {
+    impl_->setAutoInstallTransport(auto_install_transport);
+}
+
 void* TransferEngine::getBaseAddr() { return impl_->getBaseAddr(); }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
@@ -822,6 +826,10 @@ bool TransferEngine::checkOverlap(void* addr, uint64_t length) {
 
 void TransferEngine::setAutoDiscover(bool auto_discover) {
     if (!use_tent_) impl_->setAutoDiscover(auto_discover);
+}
+
+void TransferEngine::setAutoInstallTransport(bool auto_install_transport) {
+    if (!use_tent_) impl_->setAutoInstallTransport(auto_install_transport);
 }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {

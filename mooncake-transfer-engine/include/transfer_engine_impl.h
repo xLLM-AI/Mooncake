@@ -381,6 +381,10 @@ class TransferEngineImpl {
 
     void setAutoDiscover(bool auto_discover) { auto_discover_ = auto_discover; }
 
+    void setAutoInstallTransport(bool auto_install_transport) {
+        auto_install_transport_ = auto_install_transport;
+    }
+
     void* getBaseAddr() { return multi_transports_->getBaseAddr(); }
 
     void setWhitelistFilters(std::vector<std::string>&& filters) {
@@ -433,9 +437,8 @@ class TransferEngineImpl {
                        std::pair<SegmentID, TransferMetadata::NotifyDesc>>
         notifies_to_send_;
 
-    // Discover topology and install transports automatically when it's true.
-    // Set it to false only for testing.
     bool auto_discover_;
+    bool auto_install_transport_ = true;
     std::vector<std::string> filter_;
     bool use_barex_ = false;
 
