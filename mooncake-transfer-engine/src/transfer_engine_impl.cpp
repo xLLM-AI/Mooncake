@@ -203,6 +203,11 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
+    if (!auto_install_transport_) {
+        LOG(INFO) << "Automatic transport installation is disabled";
+        return 0;
+    }
+
     // Universal TCP force mechanism: if MC_FORCE_TCP is set, skip all other
     // transport installation logic and use TCP transport only. This allows
     // running metadata-only instances without requiring specialized hardware

@@ -811,15 +811,14 @@ ErrorCode Client::InitTransferEngine(
             }
         }
         transfer_engine_->setAutoDiscover(
-            {.enabled = auto_discover, .protocol = protocol});
+            {.enabled = false, .protocol = protocol});
+        transfer_engine_->setAutoInstallTransport(false);
 
         // Honor filters when auto-discovery is enabled; otherwise warn once
         if (auto_discover) {
             LOG(INFO)
                 << "Transfer engine auto discovery is enabled for protocol: "
                 << protocol;
-            auto filters = get_auto_discover_filters();
-            transfer_engine_->setWhitelistFilters(std::move(filters));
         } else {
             const char* env_filters = std::getenv("MC_MS_FILTERS");
             if (env_filters && *env_filters != '\0') {
@@ -868,31 +867,23 @@ ErrorCode Client::InitTransferEngine(
         return ErrorCode::OK;
     }
 
-    if (!auto_discover) {
-        LOG(INFO) << "Transfer engine auto discovery is disabled for protocol: "
-                  << protocol;
+    {
+        LOG(INFO) << "Installing requested Store transport: " << protocol;
 
         Transport* transport = nullptr;
 
         if (protocol == "rdma" || protocol == "efa") {
-            if (!device_names.has_value() || device_names->empty()) {
-                LOG(ERROR) << "RDMA protocol requires device names when auto "
-                              "discovery is disabled";
-                return ErrorCode::INVALID_PARAMS;
-            }
-
-            LOG(INFO) << "Using specified RDMA devices: "
-                      << device_names.value();
-
-            std::vector<std::string> devices =
-                ParseDeviceNames(device_names.value());
-
-            // Manually discover topology with specified devices only
             auto topology = transfer_engine_->getLocalTopology();
             if (topology) {
-                topology->discover(devices);
-                LOG(INFO) << "Topology discovery complete with specified "
-                             "devices. Found "
+                if (device_names.has_value() && !device_names->empty()) {
+                    LOG(INFO) << "Using specified RDMA devices: "
+                              << device_names.value();
+                    topology->discover(ParseDeviceNames(device_names.value()));
+                } else {
+                    LOG(INFO) << "Auto-discovering RDMA devices";
+                    topology->discover(get_auto_discover_filters());
+                }
+                LOG(INFO) << "Topology discovery complete. Found "
                           << topology->getHcaList().size() << " HCAs";
             }
 

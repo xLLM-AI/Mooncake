@@ -263,6 +263,8 @@ class TransferEngine {
     void setAutoDiscover(bool auto_discover);
     void setAutoDiscover(const AutoDiscoverConfig& config);
 
+    void setAutoInstallTransport(bool auto_install_transport);
+
     void* getBaseAddr();
 
     void setWhitelistFilters(std::vector<std::string>&& filters);
