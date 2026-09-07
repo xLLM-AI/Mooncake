@@ -49,6 +49,44 @@ check_success() {
     fi
 }
 
+install_msgpack_cxx_headers() {
+    print_section "Installing msgpack-cxx"
+
+    if [ -f /usr/include/msgpack.hpp ] || [ -f /usr/local/include/msgpack.hpp ]; then
+        echo -e "${YELLOW}msgpack-cxx headers are already installed. Skipping...${NC}"
+        return
+    fi
+
+    local version="cpp-6.1.0"
+    local repo_url="https://gitcode.com/gh_mirrors/ms/msgpack-c.git"
+    local work_dir
+
+    echo "Creating temporary directory for msgpack-cxx..."
+    work_dir=$(mktemp -d -t msgpack-cxx-XXXXXX)
+    check_success "Failed to create msgpack-cxx temporary directory"
+
+    echo "Cloning msgpack-cxx ${version} from ${repo_url}..."
+    git clone --depth 1 --branch "${version}" "${repo_url}" "${work_dir}/msgpack-c"
+    check_success "Failed to clone msgpack-c ${version}"
+
+    echo "Installing msgpack-cxx headers to /usr/local/include..."
+    mkdir -p /usr/local/include/msgpack
+    check_success "Failed to create msgpack-cxx include directory"
+    install -m 0644 "${work_dir}/msgpack-c/include/msgpack.hpp" /usr/local/include/msgpack.hpp
+    check_success "Failed to install msgpack.hpp"
+    cp -a "${work_dir}/msgpack-c/include/msgpack/." /usr/local/include/msgpack/
+    check_success "Failed to install msgpack-cxx headers"
+
+    rm -rf "${work_dir}"
+    check_success "Failed to clean up msgpack-cxx temporary directory"
+
+    if [ ! -f /usr/local/include/msgpack.hpp ]; then
+        print_error "msgpack-cxx installation verification failed"
+    fi
+
+    print_success "msgpack-cxx ${version} headers installed successfully"
+}
+
 read_os_release_value() {
     local key="$1"
     awk -F= -v key="$key" '
@@ -201,7 +239,6 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      libunwind-devel \
                      numactl-devel \
                      python3-devel \
-                     boost1.78-devel \
                      openssl-devel \
                      protobuf-devel \
                      yaml-cpp-devel \
@@ -209,7 +246,6 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      hiredis-devel \
                      liburing-devel \
                      jemalloc-devel \
-                     msgpack-devel \
                      libzstd-devel \
                      pkgconf-pkg-config \
                      elfutils-libelf-devel \
@@ -217,13 +253,16 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      xxhash-devel \
                      libbsd-devel"
 
-    yum install -y $SYSTEM_PACKAGES
+    yum install -y --skip-broken $SYSTEM_PACKAGES
     check_success "Failed to install system packages"
 else
     print_error "Unsupported OS: $OS"
 fi
 
 print_success "System packages installed successfully"
+if [ "$OS" = "openeuler" ]; then
+    install_msgpack_cxx_headers
+fi
 
 # Initialize and update git submodules
 print_section "Initializing Git Submodules"
