@@ -213,6 +213,13 @@ class OffsetBufferAllocator
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
 
+    // HA rebuild: allocate `size` to obtain a legit ownership handle (correct
+    // accounting + safe deallocation), but point the buffer's data address at
+    // `real_addr` (the client's actual address where data physically lives).
+    // The self-chosen allocate address is discarded.
+    std::unique_ptr<AllocatedBuffer> AllocateForRebuild(size_t size,
+                                                        void* real_addr);
+
     void deallocate(AllocatedBuffer* handle) override;
 
     size_t capacity() const override { return total_size_; }

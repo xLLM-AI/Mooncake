@@ -239,6 +239,14 @@ class ScopedSegmentAccess {
      */
     void UnmountLocalDiskSegment(const UUID& client_id);
 
+    // HA rebuild: find the owning segment's buffer allocator for a replica the
+    // client reports by (te_endpoint, buffer_address). endpoint alone is
+    // ambiguous (same host -> shared endpoint, 1:N), so disambiguate by
+    // requiring buffer_address in [segment.base, base+size). Returns nullptr if
+    // no OK-status segment matches.
+    std::shared_ptr<BufferAllocatorBase> FindAllocatorByEndpointAndAddr(
+        const std::string& te_endpoint, uintptr_t buffer_address) const;
+
    private:
     SegmentManager* segment_manager_;
     std::unique_lock<std::shared_mutex> lock_;

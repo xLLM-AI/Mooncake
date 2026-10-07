@@ -10,6 +10,7 @@
 #include <thread>
 
 #include <glog/logging.h>
+#include <gflags/gflags.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "ha/leadership/leader_coordinator_factory.h"
@@ -17,7 +18,36 @@
 #include "ha/standby_controller.h"
 #include "k8s_lease_helper.h"
 #include "master_admin_service.h"
+#include "master_metric_manager.h"
 #include "rpc_service.h"
+
+// Master switch for the HA rebuild gate. It defaults to enabled; disabling it
+// makes a promoted leader serve immediately as an emergency rollback. Non-HA
+// and single-master deployments are unaffected. When enabled, the leader closes
+// normal store traffic, collects reconnecting clients, waits for their rebuild
+// completion signals, and then opens the store. The timing flags below are
+// optional advanced settings that only apply when this switch is enabled.
+DEFINE_bool(enable_ha_rebuild_gate, true,
+            "HA: master feature switch; when true, close store service on "
+            "promotion and only open after client metadata rebuild completes "
+            "(two-phase). true (default); false = serve immediately (rollback)");
+
+// Handshake window after promotion, in milliseconds. While the window is
+// active, normal store traffic remains closed and recovery RPCs such as
+// ReMountSegment and RebuildMetadata remain available. A non-positive value
+// selects the built-in 7000 ms default. This is an advanced setting; size it to
+// cover worst-case failure detection, leader election, and client reconnection.
+DEFINE_int32(rebuild_collect_window_ms, 0,
+             "HA: (advanced, only when enable_ha_rebuild_gate) phase-1 handshake "
+             "window ms to collect client ReMount before locking N; "
+             "<=0 => built-in default 7000 when gate enabled");
+
+// Maximum time to keep the store closed after promotion. On expiry, open in
+// degraded mode even if some clients never report completion, preventing a
+// failed client from blocking the entire cluster indefinitely.
+DEFINE_int32(rebuild_force_serve_timeout_ms, 120000,
+             "HA: hard upper bound; force store service open this long after "
+             "promotion even if not all clients signaled rebuild-complete");
 
 namespace mooncake {
 namespace ha {
@@ -159,9 +189,43 @@ void ActivateServingState(MasterAdminServer& admin_server,
                           const std::shared_ptr<WrappedMasterService>& service,
                           LeaderLabelReconciler& label_reconciler) {
     admin_server.SetServiceDelegate(service);
+
+    // When disabled, preserve the original behavior: serve immediately and do
+    // not start any rebuild-gate timers.
+    if (!FLAGS_enable_ha_rebuild_gate) {
+        service->SetServing(true);
+        admin_server.SetServiceAvailable(true);
+        SetRuntimeState(admin_server, MasterRuntimeState::kServing);
+        label_reconciler.SetLeader(true);
+        return;
+    }
     admin_server.SetServiceAvailable(true);
-    SetRuntimeState(admin_server, MasterRuntimeState::kServing);
+    SetRuntimeState(admin_server, MasterRuntimeState::kLeaderWarmup);
     label_reconciler.SetLeader(true);
+    // Two-phase rebuild gate. Phase one allows clients to reconnect and remount
+    // during a fixed handshake window, then locks the exact expected client
+    // roster. Phase two waits for every expected client to report rebuild
+    // completion. The force timeout opens the store in degraded mode if a client
+    // never completes.
+    int window_ms = FLAGS_rebuild_collect_window_ms;
+    if (window_ms <= 0) window_ms = 7000;  // Use the built-in 7-second default.
+    LOG(INFO) << "[HA-REBUILD-GATE] store CLOSED from construction; "
+              << "handshake window " << window_ms
+              << " ms (phase-1: collect client ReMount)";
+    std::weak_ptr<WrappedMasterService> weak = service;
+    const int force_ms = FLAGS_rebuild_force_serve_timeout_ms;
+    // Phase one: wait for remounts, then lock the active client roster.
+    std::thread([weak, window_ms] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(window_ms));
+        if (auto s = weak.lock()) {
+            s->LockRebuildExpectedClients(s->GetAliveClientsSnapshot());
+        }
+    }).detach();
+    // Fallback timer: force the store open in degraded mode on timeout.
+    std::thread([weak, force_ms] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(force_ms));
+        if (auto s = weak.lock()) s->ForceServingAfterTimeout();
+    }).detach();
 }
 
 void DeactivateServingState(MasterAdminServer& admin_server,
@@ -381,10 +445,12 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
         // The serving primary handles heartbeats/unmounts, so forward the
         // metadata cleanup config here like the non-HA path does.
+        auto wrapped_config = mooncake::WrappedMasterServiceConfig(
+            config, leadership_session->view.view_version);
+        wrapped_config.initially_serving = !FLAGS_enable_ha_rebuild_gate;
         auto wrapped_master_service = std::make_shared<WrappedMasterService>(
-            mooncake::WrappedMasterServiceConfig(
-                config, leadership_session->view.view_version),
-            config.http_metadata_server, config.http_metadata_remote_url);
+            wrapped_config, config.http_metadata_server,
+            config.http_metadata_remote_url);
         mooncake::RegisterRpcService(server, *wrapped_master_service);
 
         auto serve_preflight =
