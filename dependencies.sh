@@ -58,6 +58,7 @@ install_msgpack_cxx_headers() {
     fi
 
     local version="cpp-6.1.0"
+    local expected_commit="8c602e8579c7e7d65d6f9c6703c9699db3fb0488"
     local repo_url="https://gitcode.com/gh_mirrors/ms/msgpack-c.git"
     local work_dir
 
@@ -68,6 +69,10 @@ install_msgpack_cxx_headers() {
     echo "Cloning msgpack-cxx ${version} from ${repo_url}..."
     git clone --depth 1 --branch "${version}" "${repo_url}" "${work_dir}/msgpack-c"
     check_success "Failed to clone msgpack-c ${version}"
+    if [ "$(git -C "${work_dir}/msgpack-c" rev-parse HEAD)" != "${expected_commit}" ]; then
+        rm -rf "${work_dir}"
+        print_error "msgpack-c ${version} does not match the expected commit"
+    fi
 
     echo "Installing msgpack-cxx headers to /usr/local/include..."
     mkdir -p /usr/local/include/msgpack
@@ -260,9 +265,7 @@ else
 fi
 
 print_success "System packages installed successfully"
-if [ "$OS" = "openeuler" ]; then
-    install_msgpack_cxx_headers
-fi
+install_msgpack_cxx_headers
 
 # Initialize and update git submodules
 print_section "Initializing Git Submodules"
