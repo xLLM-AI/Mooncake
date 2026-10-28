@@ -354,7 +354,8 @@ MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
         .state = state_,
         .leader_view = leader_view_,
         .service = service_,
-        .service_available = service_available_,
+        .service_available =
+            service_available_ && service_ && service_->IsServing(),
     };
 }
 

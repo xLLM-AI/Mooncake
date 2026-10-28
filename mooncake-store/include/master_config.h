@@ -425,6 +425,8 @@ class WrappedMasterServiceConfig {
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
+    bool initially_serving = true;
+    bool enable_ha_rebuild = false;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms =
@@ -1263,6 +1265,8 @@ inline MasterServiceConfigBuilder MasterServiceConfig::builder() {
 
 // Configuration for InProcMaster (in-process master server for testing)
 struct InProcMasterConfig {
+    bool enable_multi_tenants{false};
+    std::string tenant_quota_connector_uri;
     std::optional<int> rpc_port;
     std::optional<int> http_metrics_port;
     std::optional<int> http_metadata_port;

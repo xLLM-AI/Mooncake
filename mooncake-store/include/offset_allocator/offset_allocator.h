@@ -96,6 +96,7 @@ class OffsetAllocationHandle {
 
     // Get size
     uint64_t size() const { return requested_size; }
+    uint64_t extent() const;
 
    private:
     std::weak_ptr<OffsetAllocator> m_allocator;
@@ -155,6 +156,9 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // Allocate memory and return a Handle (thread-safe)
     [[nodiscard]]
     std::optional<OffsetAllocationHandle> allocate(size_t size);
+
+    std::optional<OffsetAllocationHandle> reserve(uint64_t address, size_t size,
+                                                  size_t extent = 0);
 
     // Get storage report (thread-safe)
     [[nodiscard]]
@@ -225,6 +229,7 @@ class __Allocator {
     void reset();
 
     OffsetAllocation allocate(uint32 size);
+    OffsetAllocation reserve(uint32 offset, uint32 size);
     void free(OffsetAllocation allocation);
 
     uint32 allocationSize(OffsetAllocation allocation) const;

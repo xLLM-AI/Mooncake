@@ -184,10 +184,13 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
                 allocator = std::make_shared<CachelibBufferAllocator>(
                     segment.name, buffer, size, segment.te_endpoint);
                 break;
-            case BufferAllocatorType::OFFSET:
-                allocator = std::make_shared<OffsetBufferAllocator>(
+            case BufferAllocatorType::OFFSET: {
+                auto offset_allocator = std::make_shared<OffsetBufferAllocator>(
                     segment.name, buffer, size, segment.te_endpoint);
-                break;
+                offset_allocator->setAllocationEpoch(
+                    segment_manager_->allocation_epoch_);
+                allocator = std::move(offset_allocator);
+            } break;
             default:
                 LOG(ERROR) << "segment_name=" << segment.name
                            << ", error=unknown_memory_allocator="
@@ -410,6 +413,22 @@ ErrorCode ScopedSegmentAccess::GetClientSegments(
         }
     }
     return ErrorCode::OK;
+}
+
+std::shared_ptr<BufferAllocatorBase>
+ScopedSegmentAccess::FindAllocatorByEndpointAndAddr(
+    const std::string& te_endpoint, uintptr_t buffer_address) const {
+    for (const auto& [id, ms] : segment_manager_->mounted_segments_) {
+        if (ms.status != SegmentStatus::OK) continue;
+        if (ms.segment.te_endpoint != te_endpoint) continue;
+        // Disambiguate 1:N endpoint sharing by address range.
+        const uintptr_t base = ms.segment.base;
+        const uintptr_t end = base + ms.segment.size;
+        if (buffer_address >= base && buffer_address < end) {
+            return ms.buf_allocator;
+        }
+    }
+    return nullptr;
 }
 
 void ScopedSegmentAccess::UnmountLocalDiskSegment(const UUID& client_id) {
@@ -859,6 +878,13 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                 Serializer<MountedSegment>::deserialize(segment_value);
             if (!result) {
                 return tl::unexpected(result.error());
+            }
+
+            if (auto allocator =
+                    std::dynamic_pointer_cast<OffsetBufferAllocator>(
+                        result->buf_allocator)) {
+                allocator->setAllocationEpoch(
+                    segment_manager_->allocation_epoch_);
             }
 
             segment_manager_->mounted_segments_.emplace(

@@ -284,6 +284,58 @@ OffsetAllocation __Allocator::allocate(uint32 size) {
     return OffsetAllocation(node.dataOffset, nodeIndex);
 }
 
+OffsetAllocation __Allocator::reserve(uint32 offset, uint32 size) {
+    const OffsetAllocation failure(OffsetAllocation::NO_SPACE,
+                                   OffsetAllocation::NO_SPACE);
+    if (size == 0 || offset > m_size || size > m_size - offset) return failure;
+    uint32 containing = Node::unused;
+    for (uint32 bin = 0; bin < NUM_LEAF_BINS && containing == Node::unused;
+         ++bin) {
+        for (uint32 index = m_binIndices[bin]; index != Node::unused;
+             index = m_nodes[index].binListNext) {
+            const auto& node = m_nodes[index];
+            if (offset >= node.dataOffset &&
+                offset - node.dataOffset <= node.dataSize &&
+                size <= node.dataSize - (offset - node.dataOffset)) {
+                containing = index;
+                break;
+            }
+        }
+    }
+    if (containing == Node::unused) return failure;
+    const Node original = m_nodes[containing];
+    const uint32 prefix = offset - original.dataOffset;
+    const uint32 suffix = original.dataSize - prefix - size;
+    const uint32 extra = (prefix != 0) + (suffix != 0);
+    if (extra > m_max_capacity - m_freeOffset) return failure;
+    while (m_current_capacity < m_freeOffset + extra) {
+        m_freeNodes.push_back(m_current_capacity++);
+        m_nodes.emplace_back();
+    }
+    removeNodeFromBin(containing);
+    const uint32 used = m_freeNodes[m_freeOffset++];
+    m_nodes[used] = {.dataOffset = offset, .dataSize = size, .used = true};
+    uint32 first = used;
+    uint32 last = used;
+    if (prefix != 0) {
+        first = insertNodeIntoBin(prefix, original.dataOffset);
+        m_nodes[first].neighborNext = used;
+        m_nodes[used].neighborPrev = first;
+    }
+    if (suffix != 0) {
+        last = insertNodeIntoBin(suffix, offset + size);
+        m_nodes[last].neighborPrev = used;
+        m_nodes[used].neighborNext = last;
+    }
+    m_nodes[first].neighborPrev = original.neighborPrev;
+    m_nodes[last].neighborNext = original.neighborNext;
+    if (original.neighborPrev != Node::unused)
+        m_nodes[original.neighborPrev].neighborNext = first;
+    if (original.neighborNext != Node::unused)
+        m_nodes[original.neighborNext].neighborPrev = last;
+    return OffsetAllocation(offset, used);
+}
+
 void __Allocator::free(OffsetAllocation allocation) {
     ASSERT(allocation.metadata != OffsetAllocation::NO_SPACE);
     if (m_nodes.empty()) return;
@@ -522,6 +574,14 @@ OffsetAllocationHandle& OffsetAllocationHandle::operator=(
     return *this;
 }
 
+uint64_t OffsetAllocationHandle::extent() const {
+    auto allocator = m_allocator.lock();
+    if (!allocator) return 0;
+    MutexLocker guard(&allocator->m_mutex);
+    return uint64_t{allocator->m_allocator->allocationSize(m_allocation)}
+           << allocator->m_multiplier_bits;
+}
+
 OffsetAllocationHandle::~OffsetAllocationHandle() {
     auto allocator = m_allocator.lock();
     if (allocator) {
@@ -603,6 +663,35 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     return OffsetAllocationHandle(
         shared_from_this(), allocation,
         m_base + (allocation.getOffset() << m_multiplier_bits), size);
+}
+
+std::optional<OffsetAllocationHandle> OffsetAllocator::reserve(uint64_t address,
+                                                               size_t size,
+                                                               size_t extent) {
+    MutexLocker guard(&m_mutex);
+    if (!m_allocator || size == 0 || address < m_base) return std::nullopt;
+    const uint64_t offset = address - m_base;
+    if (offset > m_capacity || size > m_capacity - offset) return std::nullopt;
+    const uint64_t unit = uint64_t{1} << m_multiplier_bits;
+    if (offset % unit != 0) return std::nullopt;
+    uint64_t units = (size - 1) / unit + 1;
+    if (units > SmallFloat::MAX_BIN_SIZE) return std::nullopt;
+#ifndef OFFSET_ALLOCATOR_NOT_ROUND_UP
+    units = SmallFloat::floatToUint(SmallFloat::uintToFloatRoundUp(units));
+#endif
+    if (extent != 0) {
+        if (extent < size || extent % unit != 0) return std::nullopt;
+        units = extent / unit;
+    }
+    if (units > SmallFloat::MAX_BIN_SIZE ||
+        units > (m_capacity - offset) / unit)
+        return std::nullopt;
+    auto allocation = m_allocator->reserve(offset >> m_multiplier_bits, units);
+    if (allocation.isNoSpace()) return std::nullopt;
+    m_allocated_size += size;
+    ++m_allocated_num;
+    return OffsetAllocationHandle(shared_from_this(), allocation, address,
+                                  size);
 }
 
 OffsetAllocStorageReport OffsetAllocator::storageReport() const {

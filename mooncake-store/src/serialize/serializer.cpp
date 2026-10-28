@@ -489,7 +489,7 @@ auto Serializer<offset_allocator::OffsetAllocationHandle>::deserialize(
 tl::expected<void, SerializationError> Serializer<AllocatedBuffer>::serialize(
     const AllocatedBuffer &buffer, const SegmentView &segment_view,
     MsgpackPacker &packer) {
-    packer.pack_array(5);
+    packer.pack_array(6);
 
     // Serialize basic properties
     // packer.pack(buffer.segment_name_);
@@ -542,6 +542,7 @@ tl::expected<void, SerializationError> Serializer<AllocatedBuffer>::serialize(
         packer.pack_nil();
     }
 
+    packer.pack(buffer.allocation_epoch_);
     return {};
 }
 
@@ -556,13 +557,11 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
                                "msgpack data, expected array"));
     }
 
-    // Verify array size is correct (should have 5 elements: size, buffer_ptr,
-    // segment_id, has_offset_handle, offset_handle)
-    if (obj.via.array.size != 5) {
+    if (obj.via.array.size != 5 && obj.via.array.size != 6) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             fmt::format("deserialize_msgpack AllocatedBuffer invalid array "
-                        "size: expected 5, got {}",
+                        "size: expected 5 or 6, got {}",
                         obj.via.array.size)));
     }
 
@@ -643,6 +642,8 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
     // Create AllocatedBuffer object
     auto buffer = std::make_unique<AllocatedBuffer>(allocator, buffer_ptr, size,
                                                     std::move(offsetHandle));
+    if (obj.via.array.size == 6)
+        buffer->allocation_epoch_ = array_items[5].as<int64_t>();
     // buffer->status = status;
 
     return buffer;

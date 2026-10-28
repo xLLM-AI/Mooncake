@@ -11,6 +11,54 @@
 
 namespace mooncake::offset_allocator {
 
+TEST(OffsetAllocatorRecoveryTest, ReverseImportRemoveAndWritePreservesBytes) {
+    std::vector<unsigned char> bytes(4096);
+    const auto base = reinterpret_cast<uint64_t>(bytes.data());
+    auto original = OffsetAllocator::create(base, bytes.size(), 8, 128);
+    auto first = original->allocate(129);
+    auto second = original->allocate(129);
+    auto third = original->allocate(129);
+    ASSERT_TRUE(first && second && third);
+    std::fill_n(static_cast<unsigned char*>(second->ptr()), 129, 0x5a);
+    auto recovered = OffsetAllocator::create(base, bytes.size(), 2, 128);
+    auto restored_third =
+        recovered->reserve(third->address(), 129, third->extent());
+    auto restored_second =
+        recovered->reserve(second->address(), 129, second->extent());
+    auto restored_first =
+        recovered->reserve(first->address(), 129, first->extent());
+    ASSERT_TRUE(restored_first && restored_second && restored_third);
+    EXPECT_EQ(restored_second->address(), second->address());
+    EXPECT_EQ(restored_second->extent(), second->extent());
+    EXPECT_FALSE(recovered->reserve(second->address(), 129));
+    restored_first.reset();
+    auto replacement = recovered->allocate(129);
+    ASSERT_TRUE(replacement);
+    std::fill_n(static_cast<unsigned char*>(replacement->ptr()), 129, 0xa5);
+    EXPECT_TRUE(
+        std::all_of(static_cast<unsigned char*>(restored_second->ptr()),
+                    static_cast<unsigned char*>(restored_second->ptr()) + 129,
+                    [](unsigned char value) { return value == 0x5a; }));
+    replacement.reset();
+    restored_second.reset();
+    restored_third.reset();
+    EXPECT_EQ(recovered->storageReport().totalFreeSpace, bytes.size());
+}
+
+TEST(OffsetAllocatorRecoveryTest, RejectsInvalidRangesWithoutChangingCapacity) {
+    auto allocator = OffsetAllocator::create(4096, 1024, 2, 3);
+    EXPECT_FALSE(allocator->reserve(4095, 128));
+    EXPECT_FALSE(allocator->reserve(5120, 1));
+    EXPECT_FALSE(allocator->reserve(5000, 256));
+    EXPECT_FALSE(allocator->reserve(4096, 0));
+    EXPECT_FALSE(allocator->reserve(4096, 129, 128));
+    auto middle = allocator->reserve(4352, 128);
+    ASSERT_TRUE(middle);
+    EXPECT_FALSE(allocator->reserve(4608, 128));
+    middle.reset();
+    EXPECT_EQ(allocator->storageReport().totalFreeSpace, 1024);
+}
+
 // 240 bins, according to https://github.com/sebbbi/OffsetAllocator
 constexpr uint32 NUM_BINS = 240;
 const uint32 bin_sizes[] = {

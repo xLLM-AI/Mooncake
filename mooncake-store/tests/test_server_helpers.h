@@ -108,6 +108,12 @@ class InProcMaster {
             }
 
             WrappedMasterServiceConfig wms_cfg;
+            wms_cfg.enable_multi_tenants = config.enable_multi_tenants;
+            if (!config.tenant_quota_connector_uri.empty()) {
+                wms_cfg.tenant_quota_connector_type = "file";
+                wms_cfg.tenant_quota_connector_uri =
+                    config.tenant_quota_connector_uri;
+            }
             wms_cfg.default_kv_lease_ttl = default_kv_lease_ttl;
             wms_cfg.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
             wms_cfg.allow_evict_soft_pinned_objects = true;

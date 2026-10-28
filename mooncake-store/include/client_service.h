@@ -15,6 +15,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
+#include "rebuild_replica_table.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -23,6 +24,7 @@
 #include "transfer_task.h"
 #include "types.h"
 #include "replica.h"
+#include "rebuild_types.h"
 #include "master_metric_manager.h"
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
@@ -66,6 +68,54 @@ class Client {
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+    bool IsHaRebuildEnabled() const { return enable_ha_rebuild_; }
+    void PauseRebuildNotifiesForTest(bool paused) {
+        rebuild_notifies_paused_.store(paused);
+    }
+    void SetRebuildNotifyTimeoutForTest(std::chrono::milliseconds timeout) {
+        rebuild_notify_timeout_ms_.store(timeout.count());
+    }
+    void SetBeforeUpsertEndForTest(std::function<void()> callback) {
+        before_upsert_end_for_test_ = std::move(callback);
+    }
+    size_t PendingNotifyEntryCountForTest() const {
+        std::lock_guard<std::mutex> lock(pending_notifies_mutex_);
+        size_t count = 0;
+        for (const auto& [request_id, pending] : pending_notifies_)
+            count += pending.entries.size();
+        return count;
+    }
+    uint64_t RebuildSnapshotCountForTest() const {
+        return rebuild_snapshot_count_.load();
+    }
+
+    std::vector<KeyReplicaEntry> LocalReplicaSnapshotForTest() const {
+        std::lock_guard<std::mutex> lock(local_replica_table_mutex_);
+        return local_replica_table_.Snapshot();
+    }
+
+    // --- test-only helpers for the notify-reliability backstop ---
+    // Number of endpoints with parked (failed, awaiting-retry) notifies.
+    size_t PendingNotifyBucketCountForTest() const {
+        std::lock_guard<std::mutex> lk(pending_notifies_mutex_);
+        return pending_notifies_.size();
+    }
+    // Park a notify aimed at `ep` carrying `key` (used to simulate a dropped
+    // send, then verify the background loop re-delivers it).
+    void ParkNotifyForTest(const std::string& ep, const std::string& key,
+                           const Replica::Descriptor& replica, uint64_t size,
+                           ObjectDataType data_type,
+                           const std::string& group_id,
+                           const std::string& tenant_id) {
+        KeyReplicaEntry e;
+        e.key = key;
+        e.tenant_id = tenant_id;
+        e.size = size;
+        e.data_type = data_type;
+        e.group_id = group_id;
+        e.replicas = {replica};
+        ParkPendingNotify(ep, {std::move(e)});
+    }
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -660,6 +710,7 @@ class Client {
            const std::string& tenant_id = "default");
 
    private:
+    friend struct ClientTestAccess;
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -778,6 +829,31 @@ class Client {
         std::unordered_map<std::string, std::vector<Slice>>& slices);
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
 
+    // === HA rebuild: client-side helpers (impl in client_service.cpp) ===
+    tl::expected<void, ErrorCode> RecordCommittedReplicas(
+        const std::string& key, const std::string& tenant_id,
+        bool memory_committed = true);
+    std::vector<tl::expected<void, ErrorCode>> BatchRecordCommittedReplicas(
+        const std::vector<std::string>& keys, const std::string& tenant_id);
+    // Is `ep` one of THIS client's mounted segments' te_endpoint? (Never
+    // compare against local_hostname_ -- a segment's te_endpoint =
+    // getLocalIpAndPort().)
+    bool IsMyEndpoint(const std::string& ep);
+    // On reconnect, resend the whole local table to the (empty) new master.
+    tl::expected<void, ErrorCode> ResendLocalReplicaTable(
+        ViewVersionId view_version);
+    // Background loop: poll getNotifies() and apply UPSERT entries.
+    void RebuildNotifyLoop();
+    tl::expected<void, ErrorCode> ApplyOwnedRebuildEntries(
+        const std::vector<KeyReplicaEntry>& entries);
+    bool WaitForPendingNotifies(const std::vector<uint64_t>& request_ids = {});
+    bool SendUpsertNotify(const std::string& ep,
+                          const std::vector<KeyReplicaEntry>& entries,
+                          uint64_t request_id);
+    uint64_t ParkPendingNotify(const std::string& ep,
+                               const std::vector<KeyReplicaEntry>& entries);
+    void FlushPendingNotifies();
+
     // Client identification
     const UUID client_id_;
 
@@ -792,6 +868,25 @@ class Client {
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
+
+    bool enable_ha_rebuild_{false};
+    mutable std::mutex local_replica_table_mutex_;
+    RebuildReplicaTable local_replica_table_;
+    std::optional<ViewVersionId> rebuild_replay_view_;
+    std::atomic<bool> rebuild_notify_thread_running_{false};
+    std::atomic<bool> rebuild_notifies_paused_{false};
+    std::atomic<uint64_t> rebuild_snapshot_count_{0};
+    std::thread rebuild_notify_thread_;  // polls getNotifies()
+    mutable std::mutex pending_notifies_mutex_;
+    struct PendingRebuildNotify {
+        std::string endpoint;
+        std::vector<KeyReplicaEntry> entries;
+    };
+    std::unordered_map<uint64_t, PendingRebuildNotify> pending_notifies_;
+    uint64_t next_notify_id_{1};
+    std::condition_variable pending_notifies_cv_;
+    std::atomic<int64_t> rebuild_notify_timeout_ms_{30000};
+    std::function<void()> before_upsert_end_for_test_;
 
     // Segments in graceful unmount: readable by remote peers, not allocatable
     // locally. TE MR remains registered until master confirms removal.
@@ -843,6 +938,7 @@ class Client {
     std::atomic<bool> last_ping_success_{false};
     std::atomic<bool> segment_desc_publish_pending_{false};
     std::atomic<bool> rpc_meta_publish_pending_{false};
+    std::atomic<bool> rebuild_retry_pending_{false};
     ErrorCode SwitchLeader(const ha::MasterView& target_view);
     void LeaderMonitorThreadMain();
     void StorageHeartbeatThreadMain();

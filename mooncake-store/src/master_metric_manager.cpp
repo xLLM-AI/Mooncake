@@ -126,6 +126,27 @@ MasterMetricManager::MasterMetricManager()
       remount_segment_failures_(
           "master_remount_segment_failures_total",
           "Total number of failed RemountSegment requests"),
+      rebuild_metadata_requests_(
+          "master_rebuild_metadata_requests_total",
+          "Total number of RebuildMetadata requests received"),
+      rebuild_metadata_failures_(
+          "master_rebuild_metadata_failures_total",
+          "Total number of failed RebuildMetadata requests"),
+      rebuild_state_("master_rebuild_state",
+                     "HA rebuild state: 0 rebuilding, 1 serving, 2 degraded"),
+      rebuild_expected_clients_("master_rebuild_expected_clients",
+                                "Expected clients in the current rebuild"),
+      rebuild_completed_clients_("master_rebuild_completed_clients",
+                                 "Completed clients in the current rebuild"),
+      rebuild_missing_clients_("master_rebuild_missing_clients",
+                               "Missing clients in the current rebuild"),
+      rebuild_duration_ms_("master_rebuild_duration_ms",
+                           "Duration of the current rebuild in milliseconds"),
+      rebuild_force_open_("master_rebuild_force_open_total",
+                          "Total number of degraded force opens"),
+      rebuild_stale_epoch_requests_(
+          "master_rebuild_stale_epoch_requests_total",
+          "Total number of stale rebuild requests"),
       mount_nof_segment_requests_(
           "master_mount_nof_segment_requests_total",
           "Total number of MountNoFSegment requests received"),
@@ -996,6 +1017,33 @@ void MasterMetricManager::inc_remount_segment_requests(int64_t val) {
 void MasterMetricManager::inc_remount_segment_failures(int64_t val) {
     remount_segment_failures_.inc(val);
 }
+void MasterMetricManager::inc_rebuild_metadata_requests(int64_t val) {
+    rebuild_metadata_requests_.inc(val);
+}
+void MasterMetricManager::inc_rebuild_metadata_failures(int64_t val) {
+    rebuild_metadata_failures_.inc(val);
+}
+void MasterMetricManager::set_rebuild_state(int64_t state) {
+    rebuild_state_.update(state);
+}
+void MasterMetricManager::set_rebuild_expected_clients(int64_t clients) {
+    rebuild_expected_clients_.update(clients);
+}
+void MasterMetricManager::set_rebuild_completed_clients(int64_t clients) {
+    rebuild_completed_clients_.update(clients);
+}
+void MasterMetricManager::set_rebuild_missing_clients(int64_t clients) {
+    rebuild_missing_clients_.update(clients);
+}
+void MasterMetricManager::set_rebuild_duration_ms(int64_t duration_ms) {
+    rebuild_duration_ms_.update(duration_ms);
+}
+void MasterMetricManager::inc_rebuild_force_open(int64_t val) {
+    rebuild_force_open_.inc(val);
+}
+void MasterMetricManager::inc_rebuild_stale_epoch_requests(int64_t val) {
+    rebuild_stale_epoch_requests_.inc(val);
+}
 void MasterMetricManager::inc_remount_nof_segment_requests(int64_t val) {
     remount_nof_segment_requests_.inc(val);
 }
@@ -1789,6 +1837,11 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
     serialize_metric(active_clients_);
+    serialize_metric(rebuild_state_);
+    serialize_metric(rebuild_expected_clients_);
+    serialize_metric(rebuild_completed_clients_);
+    serialize_metric(rebuild_missing_clients_);
+    serialize_metric(rebuild_duration_ms_);
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);
@@ -1819,6 +1872,10 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(unmount_segment_failures_);
     serialize_metric(remount_segment_requests_);
     serialize_metric(remount_segment_failures_);
+    serialize_metric(rebuild_metadata_requests_);
+    serialize_metric(rebuild_metadata_failures_);
+    serialize_metric(rebuild_force_open_);
+    serialize_metric(rebuild_stale_epoch_requests_);
     serialize_metric(mount_nof_segment_requests_);
     serialize_metric(mount_nof_segment_failures_);
     serialize_metric(unmount_nof_segment_requests_);

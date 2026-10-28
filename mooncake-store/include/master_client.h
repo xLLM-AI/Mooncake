@@ -17,6 +17,7 @@
 #include "segment.h"
 #include "types.h"
 #include "rpc_types.h"
+#include "rebuild_types.h"
 #include "master_metric_manager.h"
 #include "task_manager.h"
 
@@ -347,6 +348,29 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> ReMountSegment(
         const std::vector<Segment>& segments);
+
+    /**
+     * @brief HA rebuild: resend object-level metadata (key -> replica location)
+     * to the (empty) new master after a restart, so it can rebuild metadata.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> RebuildMetadata(
+        std::vector<KeyReplicaEntry>&& entries, ViewVersionId view_version);
+
+    [[nodiscard]] tl::expected<KeyReplicaEntry, ErrorCode>
+    GetCommittedRebuildEntry(const std::string& key,
+                             const std::string& tenant_id);
+
+    [[nodiscard]] std::vector<tl::expected<KeyReplicaEntry, ErrorCode>>
+    BatchGetCommittedRebuildEntries(const std::vector<std::string>& keys,
+                                    const std::string& tenant_id);
+
+    /**
+     * @brief Tell the new empty master that this client has resent all
+     * metadata. The master starts serving after every expected client reports
+     * completion.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> SignalRebuildComplete(
+        ViewVersionId view_version);
 
     /**
      * @brief Re-mount NoF ssd segments, invoked when the client is the first
