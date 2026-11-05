@@ -1611,5 +1611,115 @@ TEST(OssObjectStorageAdapterTest, StorageBackendFactoryRunsObjectHealthCheck) {
     EXPECT_EQ(server.requests()[2].rfind("DELETE ", 0), 0U);
 }
 
+
+TEST(OssObjectStorageAdapterTest, ValidatesContentRangeForSingleAndBatchReads) {
+    using Server = test::OssFaultHttpServer;
+    const std::vector<std::string> invalid{"",
+                                           "bytes 1-5/10",
+                                           "bytes 0-3/10",
+                                           "bytes 0-4/4",
+                                           "bytes 4-0/10",
+                                           "bytes 0-4/5junk",
+                                           "bytes 0-4/",
+                                           "bytes 0-4/-1",
+                                           "bytes 0-4/18446744073709551616",
+                                           "bytes 18446744073709551616-4/*",
+                                           "bytes +0-4/5",
+                                           "items 0-4/5"};
+    std::map<std::string, Server::Response> routes;
+    for (size_t i = 0; i < invalid.size(); ++i) {
+        routes.emplace(
+            "bad-" + std::to_string(i),
+            Server::Reply(206, "value",
+                          invalid[i].empty()
+                              ? ""
+                              : "Content-Range: " + invalid[i] + "\r\n"));
+    }
+    routes.emplace(
+        "known", Server::Reply(206, "value", "Content-Range: bytes 0-4/5\r\n"));
+    routes.emplace("unknown", Server::Reply(206, "value",
+                                            "Content-Range: bytes 0-4/*\r\n"));
+    routes.emplace("offset", Server::Reply(206, "value",
+                                           "Content-Range: bytes 5-9/10\r\n"));
+    Server server(std::move(routes));
+    ScopedEnvironment environment;
+    ConfigureFaultEndpoint(environment, server.port());
+    OssObjectStorageAdapter adapter("/range-validation/");
+    ASSERT_TRUE(adapter.Init());
+    ObjectStorageAdapter& generic = adapter;
+    std::array<char, 7> output;
+    for (size_t i = 0; i < invalid.size(); ++i) {
+        SCOPED_TRACE(invalid[i]);
+        const auto key = "bad-" + std::to_string(i);
+        output.fill('!');
+        const auto single = generic.GetRange(key, output.data() + 1, 5, 0);
+        ASSERT_FALSE(single);
+        EXPECT_EQ(single.error(), ErrorCode::FILE_READ_FAIL);
+        const auto batch = adapter.GetBatch({{key, output.data() + 1, 5}});
+        ASSERT_EQ(batch.size(), 1U);
+        ASSERT_FALSE(batch[0]);
+        EXPECT_EQ(batch[0].error(), ErrorCode::FILE_READ_FAIL);
+        EXPECT_EQ(output.front(), '!');
+        EXPECT_EQ(output.back(), '!');
+    }
+    for (const char* key : {"known", "unknown"}) {
+        EXPECT_TRUE(generic.GetRange(key, output.data() + 1, 5, 0));
+        const auto batch = adapter.GetBatch({{key, output.data() + 1, 5}});
+        ASSERT_EQ(batch.size(), 1U);
+        EXPECT_TRUE(batch[0]);
+    }
+    EXPECT_TRUE(generic.GetRange("offset", output.data() + 1, 5, 5));
+    const auto wrong_offset =
+        generic.GetRange("offset", output.data() + 1, 5, 4);
+    ASSERT_FALSE(wrong_offset);
+    EXPECT_EQ(wrong_offset.error(), ErrorCode::FILE_READ_FAIL);
+    server.Stop();
+    EXPECT_TRUE(server.error().empty()) << server.error();
+}
+
+TEST(OssObjectStorageAdapterTest,
+     PreservesLarge416WithoutMaskingTruncatedResponses) {
+    using Server = test::OssFaultHttpServer;
+    Server server(
+        {{"large-range", Server::Reply(416, std::string(512, 'x'))},
+         {"truncated-range",
+          Server::Raw("HTTP/1.1 416 Test\r\nContent-Length: 512\r\n"
+                      "Connection: close\r\n\r\nxx")},
+         {"present",
+          Server::Reply(206, "12345678", "Content-Range: bytes 0-7/8\r\n")}});
+    ScopedEnvironment environment;
+    ConfigureFaultEndpoint(environment, server.port());
+    OssObjectStorageAdapter adapter("/range-errors/");
+    ASSERT_TRUE(adapter.Init());
+    std::array<char, 10> output;
+    for (const char* key : {"large-range", "truncated-range"}) {
+        SCOPED_TRACE(key);
+        output.fill('!');
+        const auto expected = std::string(key) == "large-range"
+                                  ? ErrorCode::FILE_READ_FAIL
+                                  : ErrorCode::DFS_SERVICE_UNAVAILABLE;
+        const auto single = adapter.GetRange(key, output.data() + 1, 8, 0);
+        ASSERT_FALSE(single);
+        EXPECT_EQ(single.error(), expected);
+        const auto batch = adapter.GetBatch({{key, output.data() + 1, 8}});
+        ASSERT_EQ(batch.size(), 1U);
+        ASSERT_FALSE(batch[0]);
+        EXPECT_EQ(batch[0].error(), expected);
+        EXPECT_EQ(output.front(), '!');
+        EXPECT_EQ(output.back(), '!');
+    }
+    ASSERT_TRUE(adapter.GetRange("present", output.data() + 1, 8, 0));
+    EXPECT_EQ(std::string(output.data(), output.size()), "!12345678!");
+    server.Stop();
+    EXPECT_TRUE(server.error().empty()) << server.error();
+    const auto requests = server.requests();
+    EXPECT_EQ(std::count_if(requests.begin(), requests.end(),
+                            [](const auto& request) {
+                                return request.find("/large-range HTTP/") !=
+                                       std::string::npos;
+                            }),
+              2);
+}
+
 }  // namespace
 }  // namespace mooncake
