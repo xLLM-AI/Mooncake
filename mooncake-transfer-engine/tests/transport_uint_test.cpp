@@ -1397,6 +1397,41 @@ TEST_F(TransportTest, DisableAutomaticTransportInstallation) {
     EXPECT_NE(engine.installTransport("tcp", nullptr), nullptr);
 }
 
+TEST_F(TransportTest, DisableAutomaticInstallationWithDiscoveryEnabled) {
+    TransferEngine engine(true);
+    engine.setAutoInstallTransport(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+
+    EXPECT_EQ(engine.getTransport("tcp"), nullptr);
+    EXPECT_EQ(engine.getTransport("rdma"), nullptr);
+    EXPECT_EQ(engine.getTransport("shm"), nullptr);
+    EXPECT_NE(engine.installTransport("tcp", nullptr), nullptr);
+}
+
+TEST_F(TransportTest,
+       DisableAutomaticInstallationOverridesForceTransportFlags) {
+    for (const char* flag : {"MC_FORCE_TCP", "MC_FORCE_SHM"}) {
+        SCOPED_TRACE(flag);
+        ScopedEnvVar force(flag, "1");
+        TransferEngine engine(true);
+        engine.setAutoInstallTransport(false);
+        ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+
+        EXPECT_EQ(engine.getTransport("tcp"), nullptr);
+        EXPECT_EQ(engine.getTransport("shm"), nullptr);
+        EXPECT_NE(engine.installTransport("tcp", nullptr), nullptr);
+    }
+}
+
+TEST_F(TransportTest, ReenableAutomaticInstallationBeforeInitialization) {
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    TransferEngine engine(false);
+    engine.setAutoInstallTransport(false);
+    engine.setAutoInstallTransport(true);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    EXPECT_NE(engine.getTransport("tcp"), nullptr);
+}
+
 TEST_F(TransportTest, RegisterLocalMemoryBatchRejectsOverlappingBuffers) {
     TransferEngine engine(false);
     ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);

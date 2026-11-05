@@ -267,6 +267,7 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      libunwind-devel \
                      numactl-devel \
                      python3-devel \
+                     boost-devel \
                      openssl-devel \
                      protobuf-devel \
                      yaml-cpp-devel \
@@ -274,6 +275,7 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      hiredis-devel \
                      liburing-devel \
                      jemalloc-devel \
+                     msgpack-devel \
                      zeromq-devel \
                      libzstd-devel \
                      pkgconf-pkg-config \
@@ -354,9 +356,13 @@ else
 fi
 
 print_success "System packages installed successfully"
-if [ "$OS" = "openeuler" ]; then
-    install_msgpack_cxx_headers
-fi
+# RPM packages may be unavailable or provide only the C headers. The fallback
+# checks for existing C++ headers before downloading anything.
+case "$OS" in
+    centos|rhel|rocky|almalinux|euleros|openeuler|kylin)
+        install_msgpack_cxx_headers
+        ;;
+esac
 
 # Initialize and update git submodules
 print_section "Initializing Git Submodules"
