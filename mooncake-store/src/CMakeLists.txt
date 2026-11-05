@@ -727,7 +727,7 @@ endif()
 
 # Complete public Store library.
 add_library(
-  mooncake_store
+  mooncake_store STATIC
   $<TARGET_OBJECTS:mooncake_store_shared_objects>
   $<TARGET_OBJECTS:mooncake_store_master_objects>
   $<TARGET_OBJECTS:mooncake_store_client_objects>)

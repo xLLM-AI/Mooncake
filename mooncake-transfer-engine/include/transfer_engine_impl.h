@@ -400,6 +400,10 @@ class TransferEngineImpl {
         auto_discover_config_.protocol = protocol;
     }
 
+    void setAutoInstallTransport(bool auto_install_transport) {
+        auto_install_transport_ = auto_install_transport;
+    }
+
     void* getBaseAddr() { return multi_transports_->getBaseAddr(); }
 
     void* allocateSharedMemory(size_t length);
@@ -483,6 +487,7 @@ class TransferEngineImpl {
 
     // Discover topology and install transports automatically when enabled.
     AutoDiscoverConfig auto_discover_config_;
+    bool auto_install_transport_ = true;
     std::vector<std::string> filter_;
     bool use_barex_ = false;
 

@@ -40,3 +40,23 @@ func TestNewMaintenanceSessionCancelsStartup(t *testing.T) {
 		t.Fatal("maintenance session startup did not cancel")
 	}
 }
+
+func TestStoreClientKeepaliveDoesNotPingIdleConnections(t *testing.T) {
+	for _, name := range []string{mooncakeEtcdCACertEnv, mooncakeEtcdClientCertEnv,
+		mooncakeEtcdClientKeyEnv, mooncakeEtcdServerNameEnv} {
+		t.Setenv(name, "")
+	}
+	config, err := newStoreClientConfig([]string{"http://localhost:2379"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.PermitWithoutStream {
+		t.Fatal("Store clients must not send keepalive PINGs without active streams")
+	}
+	if config.DialKeepAliveTime != 10*time.Second {
+		t.Fatalf("active-stream keepalive interval = %v, want 10s", config.DialKeepAliveTime)
+	}
+	if config.DialKeepAliveTimeout != 3*time.Second {
+		t.Fatalf("active-stream keepalive timeout = %v, want 3s", config.DialKeepAliveTimeout)
+	}
+}

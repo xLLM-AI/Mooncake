@@ -352,6 +352,10 @@ void TransferEngine::setAutoDiscover(const AutoDiscoverConfig& config) {
     impl_->setAutoDiscover(config);
 }
 
+void TransferEngine::setAutoInstallTransport(bool auto_install_transport) {
+    impl_->setAutoInstallTransport(auto_install_transport);
+}
+
 void* TransferEngine::getBaseAddr() { return impl_->getBaseAddr(); }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
@@ -1153,6 +1157,10 @@ void TransferEngine::setAutoDiscover(bool auto_discover) {
 
 void TransferEngine::setAutoDiscover(const AutoDiscoverConfig& config) {
     if (!use_tent_) impl_->setAutoDiscover(config);
+}
+
+void TransferEngine::setAutoInstallTransport(bool auto_install_transport) {
+    if (!use_tent_) impl_->setAutoInstallTransport(auto_install_transport);
 }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {

@@ -285,8 +285,11 @@ func newStoreClientConfig(validEndpoints []string) (clientv3.Config, error) {
 		DialTimeout:          5 * time.Second,
 		DialKeepAliveTime:    storeDialKeepAliveTime,
 		DialKeepAliveTimeout: storeDialKeepAliveTimeout,
-		TLS:                  tlsConfig,
-		DialOptions:          etcdTLSDialOptions(tlsConfig),
+		// Keep dead-peer detection for active watch/lease streams without
+		// sending idle PINGs that etcd servers may disallow.
+		PermitWithoutStream: false,
+		TLS:                 tlsConfig,
+		DialOptions:         etcdTLSDialOptions(tlsConfig),
 	}, nil
 }
 

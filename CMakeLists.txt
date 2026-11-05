@@ -60,7 +60,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
 if(SKBUILD)
   set(PYBIND11_FINDPYTHON ON)
   find_package(pybind11 CONFIG REQUIRED)
-else()
+elseif(NOT TARGET pybind11::headers)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
 endif()
 execute_process(
