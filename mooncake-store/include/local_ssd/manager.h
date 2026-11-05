@@ -89,9 +89,11 @@ class LocalSsdManager {
                        std::string_view key);
     size_t RemoveOffloadFromAll(const TenantId& tenant_id,
                                 std::string_view key);
-    bool CancelOffloadsIfAllPending(const std::vector<UUID>& client_ids,
-                                    const TenantId& tenant_id,
-                                    std::string_view key);
+    // The implementation holds a dynamically sized, UUID-ordered set of
+    // mailbox locks. Clang cannot express ownership of that lock collection.
+    bool CancelOffloadsIfAllPending(
+        const std::vector<UUID>& client_ids, const TenantId& tenant_id,
+        std::string_view key) NO_THREAD_SAFETY_ANALYSIS;
 
     ErrorCode EnqueuePromotion(const UUID& client_id, PromotionTaskItem task);
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode> TakePromotions(

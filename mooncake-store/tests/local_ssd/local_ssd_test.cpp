@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <barrier>
 #include <thread>
 
 #include "local_ssd/manager.h"
@@ -212,6 +213,42 @@ TEST(LocalSsdManagerTest, CancelsOffloadMirrorsOnlyWhenAllArePending) {
                                                    TenantId("tenant"), "key"));
     EXPECT_TRUE(manager.SetOffloadingAndTakePending(client_a, true)->empty());
     EXPECT_TRUE(manager.SetOffloadingAndTakePending(client_b, true)->empty());
+}
+
+TEST(LocalSsdManagerTest, MirrorCancellationIsAtomicAgainstConcurrentDrain) {
+    LocalSsdManager manager;
+    const UUID client_a{20, 21};
+    const UUID client_b{22, 23};
+    ASSERT_TRUE(manager.RegisterClient(client_a, true) == ErrorCode::OK);
+    ASSERT_TRUE(manager.RegisterClient(client_b, true) == ErrorCode::OK);
+
+    for (int iteration = 0; iteration < 100; ++iteration) {
+        SCOPED_TRACE(iteration);
+        ASSERT_TRUE(manager.EnqueueOffload(client_a,
+                                           Offload("tenant", "key", 1),
+                                           10) == ErrorCode::OK);
+        ASSERT_TRUE(manager.EnqueueOffload(client_b,
+                                           Offload("tenant", "key", 1),
+                                           10) == ErrorCode::OK);
+        std::barrier start(2);
+        bool drain_succeeded = false;
+        size_t claimed_b = 0;
+        std::thread drainer([&] {
+            start.arrive_and_wait();
+            auto result = manager.SetOffloadingAndTakePending(client_b, true);
+            drain_succeeded = result.has_value();
+            if (drain_succeeded) claimed_b = result->size();
+        });
+        start.arrive_and_wait();
+        const bool cancelled = manager.CancelOffloadsIfAllPending(
+            {client_b, client_a, client_b}, TenantId("tenant"), "key");
+        drainer.join();
+        ASSERT_TRUE(drain_succeeded);
+        auto claimed_a = manager.SetOffloadingAndTakePending(client_a, true);
+        ASSERT_TRUE(claimed_a.has_value());
+        EXPECT_EQ(claimed_a->size(), cancelled ? 0 : 1);
+        EXPECT_EQ(claimed_b, cancelled ? 0 : 1);
+    }
 }
 
 }  // namespace
