@@ -988,6 +988,9 @@ print("Retrieved all keys successfully:", retrieved == values)
 
 ## Topology & Devices
 
+The following controls apply to classic (non-TENT) Store-created engines.
+TENT manages transport configuration internally.
+
 - Auto-discovery: Enabled by default for `protocol="rdma"` or `protocol="efa"`
   when `rdma_devices` is empty.
 - Discovery controls:
@@ -996,6 +999,16 @@ print("Retrieved all keys successfully:", retrieved == values)
     for RDMA/EFA.
   - `MC_MS_FILTERS` restricts auto-discovery to a comma-separated whitelist of
     NIC names, e.g. `MC_MS_FILTERS=mlx5_0,mlx5_2`.
+    With `MC_MS_AUTO_DISC=0`, this whitelist does not replace nonempty
+    `rdma_devices`: missing devices still make setup fail instead of discovering
+    every NIC. This preserves the official v0.3.14 manual-selection contract.
+  - `MC_CUSTOM_TOPO_JSON` supplies automatic topology, including affinity and
+    priority tiers, and is filtered by `MC_MS_FILTERS`; the Store does not
+    overwrite it with system discovery.
+  - `MC_FORCE_TCP` overrides the requested hardware transport, including for
+    Store-created engines. `MC_FORCE_SHM` is SHM-only without multi-protocol and
+    an optional companion with `ENABLE_MULTI_PROTOCOL=ON`; TCP force wins if
+    both are set. These controls do not reinitialize externally supplied engines.
 
 Examples:
 

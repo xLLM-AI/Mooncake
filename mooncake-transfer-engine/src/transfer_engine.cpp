@@ -352,6 +352,10 @@ void TransferEngine::setAutoDiscover(const AutoDiscoverConfig& config) {
     impl_->setAutoDiscover(config);
 }
 
+void TransferEngine::setAutoInstallTransport(bool auto_install_transport) {
+    impl_->setAutoInstallTransport(auto_install_transport);
+}
+
 void* TransferEngine::getBaseAddr() { return impl_->getBaseAddr(); }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
@@ -1155,6 +1159,10 @@ void TransferEngine::setAutoDiscover(const AutoDiscoverConfig& config) {
     if (!use_tent_) impl_->setAutoDiscover(config);
 }
 
+void TransferEngine::setAutoInstallTransport(bool auto_install_transport) {
+    if (!use_tent_) impl_->setAutoInstallTransport(auto_install_transport);
+}
+
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
     if (!use_tent_) {
         impl_->setWhitelistFilters(std::move(filters));
@@ -1913,4 +1921,10 @@ Status TransferEngine::transferScatter(
     return operation.wait();
 }
 
+bool TransferEngine::autoInstallTransportEnabled() const {
+#ifdef USE_TENT
+    if (use_tent_) return true;
+#endif
+    return impl_->autoInstallTransportEnabled();
+}
 }  // namespace mooncake

@@ -23,7 +23,7 @@ NC="\033[0m" # No Color
 # Configuration
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
-GOVER=1.26.9
+GOVER=1.26.10
 OS_RELEASE_FILE=${OS_RELEASE_FILE:-/etc/os-release}
 
 # Function to print section headers
@@ -62,6 +62,44 @@ has_shca_tools() {
     return 1
 }
 
+install_msgpack_cxx_headers() {
+    print_section "Installing msgpack-cxx"
+
+    if [ -f /usr/include/msgpack.hpp ] || [ -f /usr/local/include/msgpack.hpp ]; then
+        echo -e "${YELLOW}msgpack-cxx headers are already installed. Skipping...${NC}"
+        return
+    fi
+
+    local version="cpp-6.1.0"
+    local repo_url="${MSGPACK_CXX_REPO_URL:-${GITHUB_PROXY%/}/msgpack/msgpack-c.git}"
+    local work_dir
+
+    echo "Creating temporary directory for msgpack-cxx..."
+    work_dir=$(mktemp -d -t msgpack-cxx-XXXXXX)
+    check_success "Failed to create msgpack-cxx temporary directory"
+
+    echo "Cloning msgpack-cxx ${version} from ${repo_url}..."
+    git clone --depth 1 --branch "${version}" "${repo_url}" "${work_dir}/msgpack-c"
+    check_success "Failed to clone msgpack-c ${version}"
+
+    echo "Installing msgpack-cxx headers to /usr/local/include..."
+    mkdir -p /usr/local/include/msgpack
+    check_success "Failed to create msgpack-cxx include directory"
+    install -m 0644 "${work_dir}/msgpack-c/include/msgpack.hpp" /usr/local/include/msgpack.hpp
+    check_success "Failed to install msgpack.hpp"
+    cp -a "${work_dir}/msgpack-c/include/msgpack/." /usr/local/include/msgpack/
+    check_success "Failed to install msgpack-cxx headers"
+
+    rm -rf "${work_dir}"
+    check_success "Failed to clean up msgpack-cxx temporary directory"
+
+    if [ ! -f /usr/local/include/msgpack.hpp ]; then
+        print_error "msgpack-cxx installation verification failed"
+    fi
+
+    print_success "msgpack-cxx ${version} headers installed successfully"
+}
+
 read_os_release_value() {
     local key="$1"
     awk -F= -v key="$key" '
@@ -91,73 +129,16 @@ detect_os() {
     echo -e "${GREEN}Detected OS: $OS ${OS_VERSION:-unknown}${NC}"
 }
 
-if [ $(id -u) -ne 0 ]; then
-	print_error "Require root permission, try sudo ./dependencies.sh"
-fi
+# Boost is required, but the name differs in PyTorch manylinux images.
+# msgpack/CLI11 may be absent in RPM repositories; only these may degrade.
+install_rpm_extras() {
+    "$@" install -y boost1.78-devel || "$@" install -y boost-devel
+    check_success "Failed to install Boost development headers (both package names tried)"
+    "$@" install -y msgpack-devel || echo -e "${YELLOW}msgpack-devel unavailable; checking C++ header fallback.${NC}"
+    "$@" install -y cli11-devel || echo -e "${YELLOW}cli11-devel unavailable; install CLI11 headers manually to build the TENT CLI.${NC}"
+}
 
-# Parse command line arguments
-SKIP_CONFIRM=false
-INSTALL_SPDK=false
-for arg in "$@"; do
-    case $arg in
-        -y|--yes)
-            SKIP_CONFIRM=true
-            ;;
-        --with-spdk)
-            INSTALL_SPDK=true
-            ;;
-        -h|--help)
-            echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
-            echo -e "Usage: ./dependencies.sh [OPTIONS]"
-            echo -e "\nOptions:"
-            echo -e "  -y, --yes       Skip confirmation and install all dependencies"
-            echo -e "  --with-spdk     Install SPDK for NVMe-oF support"
-            echo -e "  -h, --help      Show this help message and exit"
-            exit 0
-            ;;
-    esac
-done
-
-# Print welcome message
-echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
-echo -e "This script will install all required dependencies for Mooncake."
-echo -e "The following components will be installed:"
-echo -e "  - System packages (build tools, libraries)"
-echo -e "  - Git submodules (pybind11)"
-echo -e "  - Go $GOVER"
-if [ "$INSTALL_SPDK" = true ]; then
-    echo -e "  - SPDK (for NVMe-oF support)"
-fi
-echo
-
-# Ask for confirmation unless -y flag is used
-if [ "$SKIP_CONFIRM" = false ]; then
-    read -p "Do you want to continue? [Y/n] " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]] && [[ ! $REPLY = "" ]]; then
-        echo -e "${YELLOW}Installation cancelled.${NC}"
-        exit 0
-    fi
-fi
-
-# Detect OS
-detect_os
-
-# Update package lists
-print_section "Updating package lists"
-if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
-    apt-get update
-    check_success "Failed to update package lists"
-elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ] || [ "$OS" = "kylin" ]; then
-    yum install -y dnf-plugins-core epel-release || true
-    yum config-manager --set-enabled powertools || yum config-manager --set-enabled crb || true
-    yum clean all
-    yum makecache
-    check_success "Failed to update package lists"
-else
-    print_error "Unsupported OS: $OS"
-fi
-
+install_system_packages() {
 # Install system packages
 print_section "Installing system packages"
 echo -e "${YELLOW}This may take a few minutes...${NC}"
@@ -229,7 +210,6 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      libunwind-devel \
                      numactl-devel \
                      python3-devel \
-                     boost1.78-devel \
                      openssl-devel \
                      protobuf-devel \
                      yaml-cpp-devel \
@@ -237,7 +217,6 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      hiredis-devel \
                      liburing-devel \
                      jemalloc-devel \
-                     msgpack-devel \
                      zeromq-devel \
                      libzstd-devel \
                      pkgconf-pkg-config \
@@ -254,8 +233,7 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
 
     yum install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"
-    # The TENT CLI needs CLI11 headers; some releases do not package them.
-    yum install -y cli11-devel || echo -e "${YELLOW}cli11-devel is not available; install CLI11 headers manually to build the TENT CLI.${NC}"
+    install_rpm_extras yum
 
 elif [ "$OS" = "kylin" ]; then
     SYSTEM_PACKAGES="@development \
@@ -270,7 +248,6 @@ elif [ "$OS" = "kylin" ]; then
                      libunwind-devel \
                      numactl-devel \
                      python3-devel \
-                     boost-devel \
                      openssl-devel \
                      protobuf-devel \
                      yaml-cpp-devel \
@@ -278,7 +255,6 @@ elif [ "$OS" = "kylin" ]; then
                      hiredis-devel \
                      liburing-devel \
                      jemalloc-devel \
-                     msgpack-devel \
                      libzstd-devel \
                      pkgconf-pkg-config \
                      elfutils-libelf-devel \
@@ -306,18 +282,97 @@ elif [ "$OS" = "kylin" ]; then
 
         KYLIN_EPKL_URL="https://eps-server.openkylin.top/NS/${KYLIN_VERSION}/${KYLIN_EPKL_RELEASE}/EPKL/main/$(uname -m)/"
     fi
-    dnf --repofrompath="kylin-epkl,$KYLIN_EPKL_URL" \
-        --setopt=kylin-epkl.gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-kylin \
-        --enablerepo=kylin-epkl install -y $SYSTEM_PACKAGES
+    local -a rpm_command=(dnf "--repofrompath=kylin-epkl,$KYLIN_EPKL_URL"
+        --setopt=kylin-epkl.gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-kylin
+        --enablerepo=kylin-epkl)
+    "${rpm_command[@]}" install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"
-    dnf --repofrompath="kylin-epkl,$KYLIN_EPKL_URL" \
-        --setopt=kylin-epkl.gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-kylin \
-        --enablerepo=kylin-epkl install -y cli11-devel || echo -e "${YELLOW}cli11-devel is not available; install CLI11 headers manually to build the TENT CLI.${NC}"
+    install_rpm_extras "${rpm_command[@]}"
+
 else
     print_error "Unsupported OS: $OS"
 fi
 
 print_success "System packages installed successfully"
+# RPM packages may be unavailable or provide only the C headers. The fallback
+# checks for existing C++ headers before downloading anything.
+case "$OS" in
+    centos|rhel|rocky|almalinux|euleros|openeuler|kylin)
+        install_msgpack_cxx_headers
+        ;;
+esac
+
+}
+
+main() {
+if [ $(id -u) -ne 0 ]; then
+	print_error "Require root permission, try sudo ./dependencies.sh"
+fi
+
+# Parse command line arguments
+SKIP_CONFIRM=false
+INSTALL_SPDK=false
+for arg in "$@"; do
+    case $arg in
+        -y|--yes)
+            SKIP_CONFIRM=true
+            ;;
+        --with-spdk)
+            INSTALL_SPDK=true
+            ;;
+        -h|--help)
+            echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
+            echo -e "Usage: ./dependencies.sh [OPTIONS]"
+            echo -e "\nOptions:"
+            echo -e "  -y, --yes       Skip confirmation and install all dependencies"
+            echo -e "  --with-spdk     Install SPDK for NVMe-oF support"
+            echo -e "  -h, --help      Show this help message and exit"
+            exit 0
+            ;;
+    esac
+done
+
+# Print welcome message
+echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
+echo -e "This script will install all required dependencies for Mooncake."
+echo -e "The following components will be installed:"
+echo -e "  - System packages (build tools, libraries)"
+echo -e "  - Git submodules (pybind11)"
+echo -e "  - Go $GOVER"
+if [ "$INSTALL_SPDK" = true ]; then
+    echo -e "  - SPDK (for NVMe-oF support)"
+fi
+echo
+
+# Ask for confirmation unless -y flag is used
+if [ "$SKIP_CONFIRM" = false ]; then
+    read -p "Do you want to continue? [Y/n] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]] && [[ ! $REPLY = "" ]]; then
+        echo -e "${YELLOW}Installation cancelled.${NC}"
+        exit 0
+    fi
+fi
+
+# Detect OS
+detect_os
+
+# Update package lists
+print_section "Updating package lists"
+if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+    apt-get update
+    check_success "Failed to update package lists"
+elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ] || [ "$OS" = "kylin" ]; then
+    yum install -y dnf-plugins-core epel-release || true
+    yum config-manager --set-enabled powertools || yum config-manager --set-enabled crb || true
+    yum clean all
+    yum makecache
+    check_success "Failed to update package lists"
+else
+    print_error "Unsupported OS: $OS"
+fi
+
+install_system_packages
 
 # Initialize and update git submodules
 print_section "Initializing Git Submodules"
@@ -331,6 +386,11 @@ if [ -f "${REPO_ROOT}/.gitmodules" ]; then
     echo "Initializing git submodules..."
     git submodule sync --recursive
     check_success "Failed to sync git submodules"
+    # Keep canonical URLs in .gitmodules; deployments can select a mirror.
+    if [ -n "${PYBIND11_REPO_URL:-}" ]; then
+        git config submodule.extern/pybind11.url "$PYBIND11_REPO_URL"
+        check_success "Failed to configure pybind11 mirror"
+    fi
     git submodule update --init --recursive
     check_success "Failed to initialize git submodules"
 
@@ -527,4 +587,10 @@ echo -e "${YELLOW}Note: You may need to restart your terminal or run 'source ~/.
 
 if [ "$INSTALL_SPDK" = true ]; then
     echo -e "${YELLOW}Note: SPDK requires hugepages and RDMA configuration. Please refer to SPDK documentation for setup.${NC}"
+fi
+
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi

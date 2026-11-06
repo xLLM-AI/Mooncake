@@ -106,6 +106,40 @@ static std::string loadTopologyJsonFile(const std::string& path) {
     return content;
 }
 
+int TransferEngineImpl::prepareTopology() {
+    int ret = 0;
+    LOG(INFO) << "Auto-discovering topology...";
+    // RDMA discovery drops EFA NICs (they expose SRD only, not the RC QPs
+    // the RDMA transport needs), but EFA discovery must keep them.
+    const bool use_efa = autoDiscoverUsesEfa();
+    if (getenv("MC_CUSTOM_TOPO_JSON")) {
+        auto path = getenv("MC_CUSTOM_TOPO_JSON");
+        LOG(INFO) << "Using custom topology from: " << path;
+        auto topo_json = loadTopologyJsonFile(path);
+        if (!topo_json.empty()) {
+            ret = local_topology_->parse(topo_json, filter_);
+            if (ret == 0 && !filter_.empty() &&
+                local_topology_->getHcaList().empty()) {
+                std::string names;
+                for (const auto& name : filter_)
+                    names += (names.empty() ? "" : ",") + name;
+                LOG(ERROR) << "No HCA in " << path << " matches device filter ["
+                           << names << "]";
+                return ERR_DEVICE_NOT_FOUND;
+            }
+        } else {
+            LOG(WARNING) << "Failed to load custom topology from " << path
+                         << ", falling back to auto-detect.";
+            local_topology_->discover(filter_, /*exclude_efa=*/!use_efa);
+        }
+    } else {
+        local_topology_->discover(filter_, /*exclude_efa=*/!use_efa);
+    }
+    LOG(INFO) << "Topology discovery complete. Found "
+              << local_topology_->getHcaList().size() << " HCAs.";
+    return ret;
+}
+
 int TransferEngineImpl::init(const std::string& metadata_conn_string,
                              const std::string& local_server_name,
                              const std::string& ip_or_host_name,
@@ -274,6 +308,18 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #endif
 
+    // Explicit force flags above keep their precedence. Store needs topology
+    // preparation (including custom JSON) without selecting a build-default
+    // transport. Multi-protocol SHM remains an optional companion transport.
+    if (!auto_install_transport_) {
+        if (auto_discover_config_.enabled) {
+            ret = prepareTopology();
+            if (ret != 0) return ret;
+        }
+        maybeInstallShmTransport(multi_transports_.get(), local_topology_);
+        return 0;
+    }
+
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     if (shouldInstallAscendTransport(auto_discover_config_.protocol)) {
         Transport* ascend_transport =
@@ -315,35 +361,9 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
 
     if (auto_discover_config_.enabled) {
-        LOG(INFO) << "Auto-discovering topology...";
-        // RDMA discovery drops EFA NICs (they expose SRD only, not the RC QPs
-        // the RDMA transport needs), but EFA discovery must keep them.
         const bool use_efa = autoDiscoverUsesEfa();
-        if (getenv("MC_CUSTOM_TOPO_JSON")) {
-            auto path = getenv("MC_CUSTOM_TOPO_JSON");
-            LOG(INFO) << "Using custom topology from: " << path;
-            auto topo_json = loadTopologyJsonFile(path);
-            if (!topo_json.empty()) {
-                ret = local_topology_->parse(topo_json, filter_);
-                if (ret == 0 && !filter_.empty() &&
-                    local_topology_->getHcaList().empty()) {
-                    std::string names;
-                    for (const auto& name : filter_)
-                        names += (names.empty() ? "" : ",") + name;
-                    LOG(ERROR) << "No HCA in " << path
-                               << " matches device filter [" << names << "]";
-                    return ERR_DEVICE_NOT_FOUND;
-                }
-            } else {
-                LOG(WARNING) << "Failed to load custom topology from " << path
-                             << ", falling back to auto-detect.";
-                local_topology_->discover(filter_, /*exclude_efa=*/!use_efa);
-            }
-        } else {
-            local_topology_->discover(filter_, /*exclude_efa=*/!use_efa);
-        }
-        LOG(INFO) << "Topology discovery complete. Found "
-                  << local_topology_->getHcaList().size() << " HCAs.";
+        ret = prepareTopology();
+        if (ret != 0) return ret;
 
 #ifdef USE_EFA
         // Install EFA before the per-build transport selection below. The

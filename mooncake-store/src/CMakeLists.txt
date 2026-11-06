@@ -728,7 +728,7 @@ endif()
 # Complete public Store library.
 add_library(
   mooncake_store
-  $<TARGET_OBJECTS:mooncake_store_shared_objects>
+  ${MOONCAKE_LIBRARY_TYPE} $<TARGET_OBJECTS:mooncake_store_shared_objects>
   $<TARGET_OBJECTS:mooncake_store_master_objects>
   $<TARGET_OBJECTS:mooncake_store_client_objects>)
 target_include_directories(mooncake_store PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
@@ -781,10 +781,14 @@ if(USE_SUNRISE)
                            ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
 endif()
 
-if(BUILD_SHARED_LIBS)
+get_target_property(_mooncake_store_type mooncake_store TYPE)
+if(_mooncake_store_type STREQUAL "SHARED_LIBRARY")
   set_target_properties(mooncake_store PROPERTIES INSTALL_RPATH "$ORIGIN")
-  install(TARGETS mooncake_store DESTINATION lib)
 endif()
+install(
+  TARGETS mooncake_store
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib)
 
 # Store Master executable.
 add_executable(mooncake_master master.cpp)
@@ -872,14 +876,14 @@ if(WITH_STORE_C_SHARED)
   endif()
 
   # We whole-archive mooncake_store and reuse its name, so require it to be
-  # static (add_library(mooncake_store) follows BUILD_SHARED_LIBS, which some
-  # backends force ON).
+  # static. MOONCAKE_BUILD_STATIC explicitly overrides BUILD_SHARED_LIBS.
   get_target_property(_mooncake_store_type mooncake_store TYPE)
   if(NOT _mooncake_store_type STREQUAL "STATIC_LIBRARY")
     message(
       FATAL_ERROR
         "WITH_STORE_C_SHARED requires mooncake_store to be a STATIC_LIBRARY "
-        "(got ${_mooncake_store_type}); configure with BUILD_SHARED_LIBS=OFF.")
+        "(got ${_mooncake_store_type}); configure with MOONCAKE_BUILD_STATIC=ON or BUILD_SHARED_LIBS=OFF."
+    )
   endif()
 
   add_library(mooncake_store_c SHARED store_c_shared.cpp)

@@ -9,7 +9,7 @@
 #include <linux/mman.h>
 #endif  // __linux__
 
-#include <Slab.h>
+#include "cachelib_memory_allocator/Slab.h"
 
 namespace mooncake {
 

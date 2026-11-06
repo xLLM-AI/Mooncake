@@ -1,3 +1,12 @@
+# xLLM links these three libraries as archives even when device backends force
+# BUILD_SHARED_LIBS=ON. Shared-library consumers can opt out explicitly.
+option(MOONCAKE_BUILD_STATIC
+       "Build the public Mooncake libraries as static archives" ON)
+set(MOONCAKE_LIBRARY_TYPE "")
+if(MOONCAKE_BUILD_STATIC)
+  set(MOONCAKE_LIBRARY_TYPE STATIC)
+endif()
+
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)

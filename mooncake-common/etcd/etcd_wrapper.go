@@ -285,8 +285,11 @@ func newStoreClientConfig(validEndpoints []string) (clientv3.Config, error) {
 		DialTimeout:          5 * time.Second,
 		DialKeepAliveTime:    storeDialKeepAliveTime,
 		DialKeepAliveTimeout: storeDialKeepAliveTimeout,
-		TLS:                  tlsConfig,
-		DialOptions:          etcdTLSDialOptions(tlsConfig),
+		// Explicitly pin the v0.3.14 default: no idle PINGs. This is a
+		// defensive policy, not a behavior change from the upstream tag.
+		PermitWithoutStream: false,
+		TLS:                 tlsConfig,
+		DialOptions:         etcdTLSDialOptions(tlsConfig),
 	}, nil
 }
 

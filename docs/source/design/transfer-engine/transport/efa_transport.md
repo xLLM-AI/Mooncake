@@ -153,12 +153,18 @@ print(f'Initialize result: {result}')  # Should be 0
 # EFA device (libfabric): rdmap79s0, domain: rdmap79s0-rdm, fabric: efa, provider: efa
 ```
 
-Mooncake Store also auto-discovers topology when `protocol="efa"` and no
+Classic (non-TENT) Mooncake Store also auto-discovers topology when
+`protocol="efa"` and no
 device names are supplied. The Store passes the requested protocol to the
 Transfer Engine, which uses its normal topology discovery and installs the EFA
 transport instead of RDMA. Use `MC_MS_FILTERS` to restrict discovery to a
 comma-separated device whitelist. To disable discovery, set
 `MC_MS_AUTO_DISC=0` and provide device names explicitly.
+A whitelist alone does not enable discovery in manual mode; nonempty device
+names remain required. `MC_MS_AUTO_DISC=1` ignores explicit device names and
+uses the whitelist. When `MC_CUSTOM_TOPO_JSON` is set, Store initialization
+loads that topology and its affinity/priority tiers rather than replacing it
+with system discovery, then installs the requested EFA transport.
 
 ## Unit Tests
 

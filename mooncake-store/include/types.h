@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -14,7 +15,7 @@
 
 #include "tenant_id.h"
 
-#include "Slab.h"
+#include "cachelib_memory_allocator/Slab.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
 #include "ylt/struct_pack.hpp"

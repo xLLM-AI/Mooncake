@@ -24,7 +24,13 @@ if (USE_ASCEND_DIRECT OR USE_UBSHMEM)
     else()
         message(WARNING "Acl runtime header file is not exist")
     endif()
-    add_library(ascend_transport SHARED ${ASCEND_SOURCES})
+    # Match the explicit delivery policy used by the public Mooncake libraries.
+    # Device backends may force BUILD_SHARED_LIBS, but static mode takes priority.
+    add_library(ascend_transport ${MOONCAKE_LIBRARY_TYPE} ${ASCEND_SOURCES})
+    get_target_property(_ascend_transport_type ascend_transport TYPE)
+    if(_ascend_transport_type STREQUAL "SHARED_LIBRARY")
+        set_target_properties(ascend_transport PROPERTIES INSTALL_RPATH "$ORIGIN")
+    endif()
     find_library(
             FOUND_METADEF
             NAMES libmetadef.so
@@ -38,7 +44,9 @@ if (USE_ASCEND_DIRECT OR USE_UBSHMEM)
     else()
         target_link_libraries(ascend_transport PRIVATE ascendcl llm_datadist graph_base graph)
     endif()
-    install(TARGETS ascend_transport DESTINATION lib)
+    install(TARGETS ascend_transport
+            ARCHIVE DESTINATION lib
+            LIBRARY DESTINATION lib)
 else()
     add_library(ascend_transport OBJECT ${ASCEND_SOURCES})
 endif()
