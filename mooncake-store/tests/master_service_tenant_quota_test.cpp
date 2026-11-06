@@ -447,6 +447,10 @@ TEST_F(MasterServiceTenantQuotaTest, ClientRebuildRestoresQuotaIdempotently) {
         auto committed = original.GetCommittedRebuildEntry("full", "tenant-a");
         ASSERT_TRUE(committed);
         entry = *committed;
+        EXPECT_EQ(entry.replicas.front()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.segment_id_.value_or(UUID{}),
+                  segment.id);
     }
     MasterService recovered(config);
     ASSERT_TRUE(recovered.ReMountSegment({segment}, client_id));

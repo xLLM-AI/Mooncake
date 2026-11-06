@@ -33,6 +33,7 @@ std::unique_ptr<AllocatedBuffer> SegmentAllocatorRegistration::Allocate(
     if (!buffer) {
         return nullptr;
     }
+    buffer->segment_id_ = segment_id_;
     buffer->bindSegmentLifetime(buffer_lifetime_);
     buffer->bindClientLiveness(record);
     if (!allocation_lifetime_.isAvailable() ||

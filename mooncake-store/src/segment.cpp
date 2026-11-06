@@ -229,6 +229,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
             auto registration =
                 segment_manager_->allocator_manager_.addAllocator(
                     segment.name, allocator, std::move(client_liveness));
+            registration->segment_id_ = segment.id;
             segment_manager_->client_segments_[client_id].push_back(segment.id);
             segment_manager_->mounted_segments_[segment.id] = {
                 segment, SegmentStatus::OK, allocator, registration};
