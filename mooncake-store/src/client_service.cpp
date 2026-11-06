@@ -844,19 +844,23 @@ ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
     if (enable_ha_rebuild_) {
         std::lock_guard lock(local_replica_table_mutex_);
         rebuild_connection_pending_ = true;
+        ++rebuild_connection_generation_;
     }
-    const auto result =
+    auto result =
         metrics_
             ? metrics_->master_heartbeat_metric.ObserveConnect(
                   [this, &address] { return master_client_.Connect(address); })
             : master_client_.Connect(address);
-    if (!enable_ha_rebuild_ || result != ErrorCode::OK) return result;
-    // A view of zero is not an incarnation fence. Learn the connected master's
-    // allocation epoch before accepting late ownership acknowledgements.
+    if (!enable_ha_rebuild_) return result;
+    if (result != ErrorCode::OK) {
+        ++rebuild_connection_generation_;
+        return result;
+    }
     auto ping = master_client_.Ping();
+    const auto generation = ++rebuild_connection_generation_;
     if (!ping) return ping.error();
-    ObserveRebuildEpoch(*ping, true);
-    return ErrorCode::OK;
+    return ObserveRebuildEpoch(*ping, generation) ? ErrorCode::OK
+                                                  : ErrorCode::INVALID_VERSION;
 }
 
 ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
@@ -2486,19 +2490,21 @@ bool Client::WaitForPendingNotifies(const std::vector<NotifyTicket>& tickets) {
     });
 }
 
-void Client::ObserveRebuildEpoch(const PingResponse& response,
-                                 bool connection_completed) {
+bool Client::ObserveRebuildEpoch(const PingResponse& response,
+                                 uint64_t connection_generation) {
     std::lock_guard lock(local_replica_table_mutex_);
-    // An old heartbeat must not open the window while a new endpoint is
-    // being connected. Only the connection's own handshake can do that.
-    if (rebuild_connection_pending_ && !connection_completed) return;
+    // A pre-connect/in-progress heartbeat cannot confirm the new endpoint.
+    // A fresh heartbeat may finish the handshake after a transient Ping error.
+    if ((connection_generation & 1) ||
+        connection_generation != rebuild_connection_generation_.load())
+        return false;
     const auto epoch =
         response.allocation_epoch.value_or(response.view_version_id);
-    if (epoch >= rebuild_master_epoch_) {
-        rebuild_master_epoch_ = epoch;
-        rebuild_notify_view_ = response.view_version_id;
-        rebuild_connection_pending_ = false;
-    }
+    if (epoch < rebuild_master_epoch_) return false;
+    rebuild_master_epoch_ = epoch;
+    rebuild_notify_view_ = response.view_version_id;
+    rebuild_connection_pending_ = false;
+    return true;
 }
 
 tl::expected<void, ErrorCode> Client::ApplyOwnedRebuildEntries(
@@ -2547,14 +2553,7 @@ tl::expected<void, ErrorCode> Client::ApplyOwnedRebuildEntries(
         for (const auto& entry : entries) {
             auto canonical = entry;
             if (canonical.tenant_id.empty()) canonical.tenant_id = "default";
-            if (canonical.version == RebuildVersion{}) {
-                for (const auto& replica : canonical.replicas)
-                    canonical.version = std::max(
-                        canonical.version,
-                        RebuildVersion{replica.get_memory_descriptor()
-                                           .buffer_descriptor.allocationEpoch(),
-                                       replica.id});
-            }
+            canonical.version = GetRebuildVersion(canonical);
             auto needed = canonical;
             needed.replicas.clear();
             for (const auto& replica : canonical.replicas) {
@@ -2674,9 +2673,11 @@ tl::expected<void, ErrorCode> Client::ReplayRebuildEntries(
 
 tl::expected<void, ErrorCode> Client::ResendLocalReplicaTable(
     ViewVersionId view_version) {
+    const auto generation = rebuild_connection_generation_.load();
     auto ping = master_client_.Ping();
     if (!ping) return tl::make_unexpected(ping.error());
-    ObserveRebuildEpoch(*ping);
+    if (!ObserveRebuildEpoch(*ping, generation))
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
     const auto epoch = ping->allocation_epoch.value_or(ping->view_version_id);
     std::vector<KeyReplicaEntry> snapshot;
     uint64_t replay_cutoff;
@@ -6230,9 +6231,23 @@ void Client::StorageHeartbeatThreadMain() {
             if (!enable_ha_rebuild_) return tl::expected<void, ErrorCode>{};
             auto replayed = WaitForOwnedReplays(view_version);
             if (!replayed) return replayed;
+            uint64_t generation;
+            int64_t epoch;
+            {
+                std::lock_guard lock(local_replica_table_mutex_);
+                if (rebuild_connection_pending_)
+                    return tl::expected<void, ErrorCode>{
+                        tl::make_unexpected(ErrorCode::INVALID_VERSION)};
+                generation = rebuild_connection_generation_.load();
+                epoch = rebuild_master_epoch_;
+            }
             auto complete = master_client_.SignalRebuildComplete(view_version);
             if (complete) {
                 std::lock_guard lock(local_replica_table_mutex_);
+                if (generation != rebuild_connection_generation_.load() ||
+                    epoch != rebuild_master_epoch_)
+                    return tl::expected<void, ErrorCode>{
+                        tl::make_unexpected(ErrorCode::INVALID_VERSION)};
                 if (rebuild_replay_view_ == view_version)
                     rebuild_replay_view_.reset();
             }
@@ -6293,6 +6308,7 @@ void Client::StorageHeartbeatThreadMain() {
             remount_segment_future = std::future<void>();
         }
 
+        const auto generation = rebuild_connection_generation_.load();
         auto ping_result = metrics_
                                ? metrics_->master_heartbeat_metric.ObservePing(
                                      [this] { return master_client_.Ping(); })
@@ -6302,7 +6318,8 @@ void Client::StorageHeartbeatThreadMain() {
             ping_fail_count = 0;
             last_ping_success_.store(true);
             auto& ping_response = ping_result.value();
-            if (enable_ha_rebuild_) ObserveRebuildEpoch(ping_response);
+            if (enable_ha_rebuild_)
+                ObserveRebuildEpoch(ping_response, generation);
             if (!leader_coordinator_) {
                 std::lock_guard<std::mutex> lock(leader_switch_mutex_);
                 current_master_view_ = ha::MasterView{

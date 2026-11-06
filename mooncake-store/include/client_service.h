@@ -1219,8 +1219,8 @@ class Client {
     NotifyTicket ParkPendingNotify(const std::string& ep,
                                    const std::vector<KeyReplicaEntry>& entries);
     void FlushPendingNotifies();
-    void ObserveRebuildEpoch(const PingResponse& response,
-                             bool connection_completed = false);
+    bool ObserveRebuildEpoch(const PingResponse& response,
+                             uint64_t connection_generation);
 
     // Client identification
     const UUID client_id_;
@@ -1246,6 +1246,8 @@ class Client {
     ViewVersionId rebuild_notify_view_{0};
     int64_t rebuild_master_epoch_{0};
     bool rebuild_connection_pending_{false};
+    // Odd while ConnectMasterEndpoint is active, even after it finishes.
+    std::atomic<uint64_t> rebuild_connection_generation_{0};
     // Protected by local_replica_table_mutex_; false means an RPC is in flight,
     // true means it failed and must be covered by a later snapshot retry.
     std::map<uint64_t, bool> owned_replay_pending_;

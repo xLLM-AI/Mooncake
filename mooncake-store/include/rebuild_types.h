@@ -13,9 +13,8 @@ namespace mooncake {
 
 using RebuildVersion = std::pair<int64_t, uint64_t>;
 
-// One key's rebuild entry: key + its replica location(s). Descriptor is already
-// serializable (YLT_REFL at replica.h:477), so it travels over RPC/notify
-// as-is.
+// One committed object and its replica locations, shared by the owner table,
+// metadata RPCs and notifications.
 struct KeyReplicaEntry {
     std::string key;
     std::string tenant_id{"default"};
@@ -37,6 +36,21 @@ struct KeyReplicaEntry {
 YLT_REFL(KeyReplicaEntry, key, tenant_id, size, data_type, group_id, replicas,
          version, with_soft_pin, with_hard_pin, object_checksum, session_id,
          residency_affinity_id, observed_epoch);
+
+// All replicas of one write share the same token, including legacy entries
+// with an omitted explicit version. Keep the derivation identical at both ends.
+inline RebuildVersion GetRebuildVersion(const KeyReplicaEntry& entry) {
+    if (entry.version != RebuildVersion{}) return entry.version;
+    RebuildVersion version{};
+    for (const auto& replica : entry.replicas) {
+        if (!replica.is_memory_replica()) continue;
+        version = std::max(
+            version, RebuildVersion{replica.get_memory_descriptor()
+                                        .buffer_descriptor.allocationEpoch(),
+                                    replica.id});
+    }
+    return version;
+}
 
 enum class RebuildNotifyOp : uint8_t { UPSERT = 0, ACK = 1 };
 

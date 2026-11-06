@@ -620,7 +620,8 @@ void ScopedSegmentAccess::ReleaseUnmountedSegmentName(
 
 std::shared_ptr<BufferAllocatorBase>
 ScopedSegmentAccess::FindAllocatorByEndpointAndAddr(
-    const std::string& te_endpoint, uintptr_t buffer_address) const {
+    const std::string& te_endpoint, uintptr_t buffer_address,
+    UUID* resolved_segment_id) const {
     for (const auto& [id, ms] : segment_manager_->mounted_segments_) {
         if (ms.status != SegmentStatus::OK) continue;
         if (ms.segment.te_endpoint != te_endpoint) continue;
@@ -628,6 +629,7 @@ ScopedSegmentAccess::FindAllocatorByEndpointAndAddr(
         const uintptr_t base = ms.segment.base;
         const uintptr_t end = base + ms.segment.size;
         if (buffer_address >= base && buffer_address < end) {
+            if (resolved_segment_id) *resolved_segment_id = id;
             return ms.buf_allocator;
         }
     }

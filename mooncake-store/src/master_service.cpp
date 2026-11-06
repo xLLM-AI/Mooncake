@@ -1640,30 +1640,25 @@ std::optional<Replica> MasterService::DescriptorToReplica(
     if (!desc.is_memory_replica()) return std::nullopt;
     const auto& descriptor = desc.get_memory_descriptor().buffer_descriptor;
     auto segments = segment_manager_.getSegmentAccess();
+    UUID segment_id;
     auto allocator = segments.FindAllocatorByEndpointAndAddr(
-        descriptor.transport_endpoint_, descriptor.buffer_address_);
+        descriptor.transport_endpoint_, descriptor.buffer_address_,
+        &segment_id);
     auto offset_allocator =
         std::dynamic_pointer_cast<OffsetBufferAllocator>(allocator);
     if (!offset_allocator) return std::nullopt;
-    std::vector<std::pair<Segment, UUID>> mounted;
-    if (segments.GetAllSegments(mounted) != ErrorCode::OK) return std::nullopt;
-    for (const auto& [segment, owner] : mounted) {
-        if (segments.GetAllocator(segment.id) != allocator ||
-            (descriptor.segment_id_ && *descriptor.segment_id_ != segment.id))
-            continue;
-        auto buffer = offset_allocator->AllocateForRebuild(
-            descriptor.size_,
-            reinterpret_cast<void*>(descriptor.buffer_address_),
-            descriptor.allocation_size_.value_or(0));
-        if (!buffer) return std::nullopt;
-        buffer->setAllocationEpoch(descriptor.allocationEpoch());
-        segments.BindBufferToSegment(segment.id, *buffer);
-        Replica replica(std::move(buffer), ReplicaStatus::COMPLETE);
-        replica.id_ = desc.id;
-        AdvanceReplicaIdHighWaterMark(desc.id + 1);
-        return replica;
-    }
-    return std::nullopt;
+    if (descriptor.segment_id_ && *descriptor.segment_id_ != segment_id)
+        return std::nullopt;
+    auto buffer = offset_allocator->AllocateForRebuild(
+        descriptor.size_, reinterpret_cast<void*>(descriptor.buffer_address_),
+        descriptor.allocation_size_.value_or(0));
+    if (!buffer) return std::nullopt;
+    buffer->setAllocationEpoch(descriptor.allocationEpoch());
+    segments.BindBufferToSegment(segment_id, *buffer);
+    Replica replica(std::move(buffer), ReplicaStatus::COMPLETE);
+    replica.id_ = desc.id;
+    AdvanceReplicaIdHighWaterMark(desc.id + 1);
+    return replica;
 }
 
 auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
@@ -1685,7 +1680,7 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
                 weight_manager_.LockGroup(oid.tenant_id, e.group_id));
         if (e.replicas.empty() || e.size == 0)
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        RebuildVersion incoming = e.version;
+        const auto incoming = GetRebuildVersion(e);
         for (const auto& desc : e.replicas) {
             if (!desc.is_memory_replica() ||
                 desc.id == std::numeric_limits<ReplicaID>::max())
@@ -1693,10 +1688,6 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
             const auto& buffer = desc.get_memory_descriptor().buffer_descriptor;
             if (buffer.size_ != e.size || buffer.allocationExtent() < e.size)
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            if (e.version == RebuildVersion{})
-                incoming =
-                    std::max(incoming,
-                             RebuildVersion{buffer.allocationEpoch(), desc.id});
         }
         MetadataAccessorRW accessor(this, oid, MetadataAccessorRW::CreateKey{});
         bool replace = false;

@@ -31,6 +31,8 @@ writes. This adds a standalone startup filesystem requirement, including when
 client tracking is disabled. Changing between standalone and HA modes, or
 rolling back to a pre-rebuild binary, requires a coordinated client restart;
 HA views and standalone incarnation counters are not interchangeable domains.
+A mode switch against existing ownership/persisted tokens is unsupported; use a
+cold store/refill rather than assuming client restart alone translates tokens.
 
 `/health` reports `service_ready=false` while the data RPC rebuild gate is
 closed, and `true` once it opens, including degraded service after timeout.

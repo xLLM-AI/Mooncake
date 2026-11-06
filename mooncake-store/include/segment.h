@@ -222,7 +222,8 @@ class ScopedSegmentAccess {
     // requiring buffer_address in [segment.base, base+size). Returns nullptr if
     // no OK-status segment matches.
     std::shared_ptr<BufferAllocatorBase> FindAllocatorByEndpointAndAddr(
-        const std::string& te_endpoint, uintptr_t buffer_address) const;
+        const std::string& te_endpoint, uintptr_t buffer_address,
+        UUID* resolved_segment_id = nullptr) const;
 
    private:
     void ReindexSegmentNameAfterRemoval(const UUID& removed_segment_id,

@@ -23,10 +23,7 @@ class RebuildReplicaTable {
         const uint64_t end = address + extent;
         const Identity identity{
             entry.tenant_id.empty() ? "default" : entry.tenant_id, entry.key};
-        const RebuildVersion version =
-            entry.version == RebuildVersion{}
-                ? RebuildVersion{buffer.allocationEpoch(), replica.id}
-                : entry.version;
+        const auto version = GetRebuildVersion(entry);
         auto key_version = key_versions_.find(identity);
         if (key_version != key_versions_.end() && key_version->second > version)
             return false;
@@ -133,12 +130,7 @@ class RebuildReplicaTable {
         const auto address =
             replica.get_memory_descriptor().buffer_descriptor.buffer_address_;
         auto found = object->second.find(address);
-        const auto version =
-            entry.version == RebuildVersion{}
-                ? RebuildVersion{replica.get_memory_descriptor()
-                                     .buffer_descriptor.allocationEpoch(),
-                                 replica.id}
-                : entry.version;
+        const auto version = GetRebuildVersion(entry);
         return found != object->second.end() &&
                found->second.version == version &&
                found->second.replicas.front().id == replica.id &&
@@ -150,12 +142,13 @@ class RebuildReplicaTable {
         auto object = objects_.find(
             {entry.tenant_id.empty() ? "default" : entry.tenant_id, entry.key});
         if (object == objects_.end()) return;
+        const auto version = GetRebuildVersion(entry);
         for (const auto& replica : entry.replicas) {
             const auto address = replica.get_memory_descriptor()
                                      .buffer_descriptor.buffer_address_;
             auto found = object->second.find(address);
             if (found != object->second.end() &&
-                found->second.version == entry.version &&
+                found->second.version == version &&
                 found->second.replicas.front().id == replica.id)
                 found->second.observed_epoch =
                     std::max(epoch, found->second.observed_epoch.value_or(
