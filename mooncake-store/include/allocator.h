@@ -150,10 +150,18 @@ class AllocatedBuffer {
         uintptr_t buffer_address_;
         std::string protocol_;
         std::string transport_endpoint_;
-        int64_t allocation_epoch_{0};
-        uint64_t allocation_size_{0};
+        struct_pack::compatible<int64_t, 5> allocation_epoch_;
+        struct_pack::compatible<uint64_t, 5> allocation_size_;
+        struct_pack::compatible<UUID, 5> segment_id_;
+        int64_t allocationEpoch() const {
+            return allocation_epoch_.value_or(0);
+        }
+        uint64_t allocationExtent() const {
+            return allocation_size_.value_or(size_);
+        }
         YLT_REFL(Descriptor, size_, buffer_address_, protocol_,
-                 transport_endpoint_, allocation_epoch_, allocation_size_);
+                 transport_endpoint_, allocation_epoch_, allocation_size_,
+                 segment_id_);
     };
 
     void change_to_cxl(std::string client_segment_name);
@@ -178,6 +186,7 @@ class AllocatedBuffer {
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};
     int64_t allocation_epoch_{0};
+    UUID segment_id_{};
 
     friend class Replica;
     friend class SegmentAllocatorRegistration;

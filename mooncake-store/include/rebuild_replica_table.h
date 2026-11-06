@@ -16,7 +16,7 @@ class RebuildReplicaTable {
         if (!replica.is_memory_replica()) return false;
         const auto& buffer = replica.get_memory_descriptor().buffer_descriptor;
         const uint64_t address = buffer.buffer_address_;
-        const uint64_t extent = buffer.allocation_size_;
+        const uint64_t extent = buffer.allocationExtent();
         if (extent < buffer.size_ || extent == 0 ||
             extent > std::numeric_limits<uint64_t>::max() - address)
             return false;
@@ -25,17 +25,31 @@ class RebuildReplicaTable {
             entry.tenant_id.empty() ? "default" : entry.tenant_id, entry.key};
         const RebuildVersion version =
             entry.version == RebuildVersion{}
-                ? RebuildVersion{buffer.allocation_epoch_, replica.id}
+                ? RebuildVersion{buffer.allocationEpoch(), replica.id}
                 : entry.version;
         auto key_version = key_versions_.find(identity);
         if (key_version != key_versions_.end() && key_version->second > version)
             return false;
+        auto previous = objects_.find(identity);
+        if (previous != objects_.end()) {
+            auto found = previous->second.find(address);
+            if (found != previous->second.end() &&
+                found->second.version == version &&
+                found->second.observed_epoch.value_or(version.first) >
+                    entry.observed_epoch.value_or(version.first))
+                return false;
+        }
         auto first = ranges_.upper_bound(address);
         if (first != ranges_.begin() && std::prev(first)->second.end > address)
             --first;
         for (auto current = first;
              current != ranges_.end() && current->first < end; ++current) {
             if (current->second.version > version) return false;
+            // An equal-version tombstone is not a live allocation. Do not
+            // resurrect a quarantined/retired copy on a delayed exact retry.
+            if (current->second.version == version &&
+                !addresses_.contains(address))
+                return false;
         }
         if (key_version != key_versions_.end() &&
             key_version->second < version) {
@@ -68,14 +82,11 @@ class RebuildReplicaTable {
         }
         ranges_[address] = Range{end, version};
         key_versions_[identity] = version;
-        objects_[identity][address] = LocalReplicaMeta{replica,
-                                                       entry.size,
-                                                       entry.data_type,
-                                                       entry.group_id,
-                                                       identity.first,
-                                                       version,
-                                                       entry.with_soft_pin,
-                                                       entry.with_hard_pin};
+        auto stored = entry;
+        stored.tenant_id = identity.first;
+        stored.replicas = {replica};
+        stored.version = version;
+        objects_[identity][address] = std::move(stored);
         addresses_[address] = identity;
         return true;
     }
@@ -84,18 +95,7 @@ class RebuildReplicaTable {
         std::vector<KeyReplicaEntry> result;
         result.reserve(addresses_.size());
         for (const auto& [address, identity] : addresses_) {
-            const auto& metadata = objects_.at(identity).at(address);
-            KeyReplicaEntry entry;
-            entry.key = identity.second;
-            entry.tenant_id = identity.first;
-            entry.size = metadata.size;
-            entry.data_type = metadata.data_type;
-            entry.group_id = metadata.group_id;
-            entry.replicas = {metadata.replica};
-            entry.version = metadata.version;
-            entry.with_soft_pin = metadata.with_soft_pin;
-            entry.with_hard_pin = metadata.with_hard_pin;
-            result.emplace_back(std::move(entry));
+            result.emplace_back(objects_.at(identity).at(address));
         }
         return result;
     }
@@ -104,7 +104,8 @@ class RebuildReplicaTable {
     // replacement. Keep address/key version fences so delayed UPSERTs cannot
     // resurrect it.
     void ForgetSnapshotEntry(const KeyReplicaEntry& entry) {
-        const Identity identity{entry.tenant_id, entry.key};
+        const Identity identity{
+            entry.tenant_id.empty() ? "default" : entry.tenant_id, entry.key};
         auto object = objects_.find(identity);
         if (object == objects_.end()) return;
         for (const auto& replica : entry.replicas) {
@@ -114,12 +115,62 @@ class RebuildReplicaTable {
             auto current = object->second.find(address);
             if (current == object->second.end() ||
                 current->second.version != entry.version ||
-                current->second.replica.id != replica.id)
+                current->second.replicas.front().id != replica.id)
                 continue;
             object->second.erase(current);
             addresses_.erase(address);
         }
         if (object->second.empty()) objects_.erase(object);
+    }
+
+    // Ownership and visibility are separate: an old allocation may already
+    // have been imported into the current master (e.g. by a standby snapshot).
+    bool NeedsReplay(const KeyReplicaEntry& entry,
+                     const Replica::Descriptor& replica, int64_t epoch) const {
+        auto object = objects_.find(
+            {entry.tenant_id.empty() ? "default" : entry.tenant_id, entry.key});
+        if (object == objects_.end()) return false;
+        const auto address =
+            replica.get_memory_descriptor().buffer_descriptor.buffer_address_;
+        auto found = object->second.find(address);
+        const auto version =
+            entry.version == RebuildVersion{}
+                ? RebuildVersion{replica.get_memory_descriptor()
+                                     .buffer_descriptor.allocationEpoch(),
+                                 replica.id}
+                : entry.version;
+        return found != object->second.end() &&
+               found->second.version == version &&
+               found->second.replicas.front().id == replica.id &&
+               found->second.observed_epoch.value_or(
+                   found->second.version.first) < epoch;
+    }
+
+    void MarkReplayed(const KeyReplicaEntry& entry, int64_t epoch) {
+        auto object = objects_.find(
+            {entry.tenant_id.empty() ? "default" : entry.tenant_id, entry.key});
+        if (object == objects_.end()) return;
+        for (const auto& replica : entry.replicas) {
+            const auto address = replica.get_memory_descriptor()
+                                     .buffer_descriptor.buffer_address_;
+            auto found = object->second.find(address);
+            if (found != object->second.end() &&
+                found->second.version == entry.version &&
+                found->second.replicas.front().id == replica.id)
+                found->second.observed_epoch =
+                    std::max(epoch, found->second.observed_epoch.value_or(
+                                        found->second.version.first));
+        }
+    }
+
+    void ForgetRegion(uint64_t base, uint64_t size) {
+        auto address = addresses_.lower_bound(base);
+        while (address != addresses_.end() && address->first - base < size) {
+            auto object = objects_.find(address->second);
+            object->second.erase(address->first);
+            if (object->second.empty()) objects_.erase(object);
+            address = addresses_.erase(address);
+        }
     }
 
    private:
@@ -128,7 +179,7 @@ class RebuildReplicaTable {
         uint64_t end;
         RebuildVersion version;
     };
-    std::map<Identity, std::map<uint64_t, LocalReplicaMeta>> objects_;
+    std::map<Identity, std::map<uint64_t, KeyReplicaEntry>> objects_;
     std::map<uint64_t, Identity> addresses_;
     std::map<uint64_t, Range> ranges_;
     std::map<Identity, RebuildVersion> key_versions_;

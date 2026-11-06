@@ -13,18 +13,6 @@ namespace mooncake {
 
 using RebuildVersion = std::pair<int64_t, uint64_t>;
 
-// A locally owned allocation and its object metadata.
-struct LocalReplicaMeta {
-    Replica::Descriptor replica;
-    uint64_t size{0};
-    ObjectDataType data_type{ObjectDataType::UNKNOWN};
-    std::string group_id;
-    std::string tenant_id{"default"};
-    RebuildVersion version{};
-    bool with_soft_pin{false};
-    bool with_hard_pin{false};
-};
-
 // One key's rebuild entry: key + its replica location(s). Descriptor is already
 // serializable (YLT_REFL at replica.h:477), so it travels over RPC/notify
 // as-is.
@@ -38,10 +26,17 @@ struct KeyReplicaEntry {
     RebuildVersion version{};
     bool with_soft_pin{false};
     bool with_hard_pin{false};
+    struct_pack::compatible<std::optional<uint64_t>, 5> object_checksum;
+    struct_pack::compatible<std::string, 5> session_id;
+    struct_pack::compatible<std::string, 5> residency_affinity_id;
+    // Which master incarnation confirmed this record (distinct from the
+    // allocation/write version of an object restored from an older snapshot).
+    struct_pack::compatible<int64_t, 5> observed_epoch;
     KeyReplicaEntry() = default;
 };
 YLT_REFL(KeyReplicaEntry, key, tenant_id, size, data_type, group_id, replicas,
-         version, with_soft_pin, with_hard_pin);
+         version, with_soft_pin, with_hard_pin, object_checksum, session_id,
+         residency_affinity_id, observed_epoch);
 
 enum class RebuildNotifyOp : uint8_t { UPSERT = 0, ACK = 1 };
 

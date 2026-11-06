@@ -9,6 +9,9 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+#include <cerrno>
+#include <sys/file.h>
 #include <future>
 #include <iterator>
 #include <limits>
@@ -461,6 +464,63 @@ struct MasterService::KvcsDfsEviction {
     eviction::Evictor evictor;
 };
 
+namespace {
+// One durable allocation epoch per standalone incarnation. Leadership views
+// already provide this fence in HA mode. No per-write filesystem operations.
+int64_t AllocateRebuildEpoch(ViewVersionId view) {
+    if (view != 0) return view;
+    const char* configured = std::getenv("MC_REBUILD_EPOCH_FILE");
+    const char* home = std::getenv("HOME");
+    if ((!configured || !*configured) && (!home || !*home))
+        throw std::runtime_error(
+            "Non-HA rebuild epoch needs HOME or MC_REBUILD_EPOCH_FILE");
+    const fs::path path = configured && *configured
+                              ? fs::path(configured)
+                              : fs::path(home) / ".mooncake-rebuild-epoch";
+    using File = std::unique_ptr<FILE, decltype(&std::fclose)>;
+    File lock(std::fopen((path.string() + ".lock").c_str(), "a+e"),
+              &std::fclose);
+    if (!lock || flock(fileno(lock.get()), LOCK_EX) != 0)
+        throw std::runtime_error("Cannot lock durable rebuild epoch: " +
+                                 path.string());
+    std::array<uint64_t, 2> state{0, ~uint64_t{0}};
+    errno = 0;
+    File previous(std::fopen(path.c_str(), "re"), &std::fclose);
+    if (previous) {
+        if (std::fread(state.data(), sizeof(state), 1, previous.get()) != 1 ||
+            std::fgetc(previous.get()) != EOF || std::ferror(previous.get()) ||
+            state[1] != ~state[0])
+            throw std::runtime_error(
+                "Corrupt rebuild epoch; refusing unsafe reset: " +
+                path.string());
+    } else if (errno != ENOENT) {
+        throw std::runtime_error("Cannot read rebuild epoch: " + path.string());
+    }
+    if (state[0] >= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+        throw std::runtime_error("Rebuild epoch exhausted");
+    ++state[0];
+    state[1] = ~state[0];
+    const auto temporary = path.string() + ".tmp";
+    File next(std::fopen(temporary.c_str(), "we"), &std::fclose);
+    if (!next || std::fwrite(state.data(), sizeof(state), 1, next.get()) != 1 ||
+        std::fflush(next.get()) != 0 || fsync(fileno(next.get())) != 0 ||
+        std::rename(temporary.c_str(), path.c_str()) != 0)
+        throw std::runtime_error("Cannot persist rebuild epoch: " +
+                                 path.string());
+    const auto parent =
+        path.has_parent_path() ? path.parent_path() : fs::path(".");
+    const int directory =
+        open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0)
+        throw std::runtime_error("Cannot open rebuild epoch directory");
+    const int synced = fsync(directory);
+    close(directory);
+    if (synced != 0)
+        throw std::runtime_error("Cannot sync rebuild epoch directory");
+    return static_cast<int64_t>(state[0]);
+}
+}  // namespace
+
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
@@ -494,6 +554,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       nof_eviction_high_watermark_ratio_(
           config.nof_eviction_high_watermark_ratio),
       view_version_(config.view_version),
+      allocation_epoch_(AllocateRebuildEpoch(config.view_version)),
       client_active_ttl_sec_(config.client_active_ttl_sec),
       client_suspicion_ttl_sec_(config.client_suspicion_ttl_sec),
       nof_heartbeat_interval_sec_(
@@ -522,7 +583,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       quota_bytes_(config.quota_bytes),
       enable_multi_tenants_(config.enable_multi_tenants),
       segment_manager_(config.memory_allocator, config.enable_cxl,
-                       config.view_version),
+                       allocation_epoch_),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_type_(config.enable_cxl
@@ -1479,7 +1540,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             }
             for (size_t i = 0; i < restore.replicas.size(); ++i) {
                 restore.buffers[i]->setAllocationEpoch(
-                    restore.descriptors[i].allocation_epoch_);
+                    restore.descriptors[i].allocationEpoch());
                 (void)restore.replicas[i]->replace_memory_buffer(
                     std::move(restore.buffers[i]));
             }
@@ -1545,7 +1606,10 @@ bool RebuildSameMemoryLocation(const Replica::Descriptor& a,
     const auto& db = b.get_memory_descriptor().buffer_descriptor;
     return da.transport_endpoint_ == db.transport_endpoint_ &&
            da.buffer_address_ == db.buffer_address_ && da.size_ == db.size_ &&
-           da.allocation_size_ == db.allocation_size_;
+           (!da.allocation_size_ || !db.allocation_size_ ||
+            da.allocationExtent() == db.allocationExtent()) &&
+           (!da.segment_id_ || !db.segment_id_ ||
+            da.segment_id_ == db.segment_id_);
 }
 
 }  // namespace
@@ -1562,7 +1626,9 @@ bool MasterService::ReplicaAlreadyPresent(
     bool found = false;
     meta.VisitReplicas([](const Replica&) { return true; },
                        [&](const Replica& existing) {
-                           if (RebuildSameMemoryLocation(
+                           if (existing.is_memory_replica() &&
+                               !existing.has_invalid_mem_handle() &&
+                               RebuildSameMemoryLocation(
                                    existing.get_descriptor(), descriptor))
                                found = true;
                        });
@@ -1573,39 +1639,31 @@ std::optional<Replica> MasterService::DescriptorToReplica(
     const Replica::Descriptor& desc) {
     if (!desc.is_memory_replica()) return std::nullopt;
     const auto& descriptor = desc.get_memory_descriptor().buffer_descriptor;
-    std::shared_ptr<BufferAllocatorBase> allocator;
-    {
-        auto segments = segment_manager_.getSegmentAccess();
-        allocator = segments.FindAllocatorByEndpointAndAddr(
-            descriptor.transport_endpoint_, descriptor.buffer_address_);
-    }
+    auto segments = segment_manager_.getSegmentAccess();
+    auto allocator = segments.FindAllocatorByEndpointAndAddr(
+        descriptor.transport_endpoint_, descriptor.buffer_address_);
     auto offset_allocator =
         std::dynamic_pointer_cast<OffsetBufferAllocator>(allocator);
     if (!offset_allocator) return std::nullopt;
-    auto buffer = offset_allocator->AllocateForRebuild(
-        descriptor.size_, reinterpret_cast<void*>(descriptor.buffer_address_),
-        descriptor.allocation_size_);
-    if (!buffer) return std::nullopt;
-    buffer->setAllocationEpoch(descriptor.allocation_epoch_);
-    {
-        auto segments = segment_manager_.getSegmentAccess();
-        std::vector<std::pair<Segment, UUID>> mounted;
-        if (segments.GetAllSegments(mounted) != ErrorCode::OK)
-            return std::nullopt;
-        bool bound = false;
-        for (const auto& [segment, owner] : mounted) {
-            if (segments.GetAllocator(segment.id) == allocator) {
-                segments.BindBufferToSegment(segment.id, *buffer);
-                bound = true;
-                break;
-            }
-        }
-        if (!bound) return std::nullopt;
+    std::vector<std::pair<Segment, UUID>> mounted;
+    if (segments.GetAllSegments(mounted) != ErrorCode::OK) return std::nullopt;
+    for (const auto& [segment, owner] : mounted) {
+        if (segments.GetAllocator(segment.id) != allocator ||
+            (descriptor.segment_id_ && *descriptor.segment_id_ != segment.id))
+            continue;
+        auto buffer = offset_allocator->AllocateForRebuild(
+            descriptor.size_,
+            reinterpret_cast<void*>(descriptor.buffer_address_),
+            descriptor.allocation_size_.value_or(0));
+        if (!buffer) return std::nullopt;
+        buffer->setAllocationEpoch(descriptor.allocationEpoch());
+        segments.BindBufferToSegment(segment.id, *buffer);
+        Replica replica(std::move(buffer), ReplicaStatus::COMPLETE);
+        replica.id_ = desc.id;
+        AdvanceReplicaIdHighWaterMark(desc.id + 1);
+        return replica;
     }
-    Replica replica(std::move(buffer), ReplicaStatus::COMPLETE);
-    replica.id_ = desc.id;
-    AdvanceReplicaIdHighWaterMark(desc.id + 1);
-    return replica;
+    return std::nullopt;
 }
 
 auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
@@ -1619,78 +1677,153 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
     for (const auto& e : entries) {
         const auto oid =
             MakeObjectIdentityForRequest(e.key, TenantId(e.tenant_id));
-        std::shared_lock<std::shared_mutex> state_lock(master_state_mutex_);
-        if (e.replicas.empty())
+        std::shared_lock state_lock(master_state_mutex_);
+        const bool managed = weight_manager_.IsManagedGroup(e.group_id);
+        std::optional<std::unique_lock<std::mutex>> group_lock;
+        if (managed)
+            group_lock.emplace(
+                weight_manager_.LockGroup(oid.tenant_id, e.group_id));
+        if (e.replicas.empty() || e.size == 0)
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        RebuildVersion incoming_version = e.version;
+        RebuildVersion incoming = e.version;
         for (const auto& desc : e.replicas) {
-            if (!desc.is_memory_replica())
+            if (!desc.is_memory_replica() ||
+                desc.id == std::numeric_limits<ReplicaID>::max())
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             const auto& buffer = desc.get_memory_descriptor().buffer_descriptor;
-            if (buffer.size_ != e.size || buffer.allocation_size_ < e.size ||
-                e.size == 0 || desc.id == std::numeric_limits<ReplicaID>::max())
+            if (buffer.size_ != e.size || buffer.allocationExtent() < e.size)
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             if (e.version == RebuildVersion{})
-                incoming_version =
-                    std::max(incoming_version,
-                             RebuildVersion{buffer.allocation_epoch_, desc.id});
+                incoming =
+                    std::max(incoming,
+                             RebuildVersion{buffer.allocationEpoch(), desc.id});
         }
-        if (incoming_version.first == view_version_ &&
-            incoming_version.second != std::numeric_limits<ReplicaID>::max()) {
-            AdvanceReplicaIdHighWaterMark(incoming_version.second + 1);
-        }
-        auto accessor = std::make_unique<MetadataAccessorRW>(
-            this, oid, MetadataAccessorRW::CreateKey{});
-        if (accessor->IsPublished()) {
-            if (accessor->InProcessing())
+        MetadataAccessorRW accessor(this, oid, MetadataAccessorRW::CreateKey{});
+        bool replace = false;
+        if (accessor.IsPublished()) {
+            auto& metadata = accessor.Get();
+            if (accessor.InProcessing())
                 return tl::make_unexpected(
                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-            auto current_version = accessor->Get().rebuild_version;
-            if (current_version == RebuildVersion{}) {
-                accessor->Get().VisitReplicas(
-                    &Replica::fn_is_memory_replica,
-                    [&](const Replica& replica) {
-                        const auto descriptor = replica.get_descriptor();
-                        current_version = std::max(
-                            current_version,
-                            RebuildVersion{
-                                descriptor.get_memory_descriptor()
-                                    .buffer_descriptor.allocation_epoch_,
-                                descriptor.id});
-                    });
-            }
-            if (incoming_version < current_version) continue;
-            if (incoming_version > current_version) {
-                accessor->Erase();
-            } else {
-                const auto& metadata = accessor->Get();
-                SpinLocker pin_lock(&metadata.lock);
-                if (metadata.TotalLength() != e.size ||
-                    metadata.group_id != e.group_id ||
-                    metadata.IsHardPinned() != e.with_hard_pin)
-                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            }
+            auto current = metadata.rebuild_version;
+            metadata.VisitReplicas(
+                &Replica::fn_is_memory_replica, [&](const Replica& replica) {
+                    const auto desc = replica.get_descriptor();
+                    current = std::max(
+                        current,
+                        RebuildVersion{desc.get_memory_descriptor()
+                                           .buffer_descriptor.allocationEpoch(),
+                                       desc.id});
+                });
+            if (incoming < current) continue;
+            replace = incoming > current;
+            // Moving a managed member out of its group is not a second import
+            // protocol. Its authoritative group operation/snapshot owns that.
+            if (replace && metadata.group_id != e.group_id &&
+                weight_manager_.IsManagedGroup(metadata.group_id))
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+            if (!replace &&
+                (metadata.TotalLength() != e.size ||
+                 metadata.group_id != e.group_id ||
+                 metadata.IsHardPinned() != e.with_hard_pin ||
+                 metadata.data_type != e.data_type ||
+                 (e.object_checksum &&
+                  metadata.GetPart(0).checksum() != *e.object_checksum) ||
+                 (e.session_id && metadata.session_id != *e.session_id) ||
+                 (e.residency_affinity_id &&
+                  metadata.residency_affinity_id != *e.residency_affinity_id)))
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+        const bool complete_duplicate =
+            accessor.IsPublished() && !replace &&
+            std::all_of(e.replicas.begin(), e.replicas.end(),
+                        [&](const auto& desc) {
+                            return ReplicaAlreadyPresent(accessor.Get(), desc);
+                        });
+        if (managed && !weight_manager_.AllowsGroupMemberMutation(e.group_id)) {
+            if (complete_duplicate) continue;  // authority already restored it
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        auto import_write =
+            weight_manager_.TrackImportWrite(oid.tenant_id, e.group_id);
+        if (!import_write) return tl::make_unexpected(import_write.error());
+
         std::vector<Replica> replicas;
+        std::vector<Replica::Descriptor> planned, reuse;
         replicas.reserve(e.replicas.size());
-        std::vector<Replica::Descriptor> missing;
         for (const auto& desc : e.replicas) {
-            if ((accessor->IsPublished() &&
-                 ReplicaAlreadyPresent(accessor->Get(), desc)) ||
-                std::any_of(missing.begin(), missing.end(),
+            if (std::any_of(planned.begin(), planned.end(),
                             [&](const auto& prior) {
                                 return RebuildSameMemoryLocation(prior, desc);
                             }))
                 continue;
-            auto rep = DescriptorToReplica(desc);
-            if (!rep) {
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            planned.push_back(desc);
+            if (accessor.IsPublished() &&
+                ReplicaAlreadyPresent(accessor.Get(), desc)) {
+                if (replace) {
+                    const auto& buffer =
+                        desc.get_memory_descriptor().buffer_descriptor;
+                    auto segments = segment_manager_.getSegmentAccess();
+                    if (!segments.FindAllocatorByEndpointAndAddr(
+                            buffer.transport_endpoint_, buffer.buffer_address_))
+                        return tl::make_unexpected(
+                            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                    reuse.push_back(desc);
+                }
+                continue;
             }
-            missing.push_back(desc);
-            replicas.emplace_back(std::move(*rep));
+            auto replica = DescriptorToReplica(desc);
+            if (!replica) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            replicas.push_back(std::move(*replica));
         }
-        if (!accessor->IsPublished()) {
-            accessor->Publish(
+        const bool changed =
+            replace || !accessor.IsPublished() || !replicas.empty();
+        if (replace) {
+            // Every fallible reserve/bind above happens with the old route
+            // intact. Exact in-place allocations are transferred, not freed.
+            auto& old = accessor.Get();
+            const auto previous_media = KvMediaSnapshot(old);
+            std::vector<Replica> retired;
+            retired.reserve(old.CountReplicas());
+            accessor.BeforeReplace();
+            auto previous = PopReplicasWithCacheTotalAccounting(old);
+            for (auto& replica : previous) {
+                const auto descriptor = replica.get_descriptor();
+                const auto found = std::find_if(
+                    reuse.begin(), reuse.end(), [&](const auto& desc) {
+                        return RebuildSameMemoryLocation(descriptor, desc);
+                    });
+                if (found == reuse.end()) {
+                    retired.push_back(std::move(replica));
+                } else {
+                    replica.id_ = found->id;
+                    std::get<MemoryReplicaData>(replica.data_)
+                        .buffer->setAllocationEpoch(
+                            found->get_memory_descriptor()
+                                .buffer_descriptor.allocationEpoch());
+                    AdvanceReplicaIdHighWaterMark(found->id + 1);
+                    replicas.push_back(std::move(replica));
+                }
+            }
+            if (!retired.empty()) {
+                ReleaseLocalDiskUsage(retired);
+                FreeDfsReplicas(oid.user_key, retired);
+                const auto release_at =
+                    std::chrono::system_clock::now() +
+                    std::max(
+                        std::chrono::milliseconds(default_kv_lease_ttl_),
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            put_start_release_timeout_sec_));
+                std::lock_guard lock(discarded_replicas_mutex_);
+                discarded_replicas_.emplace_back(std::move(retired),
+                                                 release_at);
+            }
+            accessor.Erase(EraseMode::kReplace, previous_media);
+        }
+        if (!accessor.IsPublished()) {
+            accessor.Publish(
                 client_id, std::chrono::system_clock::now(), e.size,
                 std::move(replicas),
                 e.with_soft_pin
@@ -1699,21 +1832,24 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
                           std::chrono::milliseconds(default_kv_soft_pin_ttl_))
                     : std::nullopt,
                 e.with_hard_pin, e.data_type, e.group_id, oid.tenant_id,
-                oid.user_key);
+                oid.user_key, e.residency_affinity_id.value_or(""));
+            accessor.Get().MutablePart(0).SetChecksum(
+                e.object_checksum.value_or(std::nullopt));
+            accessor.Get().session_id = e.session_id.value_or("");
         } else {
-            accessor->Get().AddReplicas(std::move(replicas));
+            accessor.Get().AddReplicas(std::move(replicas));
         }
-
-        auto& meta = accessor->Get();
-        meta.rebuild_version = incoming_version;
-        PublishKvStored(oid.user_key, meta, oid.tenant_id);
+        auto& metadata = accessor.Get();
+        metadata.rebuild_version = incoming;
+        SyncCacheTotalAccounting(metadata);
+        if (changed) PublishKvStored(oid.user_key, metadata, oid.tenant_id);
         if (enable_oplog_ && ordered_oplog_writer_) {
             auto persisted = AppendOpLogVisibleBeforeDurable(
                 OpType::PUT_END, oid.tenant_id.value(), oid.user_key,
-                SerializeMetadataForOpLog(meta));
+                SerializeMetadataForOpLog(metadata));
             if (!persisted) return tl::make_unexpected(persisted.error());
         }
-        SyncCacheTotalAccounting(meta);
+        import_write->Accept();
     }
     return {};
 }
@@ -1736,6 +1872,10 @@ MasterService::GetCommittedRebuildEntry(const std::string& key,
     entry.size = metadata.TotalLength();
     entry.group_id = metadata.group_id;
     entry.data_type = metadata.data_type;
+    entry.object_checksum = metadata.GetPart(0).checksum();
+    entry.session_id = metadata.session_id;
+    entry.residency_affinity_id = metadata.residency_affinity_id;
+    entry.observed_epoch = allocation_epoch_;
     entry.with_hard_pin = metadata.IsHardPinned();
     {
         SpinLocker pin_lock(&metadata.lock);
@@ -1750,7 +1890,7 @@ MasterService::GetCommittedRebuildEntry(const std::string& key,
                 descriptor.get_memory_descriptor().buffer_descriptor;
             entry.version = std::max(
                 entry.version,
-                RebuildVersion{buffer.allocation_epoch_, descriptor.id});
+                RebuildVersion{buffer.allocationEpoch(), descriptor.id});
             entry.replicas.emplace_back(std::move(descriptor));
         });
     return entry;
@@ -6447,11 +6587,20 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     std::unordered_set<ReplicaID> eligible_replica_ids;
                     metadata.VisitReplicas(
                         &Replica::fn_is_completed,
-                        [this, &eligible_replica_ids](Replica& replica) {
+                        [this, &metadata,
+                         &eligible_replica_ids](Replica& replica) {
+                            auto dynamic =
+                                metadata.dynamic_replicas.extract(replica.id());
                             replica.id_ = Replica::next_id_.fetch_add(1);
+                            if (!dynamic.empty()) {
+                                dynamic.key() = replica.id();
+                                metadata.dynamic_replicas.insert(
+                                    std::move(dynamic));
+                            }
                             if (replica.is_memory_replica())
                                 std::get<MemoryReplicaData>(replica.data_)
-                                    .buffer->setAllocationEpoch(view_version_);
+                                    .buffer->setAllocationEpoch(
+                                        allocation_epoch_);
                             eligible_replica_ids.insert(replica.id());
                             replica.mark_processing();
                         });
@@ -8443,7 +8592,7 @@ auto MasterService::Ping(const UUID& client_id)
         observation_accepted && ok_client_.contains(client_id)
             ? ClientStatus::OK
             : ClientStatus::NEED_REMOUNT;
-    return PingResponse(view_version_, client_status);
+    return PingResponse(view_version_, client_status, allocation_epoch_);
 }
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {

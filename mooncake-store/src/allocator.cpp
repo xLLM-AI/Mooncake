@@ -80,7 +80,8 @@ AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
       buffer_ptr_(reinterpret_cast<void*>(descriptor.buffer_address_)),
       size_(descriptor.size_),
       protocol(descriptor.protocol_),
-      allocation_epoch_(descriptor.allocation_epoch_) {
+      allocation_epoch_(descriptor.allocationEpoch()),
+      segment_id_(descriptor.segment_id_.value_or(UUID{})) {
     if (protocol == "cxl") {
         segment_name_ = descriptor.transport_endpoint_;
     }
@@ -119,7 +120,9 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor(
             this->protocol,
             getTransportEndpoint(locality),
             allocation_epoch_,
-            offset_handle_ ? offset_handle_->extent() : size_};
+            offset_handle_ ? offset_handle_->extent() : size_,
+            segment_id_ == UUID{} ? std::optional<UUID>{}
+                                  : std::optional<UUID>{segment_id_}};
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {

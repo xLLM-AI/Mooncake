@@ -17,6 +17,20 @@ Set the environment variable on every client, including clients that only own
 segments. Restart clients after changing it. Enabling only the master gate can
 leave recovery waiting for disabled clients until the degraded-service timeout.
 Non-HA restart tests enable the client setting while leaving the master gate off.
+Standalone masters now allocate a durable incarnation even when the gate is off,
+so a new write before replay cannot share an ordering domain with an old master.
+Set `MC_REBUILD_EPOCH_FILE` to a file on durable storage retained across all
+restarts/replacements of the same logical master; its parent directory must
+already exist and be writable. The default is `$HOME/.mooncake-rebuild-epoch`.
+The file and its `.lock` must not be deleted, rolled back, or replaced while
+surviving clients retain ownership metadata. A missing first-start file starts
+at incarnation 1 (legacy descriptors default to epoch 0); a corrupt, exhausted,
+or unwritable counter fails startup rather than silently resetting. The update
+uses a file lock, atomic rename and file/directory fsync once at startup, not on
+writes. This adds a standalone startup filesystem requirement, including when
+client tracking is disabled. Changing between standalone and HA modes, or
+rolling back to a pre-rebuild binary, requires a coordinated client restart;
+HA views and standalone incarnation counters are not interchangeable domains.
 
 `/health` reports `service_ready=false` while the data RPC rebuild gate is
 closed, and `true` once it opens, including degraded service after timeout.
@@ -25,7 +39,7 @@ the leader role or label identifies the elected leader rather than data readines
 
 Recovery currently imports memory replicas managed by the offset allocator.
 Descriptors carry the original allocation extent and a master-issued ordering
-token derived from the HA view and replica IDs. All replicas reported for one
+token derived from the HA view (or durable standalone incarnation) and replica IDs. All replicas reported for one
 write share its token. Owners reject older notifications for both object
 identity and overlapping address ranges. The master also selects the newest
 reported write when owners report different versions of an object.
@@ -41,13 +55,40 @@ rows individually, logs/counts invalid rows, and conditionally quarantines only
 the rejected snapshot version before continuing valid replay. Completion means
 all eligible, non-rejected locally-owned records were replayed, not that rejected
 objects were restored. Transport and stale-view errors are not quarantined and
-remain retryable. No table mutex is held across a replay RPC.
+remain retryable. No table mutex is held across a replay RPC. Successfully unmounted regions
+are removed from the owner table without releasing other live registrations;
+segment UUIDs fence delayed notifications after a different segment remounts
+at the same endpoint/address.
+
+The allocation epoch, extent and segment UUID use compatible fields inside the
+buffer descriptor, not ordinary reflected fields: old snapshot/OpLog descriptors
+are decoded with epoch 0 and no UUID. An absent extent is inferred from the
+offset allocator's size class during reservation. Deployments of the earlier
+unmerged HA revisions that wrote ordinary epoch/extent fields must not treat
+that experimental format as the baseline persisted format.
+
+Client replay preserves checksum, session and residency affinity alongside the
+original object properties. Equal-version merges validate these properties.
+Replacement stages all new reservations/bindings before detaching the old
+publication; failure retains the old route and releases staged resources.
+Exact same-location allocations are reused. An overlapping resize that cannot
+be reserved alongside the old allocation fails safely and remains retryable;
+it does not tear down the old route to force progress.
+
+Managed weight members use the existing group lock and import activity guard.
+Closed/non-importing groups reject new/replacement replay; an exact duplicate
+already restored by the authoritative weight snapshot is a no-op. Do not rely
+on client ownership replay alone to reconstruct a managed weight manifest.
 
 Successful writes wait for each remote owner to apply and acknowledge its
 ownership record. Unacknowledged records remain queued for retry; a write
 returns an error if acknowledgements do not arrive within 30 seconds. Owners
 replay notifications arriving after their recovery snapshot into the current
-master view before acknowledging them. Recovery completion also waits for the
+master view before acknowledging them. On successful completion the active
+snapshot replay window is cleared: ordinary writes already confirmed by that
+master do not issue another rebuild RPC. A late notification confirmed only by
+an older master still needs replay; clearing the window must not lose that work.
+Recovery completion also waits for the
 current view's accepted locally-owned replay work, not the sender's historical
 remote-owner ACK queue. A permanently lost remote owner therefore cannot block
 this client's completion signal; its data is lost unless another replica survives.

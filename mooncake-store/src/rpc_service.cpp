@@ -2129,6 +2129,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
 
 tl::expected<void, ErrorCode> WrappedMasterService::UnmountLocalDiskSegment(
     const UUID& client_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "UnmountLocalDiskSegment");
     timer.LogRequest("action=unmount_local_disk_segment");
     LOG(INFO) << "Unmount local disk segment with client id is : " << client_id;

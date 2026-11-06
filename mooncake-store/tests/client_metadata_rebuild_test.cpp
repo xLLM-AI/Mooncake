@@ -655,7 +655,7 @@ TEST_F(ClientCrossNotifyTest, InvalidSnapshotRowDoesNotPoisonValidReplay) {
     poison.size += 1;  // inconsistent committed size vs descriptor size
     auto& buffer =
         poison.replicas.front().get_memory_descriptor().buffer_descriptor;
-    buffer.buffer_address_ += buffer.allocation_size_;
+    buffer.buffer_address_ += buffer.allocationExtent();
     ClientTestAccess::Record(*clientB_, poison);
     ASSERT_EQ(clientB_->LocalReplicaSnapshotForTest().size(), 2);
     const auto view = ClientTestAccess::View(*clientB_);
@@ -680,7 +680,7 @@ TEST_F(ClientCrossNotifyTest, LargeSnapshotDoesNotHoldTableLockAcrossRpc) {
         entry.replicas.front()
             .get_memory_descriptor()
             .buffer_descriptor.buffer_address_ =
-            original.buffer_address_ + i * original.allocation_size_;
+            original.buffer_address_ + i * original.allocationExtent();
         ClientTestAccess::Record(*clientB_, entry);
     }
     ASSERT_EQ(clientB_->LocalReplicaSnapshotForTest().size(), 8193);

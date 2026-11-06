@@ -1940,6 +1940,7 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     ViewVersionId view_version_;
+    const int64_t allocation_epoch_;
 
     // Client related members
     mutable std::shared_mutex client_mutex_;

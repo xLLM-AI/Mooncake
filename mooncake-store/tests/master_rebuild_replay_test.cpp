@@ -357,8 +357,8 @@ TEST(MasterRebuildReplayTest,
     EXPECT_EQ(metadata.rebuild_version.value_or(RebuildVersion{}), version);
     const auto& buffer =
         metadata.replicas.front().get_memory_descriptor().buffer_descriptor;
-    EXPECT_EQ(buffer.allocation_epoch_, 42);
-    EXPECT_EQ(buffer.allocation_size_, 256);
+    EXPECT_EQ(buffer.allocationEpoch(), 42);
+    EXPECT_EQ(buffer.allocationExtent(), 256);
 
     MetadataPayload payload;
     payload.size = 128;
