@@ -31,11 +31,14 @@ struct KeyReplicaEntry {
     // Which master incarnation confirmed this record (distinct from the
     // allocation/write version of an object restored from an older snapshot).
     struct_pack::compatible<int64_t, 5> observed_epoch;
+    // Do not reinterpret a weight member as an ordinary group on an empty
+    // master: its manifest/control state must come from weight recovery.
+    struct_pack::compatible<bool, 5> managed_weight;
     KeyReplicaEntry() = default;
 };
 YLT_REFL(KeyReplicaEntry, key, tenant_id, size, data_type, group_id, replicas,
          version, with_soft_pin, with_hard_pin, object_checksum, session_id,
-         residency_affinity_id, observed_epoch);
+         residency_affinity_id, observed_epoch, managed_weight);
 
 // All replicas of one write share the same token, including legacy entries
 // with an omitted explicit version. Keep the derivation identical at both ends.

@@ -1672,12 +1672,16 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
     for (const auto& e : entries) {
         const auto oid =
             MakeObjectIdentityForRequest(e.key, TenantId(e.tenant_id));
-        std::shared_lock state_lock(master_state_mutex_);
-        const bool managed = weight_manager_.IsManagedGroup(e.group_id);
+        // Match normal writes/control operations: group -> state -> key.
+        // Lock before looking up membership, which can change concurrently.
         std::optional<std::unique_lock<std::mutex>> group_lock;
-        if (managed)
+        if (!e.group_id.empty())
             group_lock.emplace(
                 weight_manager_.LockGroup(oid.tenant_id, e.group_id));
+        std::shared_lock state_lock(master_state_mutex_);
+        const bool managed = weight_manager_.IsManagedGroup(e.group_id);
+        if (e.managed_weight.value_or(false) && !managed)
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         if (e.replicas.empty() || e.size == 0)
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         const auto incoming = GetRebuildVersion(e);
@@ -1734,8 +1738,9 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
                         });
         if (managed && !weight_manager_.AllowsGroupMemberMutation(e.group_id)) {
             if (complete_duplicate) continue;  // authority already restored it
-            return tl::make_unexpected(
-                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            // Ineligible owner replay, not a transient allocation failure.
+            // The authoritative weight snapshot controls closed members.
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto import_write =
             weight_manager_.TrackImportWrite(oid.tenant_id, e.group_id);
@@ -1862,6 +1867,7 @@ MasterService::GetCommittedRebuildEntry(const std::string& key,
     entry.tenant_id = identity.tenant_id.value();
     entry.size = metadata.TotalLength();
     entry.group_id = metadata.group_id;
+    entry.managed_weight = weight_manager_.IsManagedGroup(metadata.group_id);
     entry.data_type = metadata.data_type;
     entry.object_checksum = metadata.GetPart(0).checksum();
     entry.session_id = metadata.session_id;

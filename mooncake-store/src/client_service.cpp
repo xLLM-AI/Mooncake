@@ -6245,11 +6245,14 @@ void Client::StorageHeartbeatThreadMain() {
             if (complete) {
                 std::lock_guard lock(local_replica_table_mutex_);
                 if (generation != rebuild_connection_generation_.load() ||
-                    epoch != rebuild_master_epoch_)
+                    epoch != rebuild_master_epoch_ ||
+                    rebuild_replay_view_ != view_version)
                     return tl::expected<void, ErrorCode>{
                         tl::make_unexpected(ErrorCode::INVALID_VERSION)};
-                if (rebuild_replay_view_ == view_version)
-                    rebuild_replay_view_.reset();
+                rebuild_replay_view_.reset();
+                // Retire this attempt under the same lock as its window.
+                // A later notify/connection failure may request another retry.
+                rebuild_retry_pending_.store(!owned_replay_pending_.empty());
             }
             return complete;
         };
@@ -6274,12 +6277,6 @@ void Client::StorageHeartbeatThreadMain() {
         };
         auto result = RunRebuildRecovery(ops, kMaxAttempts, wait_before_retry);
         if (result) {
-            {
-                std::lock_guard lock(local_replica_table_mutex_);
-                // An old notify may fail after the completion barrier.
-                // Never overwrite the retry it requested with success.
-                rebuild_retry_pending_.store(!owned_replay_pending_.empty());
-            }
             LOG(INFO)
                 << "[HA-REBUILD] client sent rebuild-complete signal view="
                 << view_version;

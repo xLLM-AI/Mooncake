@@ -77,10 +77,16 @@ Exact same-location allocations are reused. An overlapping resize that cannot
 be reserved alongside the old allocation fails safely and remains retryable;
 it does not tear down the old route to force progress.
 
-Managed weight members use the existing group lock and import activity guard.
-Closed/non-importing groups reject new/replacement replay; an exact duplicate
-already restored by the authoritative weight snapshot is a no-op. Do not rely
-on client ownership replay alone to reconstruct a managed weight manifest.
+Managed weight members use the existing group lock and import activity guard,
+in the normal group -> master-state -> key lock order. Entries retain whether
+they belonged to a managed weight, so an empty master cannot reinterpret them
+as ordinary group members. Missing authoritative weight state or closed/
+non-importing groups reject new/replacement replay with `INVALID_PARAMS`;
+the client isolates/quarantines these ineligible records instead of waiting
+forever for them to become imports. An exact duplicate already restored by the
+authoritative weight snapshot is a no-op. An import currently closing still
+uses the existing retryable activity guard. Do not rely on client ownership
+replay alone to reconstruct a managed weight manifest.
 
 Successful writes wait for each remote owner to apply and acknowledge its
 ownership record. Unacknowledged records remain queued for retry; a write
