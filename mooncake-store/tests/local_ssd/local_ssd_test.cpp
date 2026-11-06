@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <barrier>
+#include <latch>
 #include <thread>
 
 #include "local_ssd/manager.h"
@@ -222,7 +223,14 @@ TEST(LocalSsdManagerTest, MirrorCancellationIsAtomicAgainstConcurrentDrain) {
     ASSERT_TRUE(manager.RegisterClient(client_a, true) == ErrorCode::OK);
     ASSERT_TRUE(manager.RegisterClient(client_b, true) == ErrorCode::OK);
 
-    for (int iteration = 0; iteration < 100; ++iteration) {
+    // Force each lock-order outcome once, then run 2,000 unordered races.
+    // A requirement that both outcomes occur by scheduler luck is flaky.
+    constexpr int kRaceIterations = 2000;
+    int cancelled_count = 0;
+    int drained_count = 0;
+    for (int iteration = 0; iteration < kRaceIterations + 2; ++iteration) {
+        const bool cancel_first = iteration == 0;
+        const bool drain_first = iteration == 1;
         SCOPED_TRACE(iteration);
         ASSERT_TRUE(manager.EnqueueOffload(client_a,
                                            Offload("tenant", "key", 1),
@@ -231,24 +239,34 @@ TEST(LocalSsdManagerTest, MirrorCancellationIsAtomicAgainstConcurrentDrain) {
                                            Offload("tenant", "key", 1),
                                            10) == ErrorCode::OK);
         std::barrier start(2);
+        std::latch first_completed(1);
         bool drain_succeeded = false;
         size_t claimed_b = 0;
         std::thread drainer([&] {
             start.arrive_and_wait();
+            if (cancel_first) first_completed.wait();
             auto result = manager.SetOffloadingAndTakePending(client_b, true);
             drain_succeeded = result.has_value();
             if (drain_succeeded) claimed_b = result->size();
+            if (drain_first) first_completed.count_down();
         });
         start.arrive_and_wait();
+        if (drain_first) first_completed.wait();
         const bool cancelled = manager.CancelOffloadsIfAllPending(
             {client_b, client_a, client_b}, TenantId("tenant"), "key");
+        if (cancel_first) first_completed.count_down();
         drainer.join();
+        if (cancel_first) EXPECT_TRUE(cancelled);
+        if (drain_first) EXPECT_FALSE(cancelled);
+        cancelled ? ++cancelled_count : ++drained_count;
         ASSERT_TRUE(drain_succeeded);
         auto claimed_a = manager.SetOffloadingAndTakePending(client_a, true);
         ASSERT_TRUE(claimed_a.has_value());
         EXPECT_EQ(claimed_a->size(), cancelled ? 0 : 1);
         EXPECT_EQ(claimed_b, cancelled ? 0 : 1);
     }
+    EXPECT_GT(cancelled_count, 0);
+    EXPECT_GT(drained_count, 0);
 }
 
 }  // namespace

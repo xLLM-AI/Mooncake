@@ -282,7 +282,8 @@ In addition to CUDA, Mooncake also supports other accelerator backends, along wi
 
 This fork defaults `MOONCAKE_BUILD_STATIC=ON` for `mooncake_common`,
 `transfer_engine`, and `mooncake_store`, independently of device backends that
-force `BUILD_SHARED_LIBS=ON`. To build the public C++ shared libraries, configure
+force `BUILD_SHARED_LIBS=ON`. The Ascend Direct/UBSHMEM transport library follows
+the same static/shared policy. To build the public C++ shared libraries, configure
 with `-DMOONCAKE_BUILD_STATIC=OFF -DBUILD_SHARED_LIBS=ON`. Installation follows
 the actual target type; static archives have no RPATH. `WITH_STORE_C_SHARED`
 continues to require a static Store core and builds a separate C-ABI shared

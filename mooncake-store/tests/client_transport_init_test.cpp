@@ -122,6 +122,47 @@ TEST_F(ClientTransportInitTest, DisabledDiscoveryRejectsMissingOrEmptyDevices) {
     }
 }
 
+TEST_F(ClientTransportInitTest,
+       DisabledDiscoveryWhitelistCannotReplaceDevices) {
+    auto_disc.Set("0");
+    filters.Set("store_test_hca_b");
+    for (const auto& devices :
+         {std::optional<std::string>{}, std::optional<std::string>{""}}) {
+        auto client = ClientTransportInitTestPeer::Make();
+        EXPECT_EQ(ClientTransportInitTestPeer::Init(*client, "rdma", devices),
+                  ErrorCode::INVALID_PARAMS);
+        // The whitelist cannot turn manual mode into unfiltered discovery.
+        EXPECT_TRUE(ClientTransportInitTestPeer::Engine(*client)
+                        .getLocalTopology()
+                        ->getHcaList()
+                        .empty());
+    }
+}
+
+TEST_F(ClientTransportInitTest,
+       DefaultDiscoveryDistinguishesAbsentAndEmptyDevices) {
+    {
+        auto client = ClientTransportInitTestPeer::Make();
+        EXPECT_NE(
+            ClientTransportInitTestPeer::Init(*client, "rdma", std::nullopt),
+            ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(
+            ClientTransportInitTestPeer::Engine(*client)
+                .getLocalTopology()
+                ->getHcaList(),
+            (std::vector<std::string>{"store_test_hca_a", "store_test_hca_b"}));
+    }
+    {
+        auto client = ClientTransportInitTestPeer::Make();
+        EXPECT_EQ(ClientTransportInitTestPeer::Init(*client, "rdma", ""),
+                  ErrorCode::INVALID_PARAMS);
+        EXPECT_TRUE(ClientTransportInitTestPeer::Engine(*client)
+                        .getLocalTopology()
+                        ->getHcaList()
+                        .empty());
+    }
+}
+
 TEST_F(ClientTransportInitTest, ManualSelectionDoesNotLoadCustomJson) {
     auto_disc.Set("0");
     auto client = ClientTransportInitTestPeer::Make();

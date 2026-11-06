@@ -398,6 +398,12 @@ export MC_INTRANODE_NVLINK=true
 - Buffers allocated with `TransferEngine::allocateSharedMemory` (ordinary `malloc` cannot be exported)
 - Runtime opt-in: `MC_FORCE_SHM=1`, or `installTransport("shm")`. With `-DENABLE_MULTI_PROTOCOL=ON` this adds SHM next to RDMA/TCP (`rdma,shm` / `tcp,shm`); without it, SHM is the only transport.
 - Same-host SHM **and** cross-host RDMA/TCP in one engine: build with `-DENABLE_MULTI_PROTOCOL=ON` (segment protocol becomes `rdma,shm` or `tcp,shm`)
+- Classic (non-TENT) Store-created Transfer Engines honor these initialization
+  overrides even when
+  default transport installation is disabled. `MC_FORCE_TCP` takes precedence
+  over SHM forcing and the originally requested hardware transport. This does
+  not change the Store allocator limitation below: Store segments are not yet
+  SHM-backed.
 
 **Limitations:**
 - Same host only. Without `ENABLE_MULTI_PROTOCOL`, `MC_FORCE_SHM=1` (or `installTransport("shm")` after another transport) sets `segment.protocol` to `shm` and replaces RDMA/TCP routing; `installTransport("shm")` logs a WARNING when it overwrites a non-empty protocol. Coexistence needs `-DENABLE_MULTI_PROTOCOL=ON`.

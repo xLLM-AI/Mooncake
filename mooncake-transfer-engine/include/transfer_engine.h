@@ -328,6 +328,10 @@ class TransferEngine {
 
     // Disables default transport selection, not explicit force flags, topology
     // preparation, or the optional multi-protocol SHM companion.
+    // Consumed by classic-engine init(): call before init() to control that
+    // initialization. Later changes do not reconfigure installed transports;
+    // they only affect a subsequent init(). Ignored while using the TENT
+    // backend, not merely because TENT support was compiled in.
     void setAutoInstallTransport(bool auto_install_transport);
     bool autoInstallTransportEnabled() const;
 
