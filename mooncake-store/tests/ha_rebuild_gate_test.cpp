@@ -16,9 +16,11 @@ WrappedMasterServiceConfig MakeConfig(bool initially_serving,
 }
 
 template <typename T>
-void ExpectUnavailable(const tl::expected<T, ErrorCode>& result) {
+void ExpectUnavailable(
+    const tl::expected<T, ErrorCode>& result,
+    ErrorCode error = ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
     ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(result.error(), error);
 }
 
 template <typename T>
@@ -41,29 +43,25 @@ TEST(HaRebuildGateTest, RebuildModeRejectsReplicaMigrationBeforeAllocation) {
     auto config = MakeConfig(true);
     config.enable_ha_rebuild = true;
     WrappedMasterService service(config);
-    const auto client_id = generate_uuid();
-    const auto copy =
-        service.CopyStart(client_id, "key", "default", "source", {"target"});
-    ASSERT_FALSE(copy);
-    EXPECT_EQ(copy.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    const auto move =
-        service.MoveStart(client_id, "key", "default", "source", "target");
-    ASSERT_FALSE(move);
-    EXPECT_EQ(move.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    const auto dynamic_copy = service.DynamicReplicaCopyStart(
-        client_id, "key", "default", "source", {"target"}, UUID{2, 3}, 1);
-    ASSERT_FALSE(dynamic_copy);
-    EXPECT_EQ(dynamic_copy.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    const auto client = generate_uuid();
+    const auto mode = ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    ExpectUnavailable(
+        service.CopyStart(client, "key", "default", "source", {"target"}),
+        mode);
+    ExpectUnavailable(
+        service.MoveStart(client, "key", "default", "source", "target"), mode);
+    ExpectUnavailable(
+        service.DynamicReplicaCopyStart(client, "key", "default", "source",
+                                        {"target"}, UUID{2, 3}, 1),
+        mode);
     WrappedMasterService ordinary(MakeConfig(true));
-    ASSERT_TRUE(ordinary.ReMountSegment({}, client_id));
-    const auto ordinary_copy =
-        ordinary.CopyStart(client_id, "key", "default", "source", {"target"});
-    ASSERT_FALSE(ordinary_copy);
-    EXPECT_EQ(ordinary_copy.error(), ErrorCode::SEGMENT_NOT_FOUND);
-    const auto ordinary_move =
-        ordinary.MoveStart(client_id, "key", "default", "source", "target");
-    ASSERT_FALSE(ordinary_move);
-    EXPECT_EQ(ordinary_move.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    ASSERT_TRUE(ordinary.ReMountSegment({}, client));
+    ExpectUnavailable(
+        ordinary.CopyStart(client, "key", "default", "source", {"target"}),
+        ErrorCode::SEGMENT_NOT_FOUND);
+    ExpectUnavailable(
+        ordinary.MoveStart(client, "key", "default", "source", "target"),
+        ErrorCode::SEGMENT_NOT_FOUND);
 }
 
 TEST(HaRebuildGateTest, ExactRosterAndEpochControlOpening) {
@@ -101,10 +99,8 @@ TEST(HaRebuildGateTest, EmptyRosterOpensAndTimeoutIsDegraded) {
     ASSERT_TRUE(timed_out.SignalRebuildComplete(UUID{1, 1}, 42).has_value());
     EXPECT_EQ(timed_out.GetServingState(), StoreServingState::SERVING);
 
-    WrappedMasterService opened(MakeConfig(false));
-    opened.LockRebuildExpectedClients({});
-    opened.SetServing(false);
-    EXPECT_EQ(opened.GetServingState(), StoreServingState::REBUILDING);
+    empty.SetServing(false);
+    EXPECT_EQ(empty.GetServingState(), StoreServingState::REBUILDING);
 }
 
 TEST(HaRebuildGateTest, ConcurrentDuplicateDoneOpensOnlyAfterExactRoster) {
@@ -180,6 +176,7 @@ TEST(HaRebuildGateTest, RebuildingRejectsBusinessAndAllowsRecoveryRpc) {
     NoFSegment nof_segment;
     ExpectUnavailable(service.MountNoFSegment(nof_segment, client));
     ExpectUnavailable(service.MountLocalDiskSegment(client, true));
+    ExpectUnavailable(service.UnmountLocalDiskSegment(client));
     ExpectUnavailable(service.CreateCopyTask("key", "default", {}));
     ExpectUnavailable(service.CreateMoveTask("key", "default", "a", "b"));
     ExpectUnavailable(service.CopyStart(client, "key", "default", "a", {"b"}));
@@ -196,15 +193,10 @@ TEST(HaRebuildGateTest, RebuildingRejectsBusinessAndAllowsRecoveryRpc) {
     ASSERT_TRUE(service.ReMountSegment({}, client).has_value());
     auto nof_remount = service.ReMountNoFSegment({}, client);
     EXPECT_NE(nof_remount.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    ExpectUnavailable(service.RebuildMetadata({}, client, 41),
+                      ErrorCode::INVALID_VERSION);
     ASSERT_TRUE(service.RebuildMetadata({}, client, 42).has_value());
-    ASSERT_TRUE(service.SignalRebuildCompleteRpc(client, 42).has_value());
-}
-
-TEST(HaRebuildGateTest, StaleMetadataBatchIsRejected) {
-    WrappedMasterService service(MakeConfig(false));
-    auto result = service.RebuildMetadata({}, UUID{1, 1}, 41);
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_VERSION);
+    ASSERT_TRUE(service.SignalRebuildComplete(client, 42).has_value());
 }
 
 }  // namespace

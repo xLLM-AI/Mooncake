@@ -183,18 +183,13 @@ struct RpcNameTraits<&WrappedMasterService::RebuildMetadata> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::GetCommittedRebuildEntry> {
-    static constexpr const char* value = "GetCommittedRebuildEntry";
-};
-
-template <>
 struct RpcNameTraits<&WrappedMasterService::BatchGetCommittedRebuildEntries> {
     static constexpr const char* value = "BatchGetCommittedRebuildEntries";
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::SignalRebuildCompleteRpc> {
-    static constexpr const char* value = "SignalRebuildCompleteRpc";
+struct RpcNameTraits<&WrappedMasterService::SignalRebuildComplete> {
+    static constexpr const char* value = "SignalRebuildComplete";
 };
 
 template <>
@@ -1058,12 +1053,6 @@ tl::expected<void, ErrorCode> MasterClient::ReMountSegment(
     return result;
 }
 
-tl::expected<KeyReplicaEntry, ErrorCode> MasterClient::GetCommittedRebuildEntry(
-    const std::string& key, const std::string& tenant_id) {
-    return invoke_rpc<&WrappedMasterService::GetCommittedRebuildEntry,
-                      KeyReplicaEntry>(key, tenant_id);
-}
-
 std::vector<tl::expected<KeyReplicaEntry, ErrorCode>>
 MasterClient::BatchGetCommittedRebuildEntries(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
@@ -1073,7 +1062,7 @@ MasterClient::BatchGetCommittedRebuildEntries(
 }
 
 tl::expected<void, ErrorCode> MasterClient::RebuildMetadata(
-    std::vector<KeyReplicaEntry>&& entries, ViewVersionId view_version) {
+    const std::vector<KeyReplicaEntry>& entries, ViewVersionId view_version) {
     ScopedVLogTimer timer(1, "MasterClient::RebuildMetadata");
     timer.LogRequest("entries_num=", entries.size(),
                      ", client_id=", client_id_);
@@ -1089,7 +1078,7 @@ tl::expected<void, ErrorCode> MasterClient::SignalRebuildComplete(
     ScopedVLogTimer timer(1, "MasterClient::SignalRebuildComplete");
     timer.LogRequest("client_id=", client_id_);
     auto result =
-        invoke_rpc<&WrappedMasterService::SignalRebuildCompleteRpc, void>(
+        invoke_rpc<&WrappedMasterService::SignalRebuildComplete, void>(
             client_id_, view_version);
     timer.LogResponseExpected(result);
     return result;

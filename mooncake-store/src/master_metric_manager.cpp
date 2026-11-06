@@ -1255,14 +1255,11 @@ void MasterMetricManager::inc_rebuild_metadata_failures(int64_t val) {
 void MasterMetricManager::set_rebuild_state(int64_t state) {
     rebuild_state_.update(state);
 }
-void MasterMetricManager::set_rebuild_expected_clients(int64_t clients) {
-    rebuild_expected_clients_.update(clients);
-}
-void MasterMetricManager::set_rebuild_completed_clients(int64_t clients) {
-    rebuild_completed_clients_.update(clients);
-}
-void MasterMetricManager::set_rebuild_missing_clients(int64_t clients) {
-    rebuild_missing_clients_.update(clients);
+void MasterMetricManager::set_rebuild_progress(int64_t expected,
+                                               int64_t completed) {
+    rebuild_expected_clients_.update(expected);
+    rebuild_completed_clients_.update(completed);
+    rebuild_missing_clients_.update(expected - completed);
 }
 void MasterMetricManager::set_rebuild_duration_ms(int64_t duration_ms) {
     rebuild_duration_ms_.update(duration_ms);

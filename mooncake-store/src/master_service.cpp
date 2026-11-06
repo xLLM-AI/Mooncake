@@ -1685,6 +1685,8 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
         if (e.replicas.empty() || e.size == 0)
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         const auto incoming = GetRebuildVersion(e);
+        if (incoming.second == std::numeric_limits<ReplicaID>::max())
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         for (const auto& desc : e.replicas) {
             if (!desc.is_memory_replica() ||
                 desc.id == std::numeric_limits<ReplicaID>::max())
@@ -1693,6 +1695,7 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
             if (buffer.size_ != e.size || buffer.allocationExtent() < e.size)
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+        AdvanceReplicaIdHighWaterMark(incoming.second + 1);
         MetadataAccessorRW accessor(this, oid, MetadataAccessorRW::CreateKey{});
         bool replace = false;
         if (accessor.IsPublished()) {

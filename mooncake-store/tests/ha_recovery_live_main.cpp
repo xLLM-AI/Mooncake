@@ -1,10 +1,4 @@
-// Live HA recovery test: standalone client that connects to a REAL, separate
-// mooncake_master PROCESS (not InProcMaster). Driven by an external shell
-// script (ha_live_test.sh):
-//   1. mount a segment, Put N keys, verify baseline
-//   2. print "READY_FOR_KILL", then poll Get until reads fail (master killed)
-//      and then succeed again (master restarted + metadata rebuilt)
-//   3. print RESULT=PASS/FAIL
+// Real restart/failover: verify bytes, registrations and fresh writes.
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
@@ -24,7 +18,6 @@
 #include "client_service.h"
 #include "types.h"
 #include "common/client_buffer_allocation.h"
-#include "common/network.h"
 
 DEFINE_string(protocol, "tcp", "transfer protocol");
 DEFINE_string(master, "127.0.0.1:50055", "master rpc ip:port");

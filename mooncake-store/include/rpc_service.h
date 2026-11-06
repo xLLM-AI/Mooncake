@@ -203,9 +203,6 @@ class WrappedMasterService {
         const std::vector<KeyReplicaEntry>& entries, const UUID& client_id,
         ViewVersionId view_version);
 
-    tl::expected<KeyReplicaEntry, ErrorCode> GetCommittedRebuildEntry(
-        const std::string& key, const std::string& tenant_id);
-
     std::vector<tl::expected<KeyReplicaEntry, ErrorCode>>
     BatchGetCommittedRebuildEntries(const std::vector<std::string>& keys,
                                     const std::string& tenant_id);
@@ -469,8 +466,6 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> SignalRebuildComplete(
         const UUID& client_id, ViewVersionId view_version);
     void ForceServingAfterTimeout();
-    tl::expected<void, ErrorCode> SignalRebuildCompleteRpc(
-        const UUID& client_id, ViewVersionId view_version);
 
    private:
     bool IsCurrentView(ViewVersionId view_version) const {

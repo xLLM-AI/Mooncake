@@ -9,46 +9,53 @@
 #include "master_service.h"
 #include "ha/snapshot/batch_oplog/codec.h"
 #include "rebuild_retry.h"
-#include "common/client_buffer_allocation.h"
-#include "common/network.h"
 
 namespace mooncake {
 namespace {
 
-TEST(MasterRebuildReplayTest, NewerWriteSupersedesOtherOwnersStaleSnapshot) {
-    const auto config = MasterServiceConfig::builder()
-                            .set_view_version(43)
-                            .set_default_kv_lease_ttl(60000)
-                            .build();
-    MasterService recovered(config);
-    const UUID client_id = generate_uuid();
+MasterServiceConfig ReplayConfig(ViewVersionId view) {
+    return MasterServiceConfig::builder()
+        .set_memory_allocator(BufferAllocatorType::OFFSET)
+        .set_default_kv_lease_ttl(60000)
+        .set_view_version(view)
+        .build();
+}
+
+Segment MakeSegment(const std::string& name, uintptr_t base, size_t size) {
     Segment segment;
     segment.id = generate_uuid();
-    segment.name = "version-owner";
-    segment.te_endpoint = segment.name;
-    segment.base = 4096;
-    segment.size = 1024;
+    segment.name = segment.te_endpoint = name;
+    segment.base = base;
+    segment.size = size;
+    return segment;
+}
+
+KeyReplicaEntry MakeEntry(const Segment& segment, const std::string& key,
+                          uint64_t size, uintptr_t address, ReplicaID id,
+                          RebuildVersion version) {
+    KeyReplicaEntry entry;
+    entry.key = key;
+    entry.size = size;
+    entry.version = version;
+    Replica::Descriptor replica;
+    replica.id = id;
+    replica.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor memory;
+    memory.buffer_descriptor = {
+        size, address, "tcp", segment.te_endpoint, version.first, size};
+    replica.descriptor_variant = memory;
+    entry.replicas = {replica};
+    return entry;
+}
+
+TEST(MasterRebuildReplayTest, NewerWriteSupersedesOtherOwnersStaleSnapshot) {
+    const auto config = ReplayConfig(43);
+    MasterService recovered(config);
+    const UUID client_id = generate_uuid();
+    auto segment = MakeSegment("version-owner", 4096, 1024);
     ASSERT_TRUE(recovered.ReMountSegment({segment}, client_id));
-    KeyReplicaEntry previous;
-    previous.key = "key";
-    previous.size = 128;
-    previous.version = {42, 1};
-    Replica::Descriptor old_replica;
-    old_replica.id = 1;
-    old_replica.status = ReplicaStatus::COMPLETE;
-    MemoryDescriptor old_memory;
-    old_memory.buffer_descriptor = {128, 4096, "tcp", segment.te_endpoint,
-                                    42,  128};
-    old_replica.descriptor_variant = old_memory;
-    previous.replicas = {old_replica};
-    auto latest = previous;
-    latest.size = 256;
-    latest.version = {42, 2};
-    latest.replicas.front().id = 2;
-    auto& latest_memory =
-        std::get<MemoryDescriptor>(latest.replicas.front().descriptor_variant);
-    latest_memory.buffer_descriptor = {256, 4352, "tcp", segment.te_endpoint,
-                                       42,  256};
+    auto previous = MakeEntry(segment, "key", 128, 4096, 1, {42, 1});
+    auto latest = MakeEntry(segment, "key", 256, 4352, 2, {42, 2});
     ASSERT_TRUE(recovered.RebuildMetadata({previous}, client_id));
     ASSERT_TRUE(recovered.RebuildMetadata({latest}, client_id));
     ASSERT_TRUE(recovered.RebuildMetadata({previous}, client_id));
@@ -67,32 +74,14 @@ TEST(MasterRebuildReplayTest, RecreatedObjectsChangeGroupsInEitherReplayOrder) {
         for (const std::string incoming_group : {"new-group", ""}) {
             SCOPED_TRACE(incoming_group +
                          (newest_first ? " newest" : " oldest"));
-            const auto config = MasterServiceConfig::builder()
-                                    .set_default_kv_lease_ttl(60000)
-                                    .set_view_version(43)
-                                    .build();
+            const auto config = ReplayConfig(43);
             MasterService recovered(config);
             const UUID owner = generate_uuid();
-            Segment segment;
-            segment.id = generate_uuid();
-            segment.name = "group-owner";
-            segment.te_endpoint = segment.name;
-            segment.base = 4096;
-            segment.size = 4096;
+            auto segment = MakeSegment("group-owner", 4096, 4096);
             ASSERT_TRUE(recovered.ReMountSegment({segment}, owner));
-            KeyReplicaEntry old_entry;
-            old_entry.key = "recreated-key";
+            auto old_entry =
+                MakeEntry(segment, "recreated-key", 128, 4096, 1, {42, 1});
             old_entry.group_id = "old-group";
-            old_entry.size = 128;
-            old_entry.version = {42, 1};
-            Replica::Descriptor replica;
-            replica.id = 1;
-            replica.status = ReplicaStatus::COMPLETE;
-            MemoryDescriptor memory;
-            memory.buffer_descriptor = {128, 4096, "tcp", segment.te_endpoint,
-                                        42,  128};
-            replica.descriptor_variant = memory;
-            old_entry.replicas = {replica};
             auto latest = old_entry;
             latest.group_id = incoming_group;
             latest.version = {42, 2};
@@ -135,12 +124,8 @@ TEST(MasterRebuildReplayTest, RecreatedObjectsChangeGroupsInEitherReplayOrder) {
 TEST(MasterRebuildReplayTest, FullSegmentSurvivesLostCompletionAndLaterWrites) {
     std::vector<unsigned char> bytes(4096);
     const UUID client_id = generate_uuid();
-    Segment segment;
-    segment.id = generate_uuid();
-    segment.name = "replay-owner";
-    segment.te_endpoint = segment.name;
-    segment.base = reinterpret_cast<uint64_t>(bytes.data());
-    segment.size = bytes.size();
+    auto segment = MakeSegment(
+        "replay-owner", reinterpret_cast<uint64_t>(bytes.data()), bytes.size());
     const auto config = MasterServiceConfig::builder()
                             .set_memory_allocator(BufferAllocatorType::OFFSET)
                             .set_default_kv_lease_ttl(60000)
@@ -223,34 +208,17 @@ TEST(MasterRebuildReplayTest, FullSegmentSurvivesLostCompletionAndLaterWrites) {
 }
 
 TEST(MasterRebuildReplayTest, SharedWriteTokenAdvancesNextReplicaId) {
-    const auto config = MasterServiceConfig::builder()
-                            .set_memory_allocator(BufferAllocatorType::OFFSET)
-                            .set_view_version(0)
-                            .set_default_kv_lease_ttl(60000)
-                            .build();
+    const auto config = ReplayConfig(0);
     MasterService recovered(config);
     const UUID client_id = generate_uuid();
     std::vector<unsigned char> bytes(4096);
-    Segment segment;
-    segment.id = generate_uuid();
-    segment.name = "shared-token-owner";
-    segment.te_endpoint = segment.name;
-    segment.base = reinterpret_cast<uint64_t>(bytes.data());
-    segment.size = bytes.size();
+    auto segment =
+        MakeSegment("shared-token-owner",
+                    reinterpret_cast<uint64_t>(bytes.data()), bytes.size());
     ASSERT_TRUE(recovered.ReMountSegment({segment}, client_id));
 
-    KeyReplicaEntry entry;
-    entry.key = "recovered-key";
-    entry.size = 128;
-    entry.version = {0, 100000};
-    Replica::Descriptor descriptor;
-    descriptor.id = 7;
-    descriptor.status = ReplicaStatus::COMPLETE;
-    MemoryDescriptor memory;
-    memory.buffer_descriptor = {128, segment.base, "tcp", segment.te_endpoint,
-                                0,   128};
-    descriptor.descriptor_variant = memory;
-    entry.replicas = {descriptor};
+    auto entry =
+        MakeEntry(segment, "recovered-key", 128, segment.base, 7, {0, 100000});
 
     ASSERT_TRUE(recovered.RebuildMetadata({entry}, client_id));
     auto replacement = recovered.PutStart(
@@ -267,25 +235,11 @@ TEST(MasterRebuildReplayTest,
     const UUID owners[] = {generate_uuid(), generate_uuid()};
     KeyReplicaEntry entries[2];
     for (int i = 0; i < 2; ++i) {
-        Segment segment;
-        segment.id = generate_uuid();
-        segment.name = "concurrent-owner-" + std::to_string(i);
-        segment.te_endpoint = segment.name;
-        segment.base = 4096 + i * 8192;
-        segment.size = 4096;
+        auto segment = MakeSegment("concurrent-owner-" + std::to_string(i),
+                                   4096 + i * 8192, 4096);
         ASSERT_TRUE(recovered.ReMountSegment({segment}, owners[i]));
-        auto& entry = entries[i];
-        entry.key = "concurrent-key";
-        entry.size = 128;
-        entry.version = {42, 10};
-        Replica::Descriptor descriptor;
-        descriptor.id = i + 1;
-        descriptor.status = ReplicaStatus::COMPLETE;
-        MemoryDescriptor memory;
-        memory.buffer_descriptor = {
-            128, segment.base, "tcp", segment.te_endpoint, 42, 128};
-        descriptor.descriptor_variant = memory;
-        entry.replicas = {descriptor};
+        entries[i] = MakeEntry(segment, "concurrent-key", 128, segment.base,
+                               i + 1, {42, 10});
     }
     std::atomic<int> failures{0};
     std::vector<std::thread> workers;
@@ -309,24 +263,8 @@ TEST(MasterRebuildReplayTest, MissingOwnerCanRemountAndRetryTheSameBatch) {
     MasterService recovered(
         MasterServiceConfig::builder().set_view_version(43).build());
     const UUID owner = generate_uuid();
-    Segment segment;
-    segment.id = generate_uuid();
-    segment.name = "retry-owner";
-    segment.te_endpoint = segment.name;
-    segment.base = 4096;
-    segment.size = 4096;
-    KeyReplicaEntry entry;
-    entry.key = "retry-key";
-    entry.size = 128;
-    entry.version = {42, 1};
-    Replica::Descriptor descriptor;
-    descriptor.id = 1;
-    descriptor.status = ReplicaStatus::COMPLETE;
-    MemoryDescriptor memory;
-    memory.buffer_descriptor = {128, segment.base, "tcp", segment.te_endpoint,
-                                42,  128};
-    descriptor.descriptor_variant = memory;
-    entry.replicas = {descriptor};
+    auto segment = MakeSegment("retry-owner", 4096, 4096);
+    auto entry = MakeEntry(segment, "retry-key", 128, segment.base, 1, {42, 1});
     EXPECT_FALSE(recovered.RebuildMetadata({entry}, owner));
     ASSERT_TRUE(recovered.ReMountSegment({segment}, owner));
     ASSERT_TRUE(recovered.RebuildMetadata({entry}, owner));

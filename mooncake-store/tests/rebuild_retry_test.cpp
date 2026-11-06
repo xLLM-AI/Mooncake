@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include <array>
-#include <string>
 #include <vector>
 
 #include "rebuild_retry.h"
@@ -13,12 +12,13 @@ struct ScriptedRecovery {
     std::array<int, 5> failures{};
     std::array<int, 5> calls{};
     std::vector<int> order;
+    ErrorCode failure_code{ErrorCode::RPC_FAIL};
 
     tl::expected<void, ErrorCode> RunStep(int step) {
         ++calls[step];
         order.push_back(step);
         if (failures[step]-- > 0) {
-            return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            return tl::make_unexpected(failure_code);
         }
         return {};
     }
@@ -54,11 +54,8 @@ TEST_P(RebuildFailureStepTest, NeverSignalsCompleteAfterExhaustedStepFailure) {
     EXPECT_EQ(scripted.calls[GetParam()], 3);
     EXPECT_EQ(scripted.calls[4], GetParam() == 4 ? 3 : 0);
     EXPECT_EQ(waits, 2);
-    for (int step = GetParam() + 1; step < 5; ++step) {
-        if (step != 4) {
-            EXPECT_EQ(scripted.calls[step], 0);
-        }
-    }
+    for (int step = GetParam() + 1; step < 4; ++step)
+        EXPECT_EQ(scripted.calls[step], 0);
 }
 
 INSTANTIATE_TEST_SUITE_P(AllRecoverySteps, RebuildFailureStepTest,
@@ -74,60 +71,30 @@ TEST(RebuildRetryTest, TransientBatchFailureRestartsWholeTransaction) {
 }
 
 TEST(RebuildRetryTest, StaleEpochStopsWithoutRetryOrDone) {
-    RebuildRecoveryOps ops;
-    int metadata_calls = 0;
-    int done_calls = 0;
-    ops.remount = [] { return tl::expected<void, ErrorCode>{}; };
-    ops.publish_segment_descriptor = [] {
-        return tl::expected<void, ErrorCode>{};
-    };
-    ops.publish_rpc_metadata = [] { return tl::expected<void, ErrorCode>{}; };
-    ops.resend_metadata = [&]() -> tl::expected<void, ErrorCode> {
-        ++metadata_calls;
-        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
-    };
-    ops.signal_complete = [&]() -> tl::expected<void, ErrorCode> {
-        ++done_calls;
-        return {};
-    };
-
-    auto result = RunRebuildRecovery(ops, 3, [](int) { return true; });
-    ASSERT_FALSE(result.has_value());
+    ScriptedRecovery scripted;
+    scripted.failures[3] = 1;
+    scripted.failure_code = ErrorCode::INVALID_VERSION;
+    auto result =
+        RunRebuildRecovery(scripted.Ops(), 3, [](int) { return true; });
+    ASSERT_FALSE(result);
     EXPECT_EQ(result.error(), ErrorCode::INVALID_VERSION);
-    EXPECT_EQ(metadata_calls, 1);
-    EXPECT_EQ(done_calls, 0);
+    EXPECT_EQ(scripted.calls[3], 1);
+    EXPECT_EQ(scripted.calls[4], 0);
 }
 
 TEST(RebuildRetryTest, StaleViewRefreshesAndRetriesWholeTransaction) {
-    RebuildRecoveryOps ops;
+    ScriptedRecovery scripted;
+    scripted.failures[3] = 1;
+    scripted.failure_code = ErrorCode::INVALID_VERSION;
+    auto ops = scripted.Ops();
     int refresh_calls = 0;
-    int remount_calls = 0;
-    int metadata_calls = 0;
-    ops.remount = [&]() -> tl::expected<void, ErrorCode> {
-        ++remount_calls;
-        return {};
-    };
-    ops.publish_segment_descriptor = [] {
-        return tl::expected<void, ErrorCode>{};
-    };
-    ops.publish_rpc_metadata = ops.publish_segment_descriptor;
-    ops.resend_metadata = [&]() -> tl::expected<void, ErrorCode> {
-        ++metadata_calls;
-        if (metadata_calls == 1)
-            return tl::make_unexpected(ErrorCode::INVALID_VERSION);
-        return {};
-    };
-    ops.signal_complete = []() -> tl::expected<void, ErrorCode> { return {}; };
-    ops.refresh_view = [&]() {
+    ops.refresh_view = [&] {
         ++refresh_calls;
         return true;
     };
-
-    auto result = RunRebuildRecovery(ops, 3, [](int) { return true; });
-    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(RunRebuildRecovery(ops, 3, [](int) { return true; }));
     EXPECT_EQ(refresh_calls, 1);
-    EXPECT_EQ(remount_calls, 2);
-    EXPECT_EQ(metadata_calls, 2);
+    EXPECT_EQ(scripted.calls, (std::array<int, 5>{2, 2, 2, 2, 1}));
 }
 
 TEST(RebuildRetryTest, ShutdownInterruptsRetries) {

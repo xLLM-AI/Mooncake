@@ -196,9 +196,7 @@ class MasterMetricManager {
     void inc_rebuild_metadata_requests(int64_t val = 1);
     void inc_rebuild_metadata_failures(int64_t val = 1);
     void set_rebuild_state(int64_t state);
-    void set_rebuild_expected_clients(int64_t clients);
-    void set_rebuild_completed_clients(int64_t clients);
-    void set_rebuild_missing_clients(int64_t clients);
+    void set_rebuild_progress(int64_t expected, int64_t completed);
     void set_rebuild_duration_ms(int64_t duration_ms);
     void inc_rebuild_force_open(int64_t val = 1);
     void inc_rebuild_stale_epoch_requests(int64_t val = 1);

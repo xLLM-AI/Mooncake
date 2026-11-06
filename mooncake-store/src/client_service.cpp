@@ -2285,9 +2285,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     return {};
 }
 
-// ===========================================================================
-// HA rebuild: client-side local replica table helpers
-// ===========================================================================
+// HA ownership recording and bounded acknowledgement retries.
 
 tl::expected<void, ErrorCode> Client::RecordCommittedReplicas(
     const std::string& key, const std::string& tenant_id,
@@ -2573,8 +2571,7 @@ tl::expected<void, ErrorCode> Client::ApplyOwnedRebuildEntries(
         }
     }
     if (!replay_id) return {};
-    auto result = master_client_.RebuildMetadata(
-        std::vector<KeyReplicaEntry>(replay), view);
+    auto result = master_client_.RebuildMetadata(replay, view);
     {
         std::lock_guard lock(local_replica_table_mutex_);
         auto pending = owned_replay_pending_.find(replay_id);
@@ -2651,8 +2648,7 @@ void Client::RebuildNotifyLoop() {
 // new master via the RebuildMetadata RPC.
 tl::expected<void, ErrorCode> Client::ReplayRebuildEntries(
     const std::vector<KeyReplicaEntry>& entries, ViewVersionId view_version) {
-    auto result = master_client_.RebuildMetadata(
-        std::vector<KeyReplicaEntry>(entries), view_version);
+    auto result = master_client_.RebuildMetadata(entries, view_version);
     if (result || result.error() != ErrorCode::INVALID_PARAMS) return result;
     // Keep the wire API unchanged. Isolate a poison row only on permanent
     // validation failure; transport/stale-view failures must remain retryable.
@@ -6202,27 +6198,22 @@ void Client::StorageHeartbeatThreadMain() {
             }
             return master_client_.ReMountSegment(segments);
         };
-        ops.publish_segment_descriptor =
-            [&]() -> tl::expected<void, ErrorCode> {
+        auto publish_metadata = [&](bool rpc) -> tl::expected<void, ErrorCode> {
             auto metadata = transfer_engine_->getMetadata();
-            if (!metadata) {
+            if (!metadata)
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-            int rc = metadata->updateLocalSegmentDesc();
-            segment_desc_publish_pending_.store(rc != 0);
+            const int rc =
+                rpc ? metadata->rePublishRpcMetaEntry(local_hostname_)
+                    : metadata->updateLocalSegmentDesc();
+            (rpc ? rpc_meta_publish_pending_ : segment_desc_publish_pending_)
+                .store(rc != 0);
             if (rc != 0) return tl::make_unexpected(ErrorCode::RPC_FAIL);
             return {};
         };
-        ops.publish_rpc_metadata = [&]() -> tl::expected<void, ErrorCode> {
-            auto metadata = transfer_engine_->getMetadata();
-            if (!metadata) {
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-            int rc = metadata->rePublishRpcMetaEntry(local_hostname_);
-            rpc_meta_publish_pending_.store(rc != 0);
-            if (rc != 0) return tl::make_unexpected(ErrorCode::RPC_FAIL);
-            return {};
+        ops.publish_segment_descriptor = [&] {
+            return publish_metadata(false);
         };
+        ops.publish_rpc_metadata = [&] { return publish_metadata(true); };
         ops.resend_metadata = [&] {
             if (!enable_ha_rebuild_) return tl::expected<void, ErrorCode>{};
             return ResendLocalReplicaTable(view_version);

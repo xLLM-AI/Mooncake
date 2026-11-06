@@ -418,11 +418,8 @@ class MasterClient {
      * to the (empty) new master after a restart, so it can rebuild metadata.
      */
     [[nodiscard]] tl::expected<void, ErrorCode> RebuildMetadata(
-        std::vector<KeyReplicaEntry>&& entries, ViewVersionId view_version);
-
-    [[nodiscard]] tl::expected<KeyReplicaEntry, ErrorCode>
-    GetCommittedRebuildEntry(const std::string& key,
-                             const std::string& tenant_id);
+        const std::vector<KeyReplicaEntry>& entries,
+        ViewVersionId view_version);
 
     [[nodiscard]] std::vector<tl::expected<KeyReplicaEntry, ErrorCode>>
     BatchGetCommittedRebuildEntries(const std::vector<std::string>& keys,

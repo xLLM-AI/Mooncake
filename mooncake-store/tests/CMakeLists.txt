@@ -592,9 +592,9 @@ add_store_test(master_rebuild_replay_test master_rebuild_replay_test.cpp)
 add_store_test(client_metadata_rebuild_test client_metadata_rebuild_test.cpp)
 set_tests_properties(client_metadata_rebuild_test
                      PROPERTIES ENVIRONMENT "MC_ENABLE_HA_REBUILD=1")
-foreach(name ha_recovery_live_main ha_scale_bench_main)
-  add_executable(${name} ${name}.cpp)
-  target_include_directories(${name} PRIVATE ${MOONCAKE_STORE_TESTS_SOURCE_DIR})
-  target_link_libraries(${name} PRIVATE mooncake_store transfer_engine
-                                        glog::glog gflags::gflags pthread)
-endforeach()
+add_executable(ha_recovery_live_main ha_recovery_live_main.cpp)
+target_include_directories(ha_recovery_live_main
+                           PRIVATE ${MOONCAKE_STORE_TESTS_SOURCE_DIR})
+target_link_libraries(
+  ha_recovery_live_main PRIVATE mooncake_store transfer_engine glog::glog
+                                gflags::gflags pthread)
