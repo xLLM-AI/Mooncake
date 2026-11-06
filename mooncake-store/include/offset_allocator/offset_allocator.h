@@ -100,6 +100,7 @@ class OffsetAllocationHandle {
 
     // Get size
     uint64_t size() const { return requested_size; }
+    uint64_t extent() const;
 
    private:
     std::weak_ptr<OffsetAllocator> m_allocator;
@@ -179,6 +180,9 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
         return m_largest_free_region.load(std::memory_order_relaxed);
     }
 
+    std::optional<OffsetAllocationHandle> reserve(uint64_t address, size_t size,
+                                                  size_t extent = 0);
+
     // Get storage report (thread-safe)
     [[nodiscard]]
     OffsetAllocStorageReport storageReport() const;
@@ -250,6 +254,7 @@ class __Allocator {
     OffsetAllocation allocate(uint32 size);
     // Returns the size of the newly merged free region, or zero if allocator
     // metadata capacity still prevents another allocation.
+    OffsetAllocation reserve(uint32 offset, uint32 size);
     uint32 free(OffsetAllocation allocation);
 
     uint32 allocationSize(OffsetAllocation allocation) const;

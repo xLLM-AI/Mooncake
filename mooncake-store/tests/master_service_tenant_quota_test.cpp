@@ -425,6 +425,68 @@ TEST_F(MasterServiceTenantQuotaTest,
     EXPECT_EQ(service.tenant_quota_policy(), nullptr);
 }
 
+TEST_F(MasterServiceTenantQuotaTest, ClientRebuildRestoresQuotaIdempotently) {
+    const auto config = MakeConfig({{TenantId("tenant-a"), 256}});
+    const auto client_id = generate_uuid();
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "quota-rebuild-owner";
+    segment.te_endpoint = segment.name;
+    segment.base = kSegmentBase;
+    segment.size = 4096;
+    KeyReplicaEntry entry;
+    {
+        MasterService original(config);
+        ASSERT_TRUE(original.MountSegment(segment, client_id));
+        auto pinned_config = MemoryConfig();
+        pinned_config.with_hard_pin = true;
+        ASSERT_TRUE(original.PutStart(client_id, "full", TenantId("tenant-a"),
+                                      256, pinned_config));
+        ASSERT_TRUE(original.PutEnd(client_id, "full", TenantId("tenant-a"),
+                                    ReplicaType::MEMORY));
+        auto committed = original.GetCommittedRebuildEntry("full", "tenant-a");
+        ASSERT_TRUE(committed);
+        entry = *committed;
+    }
+    MasterService recovered(config);
+    ASSERT_TRUE(recovered.ReMountSegment({segment}, client_id));
+    for (int replay = 0; replay < 3; ++replay) {
+        ASSERT_TRUE(recovered.RebuildMetadata({entry}, client_id));
+        const auto usage = Snapshot(recovered, TenantId("tenant-a"));
+        EXPECT_EQ(usage.charged_bytes, 256);
+        const auto excess = recovered.PutStart(
+            client_id, "excess", TenantId("tenant-a"), 1, MemoryConfig());
+        ASSERT_FALSE(excess);
+        EXPECT_EQ(excess.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
+    }
+    auto merged = entry;
+    merged.replicas.front().id += 100;
+    std::get<MemoryDescriptor>(merged.replicas.front().descriptor_variant)
+        .buffer_descriptor.buffer_address_ += 512;
+    for (int replay = 0; replay < 2; ++replay) {
+        ASSERT_TRUE(recovered.RebuildMetadata({merged}, client_id));
+        EXPECT_EQ(Snapshot(recovered, TenantId("tenant-a")).charged_bytes, 512);
+    }
+    auto replacement = entry;
+    replacement.size = 128;
+    replacement.version.second += 1;
+    replacement.replicas.front().id += 1;
+    auto& buffer = std::get<MemoryDescriptor>(
+                       replacement.replicas.front().descriptor_variant)
+                       .buffer_descriptor;
+    buffer.size_ = 128;
+    buffer.allocation_size_ = 128;
+    buffer.buffer_address_ += 1024;
+    ASSERT_TRUE(recovered.RebuildMetadata({replacement}, client_id));
+    EXPECT_EQ(Snapshot(recovered, TenantId("tenant-a")).charged_bytes, 128);
+    ASSERT_TRUE(recovered.RebuildMetadata({entry}, client_id));
+    EXPECT_EQ(Snapshot(recovered, TenantId("tenant-a")).charged_bytes, 128);
+    ASSERT_TRUE(recovered.Remove("full", TenantId("tenant-a"), true));
+    EXPECT_EQ(Snapshot(recovered, TenantId("tenant-a")).charged_bytes, 0);
+    EXPECT_TRUE(recovered.PutStart(client_id, "after-remove",
+                                   TenantId("tenant-a"), 256, MemoryConfig()));
+}
+
 TEST_F(MasterServiceTenantQuotaTest,
        MultiTenantModeRejectsUnregisteredAndImplicitDefaultWrites) {
     MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));

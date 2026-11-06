@@ -43,6 +43,10 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
       master_client_metric(labels),
       transfer_operation_metric(labels),
       ssd_metric(labels),
+      rebuild_failed_batches("client_rebuild_failed_batches_total",
+                             "Failed metadata rebuild batches", labels),
+      rebuild_retries("client_rebuild_retries_total",
+                      "HA metadata rebuild retries", labels),
       dfs_metric(labels),
 #ifdef USE_NOF
       nof_metric(labels),
@@ -97,6 +101,8 @@ void ClientMetric::serialize(std::string& str) {
     if (master_rpc_metrics_enabled_) {
         master_client_metric.serialize(str);
     }
+    rebuild_failed_batches.serialize(str);
+    rebuild_retries.serialize(str);
     transfer_operation_metric.serialize(str);
     ssd_metric.serialize(str);
     dfs_metric.serialize(str);
