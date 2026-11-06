@@ -40,7 +40,7 @@ if(WITH_STORE_C_SHARED)
   target_link_libraries(asio_static PUBLIC pthread)
 endif()
 
-add_library(mooncake_common STATIC ${MOONCAKE_COMMON_SOURCES})
+add_library(mooncake_common ${MOONCAKE_LIBRARY_TYPE} ${MOONCAKE_COMMON_SOURCES})
 
 # Internal headers under src/ (e.g. environ.h) are only visible to in-tree
 # targets and are not part of the installed interface.
@@ -54,7 +54,11 @@ target_link_libraries(
   mooncake_common PUBLIC asio_shared yaml-cpp JsonCpp::JsonCpp
                          yalantinglibs::yalantinglibs)
 
-if(BUILD_SHARED_LIBS)
+get_target_property(_mooncake_common_type mooncake_common TYPE)
+if(_mooncake_common_type STREQUAL "SHARED_LIBRARY")
   set_target_properties(mooncake_common PROPERTIES INSTALL_RPATH "$ORIGIN")
-  install(TARGETS mooncake_common DESTINATION lib)
 endif()
+install(
+  TARGETS mooncake_common
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib)

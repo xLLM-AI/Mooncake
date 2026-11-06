@@ -1921,4 +1921,10 @@ Status TransferEngine::transferScatter(
     return operation.wait();
 }
 
+bool TransferEngine::autoInstallTransportEnabled() const {
+#ifdef USE_TENT
+    if (use_tent_) return true;
+#endif
+    return impl_->autoInstallTransportEnabled();
+}
 }  // namespace mooncake

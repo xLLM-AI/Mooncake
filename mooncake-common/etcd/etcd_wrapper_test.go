@@ -41,7 +41,7 @@ func TestNewMaintenanceSessionCancelsStartup(t *testing.T) {
 	}
 }
 
-func TestStoreClientKeepaliveDoesNotPingIdleConnections(t *testing.T) {
+func TestStoreClientKeepalivePolicyRemainsPinned(t *testing.T) {
 	for _, name := range []string{mooncakeEtcdCACertEnv, mooncakeEtcdClientCertEnv,
 		mooncakeEtcdClientKeyEnv, mooncakeEtcdServerNameEnv} {
 		t.Setenv(name, "")

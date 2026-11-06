@@ -74,9 +74,8 @@ if(USE_HTTP)
   target_link_libraries(transfer_metadata_plugin PRIVATE ${CURL_LIBRARIES})
 endif()
 
-add_library(transfer_engine STATIC ${ENGINE_SOURCES}
-                                   $<TARGET_OBJECTS:transport>)
-set_target_properties(transfer_engine PROPERTIES INSTALL_RPATH "$ORIGIN")
+add_library(transfer_engine ${MOONCAKE_LIBRARY_TYPE} ${ENGINE_SOURCES}
+                            $<TARGET_OBJECTS:transport>)
 target_include_directories(
   transfer_engine
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
@@ -105,9 +104,14 @@ if(UNIX AND NOT APPLE)
   # not propagate through $<TARGET_OBJECTS:shm_transport>.
   target_link_libraries(transfer_engine PRIVATE rt)
 endif()
-if(BUILD_SHARED_LIBS)
-  install(TARGETS transfer_engine DESTINATION lib)
+get_target_property(_transfer_engine_type transfer_engine TYPE)
+if(_transfer_engine_type STREQUAL "SHARED_LIBRARY")
+  set_target_properties(transfer_engine PROPERTIES INSTALL_RPATH "$ORIGIN")
 endif()
+install(
+  TARGETS transfer_engine
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib)
 
 if(USE_BAREX)
   target_link_libraries(transfer_engine PUBLIC barex_transport)

@@ -326,7 +326,10 @@ class TransferEngine {
     void setAutoDiscover(bool auto_discover);
     void setAutoDiscover(const AutoDiscoverConfig& config);
 
+    // Disables default transport selection, not explicit force flags, topology
+    // preparation, or the optional multi-protocol SHM companion.
     void setAutoInstallTransport(bool auto_install_transport);
+    bool autoInstallTransportEnabled() const;
 
     void* getBaseAddr();
 

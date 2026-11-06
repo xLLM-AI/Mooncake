@@ -1408,19 +1408,44 @@ TEST_F(TransportTest, DisableAutomaticInstallationWithDiscoveryEnabled) {
     EXPECT_NE(engine.installTransport("tcp", nullptr), nullptr);
 }
 
-TEST_F(TransportTest,
-       DisableAutomaticInstallationOverridesForceTransportFlags) {
-    for (const char* flag : {"MC_FORCE_TCP", "MC_FORCE_SHM"}) {
-        SCOPED_TRACE(flag);
-        ScopedEnvVar force(flag, "1");
-        TransferEngine engine(true);
-        engine.setAutoInstallTransport(false);
-        ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+TEST_F(TransportTest, DisabledInstallationPreservesCustomTopologyMatrix) {
+    char path[] = "/tmp/mooncake-te-topology-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_GE(fd, 0);
+    const std::string json =
+        R"({"cpu:0":[["store_test_hca_a"],["store_test_hca_b"]]})";
+    ASSERT_EQ(write(fd, json.data(), json.size()),
+              static_cast<ssize_t>(json.size()));
+    close(fd);
+    ScopedEnvVar custom_topology("MC_CUSTOM_TOPO_JSON", path);
+    TransferEngine engine(true);
+    engine.setAutoInstallTransport(false);
+    const int rc = engine.init(P2PHANDSHAKE, "127.0.0.1:0");
+    unlink(path);
+    ASSERT_EQ(rc, 0);
+    Topology expected;
+    ASSERT_EQ(expected.parse(json), 0);
+    EXPECT_EQ(engine.getLocalTopology()->toString(), expected.toString());
+    EXPECT_EQ(engine.getTransport("rdma"), nullptr);
+    EXPECT_EQ(engine.getTransport("tcp"), nullptr);
+}
 
-        EXPECT_EQ(engine.getTransport("tcp"), nullptr);
-        EXPECT_EQ(engine.getTransport("shm"), nullptr);
-        EXPECT_NE(engine.installTransport("tcp", nullptr), nullptr);
-    }
+TEST_F(TransportTest, ForceTcpOverridesDisabledAutomaticInstallation) {
+    ScopedEnvVar force("MC_FORCE_TCP", "1");
+    TransferEngine engine(true);
+    engine.setAutoInstallTransport(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    EXPECT_NE(engine.getTransport("tcp"), nullptr);
+    EXPECT_EQ(engine.getTransport("shm"), nullptr);
+}
+
+TEST_F(TransportTest, ForceShmSurvivesDisabledAutomaticInstallation) {
+    ScopedEnvVar force("MC_FORCE_SHM", "1");
+    TransferEngine engine(true);
+    engine.setAutoInstallTransport(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    EXPECT_NE(engine.getTransport("shm"), nullptr);
+    EXPECT_EQ(engine.getTransport("tcp"), nullptr);
 }
 
 TEST_F(TransportTest, ReenableAutomaticInstallationBeforeInitialization) {

@@ -304,6 +304,8 @@ add_store_test(real_client_regular_page_register_test real_client_regular_page_r
 add_store_test(real_client_uninitialized_test real_client_uninitialized_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
+add_store_test(client_transport_init_test client_transport_init_test.cpp)
+
 add_store_test(standalone_client_test standalone_client_test.cpp)
 add_store_test(embedded_master_test embedded_master_test.cpp)
 if(USE_TENT)

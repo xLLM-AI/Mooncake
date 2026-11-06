@@ -278,6 +278,37 @@ In addition to CUDA, Mooncake also supports other accelerator backends, along wi
 - [Deployment Guide](https://kvcache-ai.github.io/Mooncake/deployment/mooncake-store-deployment-guide.html)
 
 
+### xLLM fork build and mirror configuration
+
+This fork defaults `MOONCAKE_BUILD_STATIC=ON` for `mooncake_common`,
+`transfer_engine`, and `mooncake_store`, independently of device backends that
+force `BUILD_SHARED_LIBS=ON`. To build the public C++ shared libraries, configure
+with `-DMOONCAKE_BUILD_STATIC=OFF -DBUILD_SHARED_LIBS=ON`. Installation follows
+the actual target type; static archives have no RPATH. `WITH_STORE_C_SHARED`
+continues to require a static Store core and builds a separate C-ABI shared
+library for `dlopen` consumers.
+
+The dependency installer keeps canonical GitHub URLs by default. Restricted
+networks can select mirrors without editing tracked submodule configuration:
+
+```bash
+sudo env PYBIND11_REPO_URL=https://gitcode.com/GitHub_Trending/py/pybind11.git \
+  MSGPACK_CXX_REPO_URL=https://gitcode.com/gh_mirrors/ms/msgpack-c.git \
+  bash dependencies.sh
+```
+
+`MSGPACK_CXX_REPO_URL` overrides the repository URL; otherwise the MessagePack
+fallback uses `${GITHUB_PROXY}/msgpack/msgpack-c.git`. Required RPM packages
+fail fast, Boost supports both manylinux and distribution package names, and
+only MessagePack/CLI11 package absence is tolerated before the header fallback.
+
+Store clients install the requested transport, but explicit `MC_FORCE_TCP`
+and SHM-only overrides retain priority. In multi-protocol builds, SHM remains
+an optional companion. Automatic Store discovery respects `MC_MS_FILTERS`
+and `MC_CUSTOM_TOPO_JSON` and ignores explicit device names; with
+`MC_MS_AUTO_DISC=0`, RDMA/EFA requires nonempty device names unless a
+force-only override is active.
+
 ### Skills for AI Assistants
 
 Mooncake ships a set of **built-in skills** under [`.claude/skills`](.claude/skills) — reusable, task-focused playbooks that an AI coding assistant (such as Claude Code) invokes automatically when your request matches, or that you can run as a slash command.

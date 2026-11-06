@@ -948,8 +948,16 @@ ErrorCode Client::InitTransferEngine(
     // be live while the ascend transport is installed below; reset it on every
     // exit path. Assumes TE inits are serialized within the process.
     struct StoreTeInitGuard {
-        ~StoreTeInitGuard() { globalConfig().ascend_store_te_init = false; }
-    } store_te_init_guard;
+        TransferEngine& engine;
+        bool auto_install;
+        bool ascend_store_te_init;
+        ~StoreTeInitGuard() {
+            engine.setAutoInstallTransport(auto_install);
+            globalConfig().ascend_store_te_init = ascend_store_te_init;
+        }
+    } store_te_init_guard{*transfer_engine_,
+                          transfer_engine_->autoInstallTransportEnabled(),
+                          globalConfig().ascend_store_te_init};
     if (protocol == "ascend") {
         globalConfig().ascend_store_te_init = true;
     }
@@ -961,13 +969,12 @@ ErrorCode Client::InitTransferEngine(
     bool use_tent = transfer_engine_->isUsingTent();
 
     bool auto_discover = false;
-    std::vector<std::string> discovery_filters;
     if (!use_tent) {
         auto config = ClientAutoDiscoveryConfig::FromEnvironment(
             protocol, device_names.has_value());
         auto_discover = config.enabled;
         transfer_engine_->setAutoDiscover(
-            {.enabled = false, .protocol = protocol});
+            {.enabled = auto_discover, .protocol = protocol});
         transfer_engine_->setAutoInstallTransport(false);
 
         // Honor filters when auto-discovery is enabled; otherwise warn once
@@ -979,7 +986,7 @@ ErrorCode Client::InitTransferEngine(
 
         config.LoadFiltersFromEnvironment();
         if (auto_discover) {
-            discovery_filters = std::move(config.filters);
+            transfer_engine_->setWhitelistFilters(std::move(config.filters));
         }
     }
 
@@ -1021,29 +1028,33 @@ ErrorCode Client::InitTransferEngine(
         return ErrorCode::OK;
     }
 
+    // init() has already honored force flags. Do not install the originally
+    // requested hardware transport after a forced TCP/SHM-only initialization.
+    if (std::getenv("MC_FORCE_TCP")) return ErrorCode::OK;
+#ifndef ENABLE_MULTI_PROTOCOL
+    if (envFlagEnabled("MC_FORCE_SHM")) return ErrorCode::OK;
+#endif
+
     {
         LOG(INFO) << "Installing requested Store transport: " << protocol;
 
         Transport* transport = nullptr;
 
         if (protocol == "rdma" || protocol == "efa") {
-            auto topology = transfer_engine_->getLocalTopology();
-            if (topology) {
-                if (device_names.has_value() && !device_names->empty()) {
-                    LOG(INFO) << "Using specified RDMA devices: "
-                              << device_names.value();
-                    topology->discover(ParseDeviceNames(device_names.value()));
-                } else {
-                    bool exclude_efa = true;
-#ifdef USE_EFA
-                    exclude_efa = protocol != "efa";
-#endif
-                    LOG(INFO) << "Auto-discovering " << protocol << " devices";
-                    topology->discover(discovery_filters, exclude_efa);
+            if (!auto_discover) {
+                if (!device_names.has_value() || device_names->empty()) {
+                    LOG(ERROR) << "RDMA/EFA requires device names when auto "
+                                  "discovery is disabled";
+                    return ErrorCode::INVALID_PARAMS;
                 }
-                LOG(INFO) << "Topology discovery complete. Found "
-                          << topology->getHcaList().size() << " HCAs";
+                auto topology = transfer_engine_->getLocalTopology();
+                if (topology) {
+                    topology->discover(ParseDeviceNames(device_names.value()));
+                }
             }
+            // With auto-discovery enabled, init() has prepared topology using
+            // MC_MS_FILTERS and MC_CUSTOM_TOPO_JSON. Explicit device_names must
+            // not override that configuration.
 
             transport = transfer_engine_->installTransport(protocol, nullptr);
             if (!transport) {
