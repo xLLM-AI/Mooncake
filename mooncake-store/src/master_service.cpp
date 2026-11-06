@@ -1704,15 +1704,21 @@ auto MasterService::RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
                 return tl::make_unexpected(
                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
             auto current = metadata.rebuild_version;
-            metadata.VisitReplicas(
-                &Replica::fn_is_memory_replica, [&](const Replica& replica) {
-                    const auto desc = replica.get_descriptor();
-                    current = std::max(
-                        current,
-                        RebuildVersion{desc.get_memory_descriptor()
-                                           .buffer_descriptor.allocationEpoch(),
-                                       desc.id});
-                });
+            // Replica IDs can change without a new write (same-version merge).
+            // Derive a token only for metadata without an explicit write token.
+            if (current == RebuildVersion{}) {
+                metadata.VisitReplicas(
+                    &Replica::fn_is_memory_replica,
+                    [&](const Replica& replica) {
+                        const auto desc = replica.get_descriptor();
+                        current = std::max(
+                            current,
+                            RebuildVersion{
+                                desc.get_memory_descriptor()
+                                    .buffer_descriptor.allocationEpoch(),
+                                desc.id});
+                    });
+            }
             if (incoming < current) continue;
             replace = incoming > current;
             // Moving a managed member out of its group is not a second import
@@ -1882,15 +1888,17 @@ MasterService::GetCommittedRebuildEntry(const std::string& key,
         entry.with_soft_pin = metadata.soft_pin_timeout.has_value();
     }
     entry.version = metadata.rebuild_version;
+    const bool derive_version = entry.version == RebuildVersion{};
     metadata.VisitReplicas(
         &Replica::fn_is_memory_replica, [&](const Replica& replica) {
             if (replica.status() != ReplicaStatus::COMPLETE) return;
             auto descriptor = replica.get_descriptor();
             const auto& buffer =
                 descriptor.get_memory_descriptor().buffer_descriptor;
-            entry.version = std::max(
-                entry.version,
-                RebuildVersion{buffer.allocationEpoch(), descriptor.id});
+            if (derive_version)
+                entry.version = std::max(
+                    entry.version,
+                    RebuildVersion{buffer.allocationEpoch(), descriptor.id});
             entry.replicas.emplace_back(std::move(descriptor));
         });
     return entry;

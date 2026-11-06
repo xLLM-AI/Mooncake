@@ -466,6 +466,10 @@ TEST_F(MasterServiceTenantQuotaTest, ClientRebuildRestoresQuotaIdempotently) {
     for (int replay = 0; replay < 2; ++replay) {
         ASSERT_TRUE(recovered.RebuildMetadata({merged}, client_id));
         EXPECT_EQ(Snapshot(recovered, TenantId("tenant-a")).charged_bytes, 512);
+        const auto committed =
+            recovered.GetCommittedRebuildEntry("full", "tenant-a");
+        ASSERT_TRUE(committed);
+        EXPECT_EQ(committed->version, entry.version);
     }
     auto replacement = entry;
     replacement.size = 128;
