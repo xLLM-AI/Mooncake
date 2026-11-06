@@ -166,6 +166,7 @@ struct TestValues {
         : allocator(allocator) {
         for (const auto& value : values) {
             void* data = allocator.allocate(value.size());
+            if (!data) throw std::bad_alloc();
             std::memcpy(data, value.data(), value.size());
             slices.push_back({{data, value.size()}});
         }
@@ -208,6 +209,7 @@ tl::expected<void, ErrorCode> PutString(std::shared_ptr<Client>& client,
 bool GetAndVerify(std::shared_ptr<Client>& client, SimpleAllocator& allocator,
                   const std::string& key, const std::string& expected) {
     void* buf = allocator.allocate(expected.size());
+    if (!buf) return false;
     std::vector<Slice> slices{Slice{buf, expected.size()}};
     auto res = client->Get(key, slices);
     bool ok = res.has_value() && slices[0].size == expected.size() &&
@@ -283,7 +285,8 @@ class RebuildClientFixture : public ::testing::Test {
         return ::testing::AssertionSuccess();
     }
     static constexpr size_t kSeg = 128 * 1024 * 1024;
-    static constexpr size_t kAlloc = 64 * 1024 * 1024;
+    // Each of the five payload-size classes needs a separate 16 MiB slab.
+    static constexpr size_t kAlloc = 128 * 1024 * 1024;
     InProcMaster master_;
     std::string master_address_;
 };
@@ -394,11 +397,15 @@ TEST_P(ClientReadRecoveryTest, ByteExactReadsAndRegistrationsSurviveRestart) {
         ASSERT_TRUE(PutString(writer, allocator, keys[i], values[i]));
         ASSERT_TRUE(GetAndVerify(writer, allocator, keys[i], values[i]));
     }
-    if (GetParam() == ReadScenario::LAZY_DELETE)
-        for (size_t i = 0; i < keys.size(); i += 2)
+    if (GetParam() == ReadScenario::LAZY_DELETE) {
+        for (size_t i = 0; i < keys.size(); i += 2) {
             ASSERT_TRUE(writer->Remove(keys[i], true));
+        }
+    }
     ASSERT_EQ(ClientTestAccess::Snapshot(*clientB_).size(), keys.size());
-    if (remote) EXPECT_TRUE(ClientTestAccess::Snapshot(*writer).empty());
+    if (remote) {
+        EXPECT_TRUE(ClientTestAccess::Snapshot(*writer).empty());
+    }
     const auto registrations = ClientTestAccess::RegisteredBuffers(*writer);
     const auto owner_registrations =
         ClientTestAccess::RegisteredBuffers(*clientB_);
@@ -408,9 +415,11 @@ TEST_P(ClientReadRecoveryTest, ByteExactReadsAndRegistrationsSurviveRestart) {
     EXPECT_EQ(ClientTestAccess::RegisteredBuffers(*writer), registrations);
     EXPECT_EQ(ClientTestAccess::RegisteredBuffers(*clientB_),
               owner_registrations);
-    if (remote)
-        for (size_t i = 0; i < keys.size(); ++i)
+    if (remote) {
+        for (size_t i = 0; i < keys.size(); ++i) {
             EXPECT_TRUE(GetAndVerify(clientB_, *allocB_, keys[i], values[i]));
+        }
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(OwnerAndLazyDelete, ClientReadRecoveryTest,
