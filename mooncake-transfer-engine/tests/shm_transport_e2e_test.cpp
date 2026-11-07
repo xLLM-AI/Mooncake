@@ -94,6 +94,7 @@ bool WaitCompleted(TransferEngine& engine, BatchID batch_id) {
 std::unique_ptr<TransferEngine> MakeEngine(const std::string& server_name,
                                            bool install_shm = true) {
     auto engine = std::make_unique<TransferEngine>(false);
+    engine->setAutoInstallTransport(false);
     auto host_port = parseHostNameWithPort(server_name);
     int rc = engine->init(P2PHANDSHAKE, server_name, host_port.first.c_str(),
                           host_port.second);
