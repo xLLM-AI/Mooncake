@@ -1199,8 +1199,15 @@ TEST_F(MasterServiceTest, DfsOnlyLifecyclePathsReleaseTheExtent) {
     // An abandoned write is reaped after the release timeout.
     ASSERT_TRUE(service.PutStart(writer, "c", TenantId::Default(), kSize,
                                  DfsOnlyConfig()));
-    std::this_thread::sleep_for(std::chrono::seconds(4));
+    // Maintenance and deferred-release rounds are asynchronous.
     auto reaped = service.GetReplicaList("c", TenantId::Default());
+    for (int attempt = 0;
+         attempt < 100 &&
+         (reaped || reaped.error() != ErrorCode::OBJECT_NOT_FOUND);
+         ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        reaped = service.GetReplicaList("c", TenantId::Default());
+    }
     ASSERT_FALSE(reaped.has_value());
     EXPECT_EQ(reaped.error(), ErrorCode::OBJECT_NOT_FOUND);
     auto reuse = service.PutStart(other, "d", TenantId::Default(), kSize,

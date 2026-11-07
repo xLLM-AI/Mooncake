@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "allocator.h"
@@ -101,9 +102,14 @@ struct ClientTestAccess {
         client.owned_replay_cv_.notify_all();
     }
     static auto RegisteredBuffers(Client& client) {
-        return client.transfer_engine_->getMetadata()
-            ->getSegmentDescByID(LOCAL_SEGMENT_ID)
-            ->buffers;
+        std::vector<SegmentBufferInfo> buffers;
+        CHECK_EQ(client.transfer_engine_->getSegmentBuffers(LOCAL_SEGMENT_ID,
+                                                            buffers),
+                 0);
+        std::vector<std::tuple<uint64_t, uint64_t, std::string>> ranges;
+        for (const auto& buffer : buffers)
+            ranges.emplace_back(buffer.addr, buffer.length, buffer.location);
+        return ranges;
     }
     static auto Move(Client& client, const std::string& key,
                      const std::string& source, const std::string& target) {

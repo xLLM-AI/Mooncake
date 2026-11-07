@@ -413,6 +413,9 @@ bool ScopedSegmentAccess::ReplaceAllocators(
         if (replacement.expected != replacement.replacement) {
             replacement.replacement->SetLocality(
                 mounted->second.segment.locality);
+            if (auto offset = std::dynamic_pointer_cast<OffsetBufferAllocator>(
+                    replacement.replacement))
+                offset->setAllocationEpoch(segment_manager_->allocation_epoch_);
         }
     }
     if (!segment_manager_->allocator_manager_.replaceAllocators(

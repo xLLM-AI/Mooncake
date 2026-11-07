@@ -9,6 +9,7 @@
 #include "master_service.h"
 #include "ha/snapshot/batch_oplog/codec.h"
 #include "rebuild_retry.h"
+#include "rebuild_replica_table.h"
 
 namespace mooncake {
 namespace {
@@ -46,6 +47,68 @@ KeyReplicaEntry MakeEntry(const Segment& segment, const std::string& key,
     replica.descriptor_variant = memory;
     entry.replicas = {replica};
     return entry;
+}
+
+TEST(MasterRebuildReplayTest, SnapshotRemountPreservesNewAllocationEpoch) {
+    std::vector<char> bytes(4096, 'O');
+    const auto segment =
+        MakeSegment("snapshot-owner", reinterpret_cast<uintptr_t>(bytes.data()),
+                    bytes.size());
+    const auto owner = generate_uuid();
+    const auto old =
+        MakeEntry(segment, "old-key", 128, segment.base, 99, {42, 99});
+    RebuildReplicaTable table;
+    ASSERT_TRUE(table.Record(old, old.replicas.front()));
+    StandbyObjectEntry object;
+    object.key = old.key;
+    object.metadata.client_id = owner;
+    object.metadata.size = old.size;
+    object.metadata.replicas = old.replicas;
+    object.metadata.rebuild_version = old.version;
+    auto decoded = DecodeBatchOpLogSnapshotObjectChunk(
+        EncodeBatchOpLogSnapshotObjectChunk(0, {object}), 0, 1);
+    ASSERT_TRUE(decoded);
+    StandbySegmentInfo saved;
+    saved.segment_name = segment.name;
+    saved.transport_endpoint = segment.te_endpoint;
+    saved.capacity = segment.size;
+    saved.is_memory_segment = true;
+    MasterService restored(ReplayConfig(43));
+    ASSERT_TRUE(
+        restored.RestoreFromStandbySnapshot(decoded->objects, 0, {saved}));
+    ASSERT_TRUE(restored.ReMountSegment({segment}, owner));
+    auto prior = restored.GetCommittedRebuildEntry(old.key, "default");
+    ASSERT_TRUE(prior);
+    EXPECT_EQ(prior->version, old.version);
+    ASSERT_TRUE(restored.Remove(old.key, TenantId::Default(), true));
+    auto allocated = restored.PutStart(owner, "new-key", TenantId::Default(),
+                                       old.size, ReplicateConfig{});
+    ASSERT_TRUE(allocated);
+    const auto& buffer =
+        allocated->front().get_memory_descriptor().buffer_descriptor;
+    EXPECT_EQ(buffer.buffer_address_, segment.base);
+    EXPECT_EQ(buffer.allocationEpoch(), 43);
+    std::fill(bytes.begin(), bytes.begin() + old.size, 'N');
+    ASSERT_TRUE(restored.PutEnd(owner, "new-key", TenantId::Default(),
+                                ReplicaType::MEMORY));
+    auto latest = restored.GetCommittedRebuildEntry("new-key", "default");
+    ASSERT_TRUE(latest);
+    ASSERT_TRUE(table.Record(*latest, latest->replicas.front()));
+    const auto snapshot = table.Snapshot();
+    ASSERT_EQ(snapshot.size(), 1);
+    EXPECT_EQ(snapshot.front().key, "new-key");
+    MasterService restarted(ReplayConfig(44));
+    ASSERT_TRUE(restarted.ReMountSegment({segment}, owner));
+    ASSERT_TRUE(restarted.RebuildMetadata(snapshot, owner));
+    EXPECT_FALSE(restarted.GetReplicaList(old.key, TenantId::Default()));
+    auto result = restarted.GetReplicaList("new-key", TenantId::Default());
+    ASSERT_TRUE(result);
+    const auto address = result->replicas.front()
+                             .get_memory_descriptor()
+                             .buffer_descriptor.buffer_address_;
+    EXPECT_EQ(std::memcmp(reinterpret_cast<const void*>(address),
+                          std::string(old.size, 'N').data(), old.size),
+              0);
 }
 
 TEST(MasterRebuildReplayTest, NewerWriteSupersedesOtherOwnersStaleSnapshot) {

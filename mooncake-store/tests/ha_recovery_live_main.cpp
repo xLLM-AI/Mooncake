@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
@@ -31,9 +32,14 @@ DEFINE_int32(
 namespace mooncake {
 struct ClientTestAccess {
     static auto RegisteredBuffers(Client& client) {
-        return client.transfer_engine_->getMetadata()
-            ->getSegmentDescByID(LOCAL_SEGMENT_ID)
-            ->buffers;
+        std::vector<SegmentBufferInfo> buffers;
+        CHECK_EQ(client.transfer_engine_->getSegmentBuffers(LOCAL_SEGMENT_ID,
+                                                            buffers),
+                 0);
+        std::vector<std::tuple<uint64_t, uint64_t, std::string>> ranges;
+        for (const auto& buffer : buffers)
+            ranges.emplace_back(buffer.addr, buffer.length, buffer.location);
+        return ranges;
     }
 };
 }  // namespace mooncake
