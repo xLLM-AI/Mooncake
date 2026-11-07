@@ -1162,9 +1162,9 @@ class Client {
     bool WaitForPendingNotifies(const std::vector<NotifyTicket>& tickets);
     tl::expected<void, ErrorCode> WaitForOwnedReplays(
         ViewVersionId view_version);
+    bool IsActiveOwnedReplica(const Replica::Descriptor& replica) const;
     tl::expected<void, ErrorCode> ReplayRebuildEntries(
-        const std::vector<KeyReplicaEntry>& entries,
-        ViewVersionId view_version);
+        std::vector<KeyReplicaEntry> entries, ViewVersionId view_version);
     bool SendUpsertNotify(const std::string& ep,
                           const std::vector<KeyReplicaEntry>& entries,
                           uint64_t request_id);

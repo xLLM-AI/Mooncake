@@ -535,6 +535,10 @@ TEST_F(ClientCrossNotifyTest, LargeSnapshotDoesNotHoldTableLockAcrossRpc) {
         entry.replicas.front().id += i;
         BufferDescriptor(entry.replicas.front()).buffer_address_ =
             original.buffer_address_ + i * original.allocationExtent();
+        std::memcpy(
+            reinterpret_cast<void*>(
+                BufferDescriptor(entry.replicas.front()).buffer_address_),
+            "value", entry.size);
         ClientTestAccess::Record(*clientB_, entry);
     }
     ASSERT_EQ(ClientTestAccess::Snapshot(*clientB_).size(), 8193);
@@ -836,6 +840,34 @@ TEST_F(ClientTenantNotifyTest, SameKeyFromTwoTenantsSurvivesOnSharedOwner) {
         ASSERT_TRUE(WaitForAllKeysRebuilt(writers[index], *allocA_,
                                           {"shared-key"}, {values[index]}));
     }
+}
+
+TEST_F(ClientCrossNotifyTest, AckLossAfterReuseCannotRestoreChangedBytes) {
+    const std::string old_value(4096, 'A'), new_value(4096, 'B');
+    ASSERT_TRUE(PutString(clientA_, *allocA_, "lost-ack-old", old_value));
+    ASSERT_TRUE(PutString(clientA_, *allocA_, "retained", old_value));
+    auto old = clientA_->Query("lost-ack-old");
+    ASSERT_TRUE(old);
+    const auto address =
+        BufferDescriptor(old->replicas.front()).buffer_address_;
+    ASSERT_TRUE(clientA_->Remove("lost-ack-old", true));
+    ClientTestAccess::Pause(*clientB_, true);
+    ClientTestAccess::Timeout(*clientA_, std::chrono::milliseconds(200));
+    auto unconfirmed = PutString(clientA_, *allocA_, "lost-ack-new", new_value);
+    ASSERT_FALSE(unconfirmed);
+    EXPECT_EQ(unconfirmed.error(), ErrorCode::RPC_TIMEOUT);
+    auto committed = clientA_->Query("lost-ack-new");
+    ASSERT_TRUE(committed);
+    ASSERT_EQ(BufferDescriptor(committed->replicas.front()).buffer_address_,
+              address);
+    RestartMasterEmpty();
+    ASSERT_TRUE(
+        WaitForAllKeysRebuilt(clientA_, *allocA_, {"retained"}, {old_value}));
+    EXPECT_FALSE(clientA_->Query("lost-ack-old"));
+    ClientTestAccess::Pause(*clientB_, false);
+    ASSERT_TRUE(WaitUntil(
+        [&] { return ClientTestAccess::PendingBuckets(*clientA_) == 0; }));
+    EXPECT_TRUE(GetAndVerify(clientA_, *allocA_, "lost-ack-new", new_value));
 }
 
 TEST_F(ClientCrossNotifyTest, ReorderedRetryCannotResurrectReusedAddress) {

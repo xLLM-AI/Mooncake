@@ -1593,7 +1593,7 @@ tl::expected<uint64_t, ErrorCode> Client::ComputeObjectChecksumForSlices(
 tl::expected<void, ErrorCode> Client::VerifyObjectChecksum(
     const std::string& object_key, const std::vector<Slice>& slices,
     size_t object_size, std::optional<uint64_t> expected_checksum) {
-    if (!object_checksum_enabled_) {
+    if (!object_checksum_enabled_ && !enable_ha_rebuild_) {
         return {};
     }
     if (!expected_checksum.has_value()) {
@@ -2112,7 +2112,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
     std::optional<uint64_t> object_checksum;
-    if (object_checksum_enabled_) {
+    if (object_checksum_enabled_ || enable_ha_rebuild_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
             key, slices, CalculateSliceSize(slices));
         if (!checksum_result) {
@@ -2505,6 +2505,21 @@ bool Client::ObserveRebuildEpoch(const PingResponse& response,
     return true;
 }
 
+bool Client::IsActiveOwnedReplica(const Replica::Descriptor& replica) const {
+    const auto& buffer = replica.get_memory_descriptor().buffer_descriptor;
+    return std::any_of(
+        mounted_segments_.begin(), mounted_segments_.end(),
+        [&](const auto& mounted) {
+            const auto& segment = mounted.second;
+            return segment.te_endpoint == buffer.transport_endpoint_ &&
+                   (!buffer.segment_id_ || *buffer.segment_id_ == segment.id) &&
+                   buffer.buffer_address_ >= segment.base &&
+                   buffer.buffer_address_ - segment.base < segment.size &&
+                   buffer.allocationExtent() <=
+                       segment.size - (buffer.buffer_address_ - segment.base);
+        });
+}
+
 tl::expected<void, ErrorCode> Client::ApplyOwnedRebuildEntries(
     const std::vector<KeyReplicaEntry>& entries) {
     std::vector<KeyReplicaEntry> replay;
@@ -2527,21 +2542,7 @@ tl::expected<void, ErrorCode> Client::ApplyOwnedRebuildEntries(
                 if (buffer.size_ != entry.size ||
                     buffer.allocationExtent() < entry.size)
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                const bool owned = std::any_of(
-                    mounted_segments_.begin(), mounted_segments_.end(),
-                    [&](const auto& mounted) {
-                        const auto& segment = mounted.second;
-                        return segment.te_endpoint ==
-                                   buffer.transport_endpoint_ &&
-                               (!buffer.segment_id_ ||
-                                *buffer.segment_id_ == segment.id) &&
-                               buffer.buffer_address_ >= segment.base &&
-                               buffer.buffer_address_ - segment.base <
-                                   segment.size &&
-                               buffer.allocationExtent() <=
-                                   segment.size -
-                                       (buffer.buffer_address_ - segment.base);
-                    });
+                const bool owned = IsActiveOwnedReplica(replica);
                 if (!owned)
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
@@ -2571,7 +2572,7 @@ tl::expected<void, ErrorCode> Client::ApplyOwnedRebuildEntries(
         }
     }
     if (!replay_id) return {};
-    auto result = master_client_.RebuildMetadata(replay, view);
+    auto result = ReplayRebuildEntries(std::move(replay), view);
     {
         std::lock_guard lock(local_replica_table_mutex_);
         auto pending = owned_replay_pending_.find(replay_id);
@@ -2647,7 +2648,50 @@ void Client::RebuildNotifyLoop() {
 // On reconnect, snapshot the local table and resend it (batched) to the empty
 // new master via the RebuildMetadata RPC.
 tl::expected<void, ErrorCode> Client::ReplayRebuildEntries(
-    const std::vector<KeyReplicaEntry>& entries, ViewVersionId view_version) {
+    std::vector<KeyReplicaEntry> entries, ViewVersionId view_version) {
+    // ACK loss can leave an old ownership record after its bytes were reused.
+    // Validate while mounted; never hold a memory/table lock across the RPC.
+    for (auto& entry : entries) {
+        std::optional<ErrorCode> error;
+        std::erase_if(
+            entry.replicas, [&](const auto& replica) {
+                if (error || !replica.is_memory_replica()) return false;
+                const auto& buffer =
+                    replica.get_memory_descriptor().buffer_descriptor;
+                if (!entry.size || buffer.size_ != entry.size ||
+                    buffer.allocationExtent() < entry.size)
+                    return false;
+                std::lock_guard segments_lock(mounted_segments_mutex_);
+                auto checked =
+                    IsActiveOwnedReplica(replica)
+                        ? VerifyObjectChecksum(
+                              entry.key,
+                              {{reinterpret_cast<void*>(buffer.buffer_address_),
+                                entry.size}},
+                              entry.size,
+                              entry.object_checksum.value_or(std::nullopt))
+                        : tl::expected<void, ErrorCode>(tl::make_unexpected(
+                              ErrorCode::CHECKSUM_MISMATCH));
+                if (checked) return false;
+                if (checked.error() != ErrorCode::CHECKSUM_MISMATCH) {
+                    error = checked.error();
+                    return false;
+                }
+                auto rejected = entry;
+                rejected.replicas = {replica};
+                std::lock_guard table_lock(local_replica_table_mutex_);
+                local_replica_table_.ForgetSnapshotEntry(rejected);
+                if (metrics_) metrics_->rebuild_failed_batches.inc();
+                LOG(WARNING)
+                    << "[HA-REBUILD] discarding changed/retired replica key="
+                    << entry.key;
+                return true;
+            });
+        if (error) return tl::make_unexpected(*error);
+    }
+    std::erase_if(entries,
+                  [](const auto& entry) { return entry.replicas.empty(); });
+    if (entries.empty()) return {};
     auto result = master_client_.RebuildMetadata(entries, view_version);
     if (result || result.error() != ErrorCode::INVALID_PARAMS) return result;
     // Keep the wire API unchanged. Isolate a poison row only on permanent
@@ -2689,7 +2733,7 @@ tl::expected<void, ErrorCode> Client::ResendLocalReplicaTable(
         std::vector<KeyReplicaEntry> batch(
             snapshot.begin() + i,
             snapshot.begin() + std::min(i + kBatchSize, snapshot.size()));
-        auto result = ReplayRebuildEntries(batch, view_version);
+        auto result = ReplayRebuildEntries(std::move(batch), view_version);
         if (!result) {
             if (metrics_) metrics_->rebuild_failed_batches.inc();
             LOG(ERROR) << "RebuildMetadata resend failed: "
@@ -2799,7 +2843,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
     std::optional<uint64_t> object_checksum;
-    if (object_checksum_enabled_) {
+    if (object_checksum_enabled_ || enable_ha_rebuild_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
             key, slices, CalculateSliceSize(slices));
         if (!checksum_result) {
@@ -3081,7 +3125,7 @@ std::vector<PutOperation> Client::CreatePutOperations(
 }
 
 void Client::ComputeBatchObjectChecksums(std::vector<PutOperation>& ops) {
-    if (!object_checksum_enabled_) {
+    if (!object_checksum_enabled_ && !enable_ha_rebuild_) {
         return;
     }
     for (auto& op : ops) {

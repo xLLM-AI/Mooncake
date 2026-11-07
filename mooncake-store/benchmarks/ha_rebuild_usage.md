@@ -8,6 +8,14 @@ export MC_ENABLE_HA_REBUILD=1
 mooncake_master --enable_ha=true --enable_ha_rebuild_gate=true <other-options>
 ```
 
+HA store writes/reads also use checksums, regardless of `MOONCAKE_STORE_CHECKSUM`,
+to reject changed bytes after an unconfirmed write reuses a recorded address.
+Replay verifies active local replicas and discards known checksum mismatches;
+device/read failures remain retryable. This is not data persistence: overwritten
+bytes cannot be recovered. Reads retain the checksum guard for in-flight writes.
+Local hot cache keeps its existing commit/recovery invalidation; HA does not
+disable it when the standalone checksum option is off.
+
 Restart every owner when changing the client flag. Disabled owners can delay a
 closed gate until its degraded timeout. `ServiceReady()`/discovery remain available;
 `/health` reports data readiness, including `service_ready=true` when degraded.
