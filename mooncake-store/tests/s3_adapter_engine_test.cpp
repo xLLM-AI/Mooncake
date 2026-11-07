@@ -11,6 +11,7 @@
 // The slow tests (the 120 s request timeout, the 10 s connect timeout) are
 // skipped unless MOONCAKE_RUN_S3_FAULT_TIMEOUT_TESTS=1.
 
+#include <curl/curl.h>
 #include <gtest/gtest.h>
 
 #include <arpa/inet.h>
@@ -28,6 +29,7 @@
 #include <future>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -1182,9 +1184,10 @@ TEST(S3ObjectStorageAdapterEngineTest, BatchQueueDoesNotConsumeRequestTimeout) {
     EXPECT_EQ(CountRequestsFor(server.requests(), "healthy"), 1U);
 }
 
-// S3-specific (no OSS counterpart): the connect timeout is 10 s per attempt
-// and a connect timeout is retried. The listener's accept queue is filled so
-// the kernel drops further SYNs and the adapter's connect never completes.
+// Connect is capped at 10 s per attempt, but the kernel may abort earlier.
+// A full accept queue drops SYNs: measure a single connect on this host, then
+// require the adapter to retry rather than mistake it for a sent-request
+// timeout.
 TEST(S3ObjectStorageAdapterEngineTest, ConnectTimeoutIsTenSecondsPerAttempt) {
     if (!SlowTimeoutTestsEnabled()) {
         GTEST_SKIP() << "Set MOONCAKE_RUN_S3_FAULT_TIMEOUT_TESTS=1 for the "
@@ -1215,17 +1218,29 @@ TEST(S3ObjectStorageAdapterEngineTest, ConnectTimeoutIsTenSecondsPerAttempt) {
         connect(filler, reinterpret_cast<sockaddr*>(&address), size);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    // Precondition: a fresh connect must hang rather than complete.
-    const int probe = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    ASSERT_GE(probe, 0);
-    descriptors.fds.push_back(probe);
-    connect(probe, reinterpret_cast<sockaddr*>(&address), size);
-    pollfd writable{probe, POLLOUT, 0};
-    ASSERT_EQ(poll(&writable, 1, 1500), 0)
-        << "the kernel completed a connect to a full accept queue";
-
     ScopedEnvironment environment;
     ConfigureFaultEndpoint(environment, ntohs(address.sin_port));
+    std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> probe(
+        curl_easy_init(), curl_easy_cleanup);
+    ASSERT_NE(probe, nullptr);
+    const std::string url =
+        "http://127.0.0.1:" + std::to_string(ntohs(address.sin_port)) + "/";
+    curl_easy_setopt(probe.get(), CURLOPT_URL, url.c_str());
+    curl_easy_setopt(probe.get(), CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(probe.get(), CURLOPT_CONNECTTIMEOUT_MS, 10000L);
+    curl_easy_setopt(probe.get(), CURLOPT_TIMEOUT_MS, 120000L);
+    const auto probe_started = std::chrono::steady_clock::now();
+    ASSERT_EQ(curl_easy_perform(probe.get()), CURLE_OPERATION_TIMEDOUT);
+    const auto single_connect =
+        std::chrono::steady_clock::now() - probe_started;
+    long request_size = 0;
+    ASSERT_EQ(
+        curl_easy_getinfo(probe.get(), CURLINFO_REQUEST_SIZE, &request_size),
+        CURLE_OK);
+    ASSERT_EQ(request_size, 0);
+    ASSERT_GE(Seconds(single_connect), 1.0);
+    ASSERT_LT(Seconds(single_connect), 11.0);
+
     S3ObjectStorageAdapter adapter("/connect-timeout/");
     ASSERT_TRUE(adapter.Init());
     std::array<char, 7> output;
@@ -1235,8 +1250,8 @@ TEST(S3ObjectStorageAdapterEngineTest, ConnectTimeoutIsTenSecondsPerAttempt) {
     const auto elapsed = std::chrono::steady_clock::now() - started;
     ASSERT_FALSE(failed);
     EXPECT_EQ(failed.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
-    // kAttempts connect timeouts of 10 s plus 0.3-0.45 s of backoff.
-    EXPECT_GE(Seconds(elapsed), 29.0);
+    // All three attempts must run, including early kernel connect timeouts.
+    EXPECT_GE(Seconds(elapsed), Seconds(single_connect) * 2.5);
     EXPECT_LT(Seconds(elapsed), 36.0);
     EXPECT_EQ(output.front(), '!');
     EXPECT_EQ(output.back(), '!');

@@ -33,6 +33,7 @@ std::unique_ptr<AllocatedBuffer> SegmentAllocatorRegistration::Allocate(
     if (!buffer) {
         return nullptr;
     }
+    buffer->segment_id_ = segment_id_;
     buffer->bindSegmentLifetime(buffer_lifetime_);
     buffer->bindClientLiveness(record);
     if (!allocation_lifetime_.isAvailable() ||
@@ -62,6 +63,7 @@ void SegmentAllocatorRegistration::BindClientLiveness(
 }
 
 void SegmentAllocatorRegistration::BindBuffer(AllocatedBuffer& buffer) const {
+    buffer.segment_id_ = segment_id_;
     buffer.bindSegmentLifetime(buffer_lifetime_);
     buffer.bindClientLiveness(std::atomic_load_explicit(
         &client_liveness_, std::memory_order_acquire));

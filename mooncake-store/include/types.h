@@ -403,6 +403,8 @@ enum class ErrorCode : int32_t {
         -1007,  ///< Promotion catch-up could not prove all durable OpLog
                 ///< entries were applied, or unresolved skipped/missing
                 ///< gaps remain after final catch-up + second gap resolution.
+    REBUILD_FENCE_EXHAUSTED =
+        -1008,  ///< Ownership history budget exhausted, not segment space.
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =

@@ -1,4 +1,5 @@
 #include "device/runtime_accelerator.h"
+#include "device/accelerator_registry.h"
 
 #include <cstring>
 
@@ -6,6 +7,12 @@
 
 namespace mooncake::device {
 namespace {
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+TEST(RuntimeAcceleratorTest, StaticConsumerIncludesAscendDevice) {
+    EXPECT_NE(GetAcceleratorRegistry().GetDevice(AcceleratorVendor::kAscend),
+              nullptr);
+}
+#endif
 
 class FakeAcceleratorDevice final : public AcceleratorDevice {
    public:

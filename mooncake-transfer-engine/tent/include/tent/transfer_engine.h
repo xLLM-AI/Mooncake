@@ -294,6 +294,8 @@ class TransferEngine {
 
     Status getSegmentInfo(SegmentID handle, SegmentInfo& info);
 
+    Status synchronizeLocalMetadata();
+
    public:
     Status allocateLocalMemory(void** addr, size_t size,
                                Location location = kWildcardLocation);

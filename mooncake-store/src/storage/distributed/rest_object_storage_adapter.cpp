@@ -210,14 +210,12 @@ bool IsTransientFailure(CURLcode result, long status, bool overflow,
         return IsTransientStatus(status);
     }
     if (result == CURLE_OPERATION_TIMEDOUT) {
-#if LIBCURL_VERSION_NUM >= 0x073d00  // CURLINFO_PRETRANSFER_TIME_T: 7.61.0.
-        curl_off_t pretransfer = 0;
-        curl_easy_getinfo(curl, CURLINFO_PRETRANSFER_TIME_T, &pretransfer);
-#else
-        double pretransfer = 0;
-        curl_easy_getinfo(curl, CURLINFO_PRETRANSFER_TIME, &pretransfer);
-#endif
-        return pretransfer == 0;
+        // PRETRANSFER_TIME can be populated even when connect fails. Retry
+        // only if no request headers reached the peer, not after a sent PUT.
+        long request_size = 0;
+        return curl_easy_getinfo(curl, CURLINFO_REQUEST_SIZE, &request_size) ==
+                   CURLE_OK &&
+               request_size == 0;
     }
     return IsTransientCurlError(result);
 }
