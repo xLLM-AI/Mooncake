@@ -12,6 +12,7 @@
 #include <thread>
 
 #include <glog/logging.h>
+#include <gflags/gflags.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "config/rpc_protocol_config.h"
@@ -26,6 +27,34 @@
 #include "rpc_service.h"
 #include "rpc_worker_pool.h"
 #include "shutdown_request.h"
+
+#include "master_metric_manager.h"
+// Master switch for the HA rebuild gate. It defaults to disabled; enabling it
+// makes a promoted leader wait for client metadata rebuild before serving.
+// Non-HA and single-master deployments are unaffected. The timing flags below
+// are optional advanced settings that only apply when this switch is enabled.
+DEFINE_bool(enable_ha_rebuild_gate, false,
+            "HA: master feature switch; when true, close store service on "
+            "promotion and only open after client metadata rebuild completes "
+            "(two-phase). false (default); true enables the rebuild gate");
+
+// Handshake window after promotion, in milliseconds. While the window is
+// active, normal store traffic remains closed and recovery RPCs such as
+// ReMountSegment and RebuildMetadata remain available. A non-positive value
+// selects the built-in 7000 ms default. This is an advanced setting; size it to
+// cover worst-case failure detection, leader election, and client reconnection.
+DEFINE_int32(
+    rebuild_collect_window_ms, 0,
+    "HA: (advanced, only when enable_ha_rebuild_gate) phase-1 handshake "
+    "window ms to collect client ReMount before locking N; "
+    "<=0 => built-in default 7000 when gate enabled");
+
+// Maximum time to keep the store closed after promotion. On expiry, open in
+// degraded mode even if some clients never report completion, preventing a
+// failed client from blocking the entire cluster indefinitely.
+DEFINE_int32(rebuild_force_serve_timeout_ms, 120000,
+             "HA: hard upper bound; force store service open this long after "
+             "promotion even if not all clients signaled rebuild-complete");
 
 namespace mooncake {
 namespace ha {
@@ -362,12 +391,32 @@ void ActivateServingState(MasterAdminServer& admin_server,
                           LeaderLabelReconciler& label_reconciler) {
     admin_server.SetServiceDelegate(service);
     admin_server.SetServiceAvailable(true);
-    SetRuntimeState(admin_server, MasterRuntimeState::kServing);
+    SetRuntimeState(admin_server, FLAGS_enable_ha_rebuild_gate
+                                      ? MasterRuntimeState::kLeaderWarmup
+                                      : MasterRuntimeState::kServing);
     label_reconciler.SetLeader(true);
     // RFC #4700 slice 1: the promotion restore already moved the service
     // Constructed -> Recovering -> Ready; this is the Ready -> Serving
     // edge, taken only after readiness is published.
     service->ActivateServing();
+    if (!FLAGS_enable_ha_rebuild_gate) {
+        service->SetServing(true);
+        return;
+    }
+    std::weak_ptr<WrappedMasterService> weak = service;
+    const int window_ms = FLAGS_rebuild_collect_window_ms > 0
+                              ? FLAGS_rebuild_collect_window_ms
+                              : 7000;
+    std::thread([weak, window_ms] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(window_ms));
+        if (auto s = weak.lock())
+            s->LockRebuildExpectedClients(s->GetAliveClientsSnapshot());
+    }).detach();
+    const int force_ms = FLAGS_rebuild_force_serve_timeout_ms;
+    std::thread([weak, force_ms] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(force_ms));
+        if (auto s = weak.lock()) s->ForceServingAfterTimeout();
+    }).detach();
 }
 
 void DeactivateServingState(MasterAdminServer& admin_server,
@@ -740,6 +789,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
         mooncake::WrappedMasterServiceConfig wrapped_config(
             config, leadership_session->view.view_version);
+        wrapped_config.initially_serving = !FLAGS_enable_ha_rebuild_gate;
+        wrapped_config.enable_ha_rebuild = FLAGS_enable_ha_rebuild_gate;
         // The serving primary handles heartbeats/unmounts, so forward the
         // metadata cleanup config here like the non-HA path does.
         // Keep the gate alive until after the service is destroyed because the

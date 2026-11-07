@@ -24,6 +24,9 @@
 #include "dummy_client.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
+#ifdef USE_ASCEND_DIRECT
+#include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
+#endif
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
@@ -38,6 +41,10 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::service_ready_internal>(&rc);
     server.register_handler<&RealClient::ping>(&rc);
     server.register_handler<&RealClient::map_shm_internal>(&rc);
+    server.register_handler<&RealClient::is_shm_mapped_internal>(&rc);
+#ifdef USE_ASCEND_DIRECT
+    server.register_handler<&RealClient::ascend_unmap_shm_internal>(&rc);
+#endif
     server.register_handler<&RealClient::unmap_shm_internal>(&rc);
     server.register_handler<&RealClient::unregister_shm_buffer_internal>(&rc);
     server.register_handler<&RealClient::probeKey_internal>(&rc);
@@ -75,6 +82,9 @@ class DummyClientProbeKeyTest : public ::testing::Test {
 
     // Bring up master + RealClient + RPC server + DummyClient.
     bool SetupStack() {
+#ifdef USE_ASCEND_DIRECT
+        if (!ContextManager::getInstance().initialize()) return false;
+#endif
         if (!master_.Start(InProcMasterConfigBuilder().build())) return false;
 
         real_client_ = RealClient::create();

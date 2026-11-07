@@ -229,6 +229,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
             auto registration =
                 segment_manager_->allocator_manager_.addAllocator(
                     segment.name, allocator, std::move(client_liveness));
+            registration->segment_id_ = segment.id;
             segment_manager_->client_segments_[client_id].push_back(segment.id);
             segment_manager_->mounted_segments_[segment.id] = {
                 segment, SegmentStatus::OK, allocator, registration};
@@ -267,11 +268,15 @@ ErrorCode ScopedSegmentAccess::MountSegment(
         return created.error();
     }
     auto allocator = std::move(*created);
+    if (auto offset =
+            std::dynamic_pointer_cast<OffsetBufferAllocator>(allocator))
+        offset->setAllocationEpoch(segment_manager_->allocation_epoch_);
     allocator->SetLocality(segment.locality);
 
     allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
     auto registration = segment_manager_->allocator_manager_.addAllocator(
         segment.name, allocator, std::move(client_liveness));
+    registration->segment_id_ = segment.id;
     segment_manager_->client_segments_[client_id].push_back(segment.id);
     segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator), registration};
@@ -408,6 +413,9 @@ bool ScopedSegmentAccess::ReplaceAllocators(
         if (replacement.expected != replacement.replacement) {
             replacement.replacement->SetLocality(
                 mounted->second.segment.locality);
+            if (auto offset = std::dynamic_pointer_cast<OffsetBufferAllocator>(
+                    replacement.replacement))
+                offset->setAllocationEpoch(segment_manager_->allocation_epoch_);
         }
     }
     if (!segment_manager_->allocator_manager_.replaceAllocators(
@@ -612,6 +620,24 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
 void ScopedSegmentAccess::ReleaseUnmountedSegmentName(
     const UUID& segment_id, const std::string& segment_name) {
     ReindexSegmentNameAfterRemoval(segment_id, segment_name);
+}
+
+std::shared_ptr<BufferAllocatorBase>
+ScopedSegmentAccess::FindAllocatorByEndpointAndAddr(
+    const std::string& te_endpoint, uintptr_t buffer_address,
+    UUID* resolved_segment_id) const {
+    for (const auto& [id, ms] : segment_manager_->mounted_segments_) {
+        if (ms.status != SegmentStatus::OK) continue;
+        if (ms.segment.te_endpoint != te_endpoint) continue;
+        // Disambiguate 1:N endpoint sharing by address range.
+        const uintptr_t base = ms.segment.base;
+        const uintptr_t end = base + ms.segment.size;
+        if (buffer_address >= base && buffer_address < end) {
+            if (resolved_segment_id) *resolved_segment_id = id;
+            return ms.buf_allocator;
+        }
+    }
+    return nullptr;
 }
 
 ErrorCode ScopedSegmentAccess::GetClientSegments(

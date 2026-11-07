@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -34,8 +35,8 @@ void BlockGetMempolicy() {
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
     struct sock_fprog prog = {sizeof(filter) / sizeof(filter[0]), filter};
-    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
-        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1UL, 0UL, 0UL, 0UL) != 0 ||
+        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0UL, 0UL) != 0) {
         _exit(2);
     }
 }
@@ -115,6 +116,28 @@ TEST_F(NumaAllowedNodesTest, BindTaskPolicyNarrowsTheAllowedNodes) {
 }
 
 TEST(NumaAllowedNodesFallbackTest, KeepsNodesWhenAllowedNodesAreUnreadable) {
+    // A valid allow-all probe distinguishes unavailable seccomp from a broken
+    // get_mempolicy filter, without changing the parent process's policy.
+    const pid_t child = fork();
+    ASSERT_NE(child, -1);
+    if (child == 0) {
+        struct sock_filter allow = BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+        struct sock_fprog prog = {1, &allow};
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1UL, 0UL, 0UL, 0UL) != 0 ||
+            prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0UL, 0UL) != 0)
+            _exit(errno);
+        _exit(0);
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    ASSERT_EQ(waited, child);
+    ASSERT_TRUE(WIFEXITED(status));
+    if (WEXITSTATUS(status) != 0)
+        GTEST_SKIP() << "runtime cannot install seccomp filters, errno="
+                     << WEXITSTATUS(status);
     EXPECT_EXIT(_exit(KeepsNodesWithGetMempolicyBlocked()),
                 ::testing::ExitedWithCode(0), "");
 }

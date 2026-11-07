@@ -380,10 +380,14 @@ void MasterAdminServer::SetServiceAvailable(bool available) {
 MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
     std::lock_guard<std::mutex> lock(state_mutex_);
     return RuntimeSnapshot{
-        .state = state_,
+        .state = state_ == ha::MasterRuntimeState::kLeaderWarmup && service_ &&
+                         service_->IsServing()
+                     ? ha::MasterRuntimeState::kServing
+                     : state_,
         .leader_view = leader_view_,
         .service = service_,
-        .service_available = service_available_,
+        .service_available =
+            service_available_ && service_ && service_->IsServing(),
     };
 }
 
@@ -1423,9 +1427,14 @@ void MasterAdminServer::HandleRemoveAll(coro_http::coro_http_request& req,
         // Empty tenant_id => clear all tenants; pass "" so WrappedMasterService
         // dispatches to the global (broadcast) RemoveAll, not the "default"
         // tenant-scoped one.
-        long count = service->RemoveAll(force, tenant_id);
+        auto count = service->RemoveAll(force, tenant_id);
+        if (!count) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(count.error()),
+                               count.error());
+            return;
+        }
         WriteJsonResponse(resp, coro_http::status_type::ok,
-                          HttpRemoveAllResponse{.removed_count = count});
+                          HttpRemoveAllResponse{.removed_count = *count});
     });
 }
 

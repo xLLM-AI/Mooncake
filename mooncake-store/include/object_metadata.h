@@ -107,6 +107,7 @@ struct ObjectMetadata {
     const std::string group_id;
     const std::string residency_affinity_id;
     const TenantId tenant_id;
+    std::pair<int64_t, uint64_t> rebuild_version{};
     const std::string user_key;
 
     // Committed attribution only; protected by the key's lock.

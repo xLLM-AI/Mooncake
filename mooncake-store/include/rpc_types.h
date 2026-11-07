@@ -64,10 +64,14 @@ YLT_REFL(ReplicaActionLease, proposal_id, lease_id, action, tenant_id, key,
 struct PingResponse {
     ViewVersionId view_version_id;
     ClientStatus client_status;
+    struct_pack::compatible<int64_t, 5> allocation_epoch;
 
     PingResponse() = default;
-    PingResponse(ViewVersionId view_version, ClientStatus status)
-        : view_version_id(view_version), client_status(status) {}
+    PingResponse(ViewVersionId view_version, ClientStatus status,
+                 std::optional<int64_t> epoch = std::nullopt)
+        : view_version_id(view_version),
+          client_status(status),
+          allocation_epoch(epoch.value_or(view_version)) {}
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const PingResponse& response) noexcept {
@@ -76,7 +80,7 @@ struct PingResponse {
                   << ", client_status: " << response.client_status << " }";
     }
 };
-YLT_REFL(PingResponse, view_version_id, client_status);
+YLT_REFL(PingResponse, view_version_id, client_status, allocation_epoch);
 
 /**
  * @brief Response structure for GetReplicaList operation

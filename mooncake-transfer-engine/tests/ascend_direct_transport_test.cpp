@@ -299,8 +299,26 @@ aclError aclrtGetPhyDevIdByLogicDevId(int32_t logic_dev_id,
     return ACL_ERROR_NONE;
 }
 
+aclError aclrtGetLogicDevIdByUserDevId(int32_t user_device,
+                                       int32_t* logical_device) {
+    if (!logical_device || user_device < 0 || user_device >= g_device_count)
+        return ACL_ERROR_FAILURE;
+    *logical_device = user_device;
+    return ACL_ERROR_NONE;
+}
+
+aclError aclrtMemSetAccess(void* address, size_t size, aclrtMemAccessDesc* desc,
+                           size_t count) {
+    if (!address || !size || !desc || count != 1 ||
+        desc->flags != ACL_RT_MEM_ACCESS_FLAGS_READWRITE ||
+        desc->location.type != ACL_MEM_LOCATION_TYPE_DEVICE ||
+        desc->location.id >= static_cast<uint32_t>(g_device_count))
+        return ACL_ERROR_FAILURE;
+    return ACL_ERROR_NONE;
+}
+
 aclError aclrtMallocPhysical(aclrtDrvMemHandle* handle, size_t size,
-                             aclrtPhysicalMemProp* prop, uint32_t flags) {
+                             const aclrtPhysicalMemProp* prop, uint64_t flags) {
     (void)prop;
     (void)flags;
     std::lock_guard<std::mutex> lock(g_acl_mutex);
@@ -314,7 +332,7 @@ aclError aclrtMallocPhysical(aclrtDrvMemHandle* handle, size_t size,
 }
 
 aclError aclrtReserveMemAddress(void** va, size_t size, size_t alignment,
-                                void* hint_addr, uint32_t page_type) {
+                                void* hint_addr, uint64_t page_type) {
     (void)alignment;
     (void)hint_addr;
     (void)page_type;
@@ -562,6 +580,31 @@ Status AdxlEngine::Initialize(
             std::string(kv.second.GetString());
     }
     return g_initialize_result;
+}
+
+// The mock engine must not call the real SDK allocator with fake ACL contexts.
+static std::map<void*, aclrtDrvMemHandle> mock_allocation_handles;
+Status AdxlEngine::MallocMem(MemType, size_t size, void** ptr) {
+    aclrtDrvMemHandle handle = nullptr;
+    aclrtPhysicalMemProp prop{};
+    if (aclrtMallocPhysical(&handle, size, &prop, 0) != ACL_ERROR_NONE)
+        return FAILED;
+    if (aclrtReserveMemAddress(ptr, size, 0, nullptr, 0) != ACL_ERROR_NONE) {
+        aclrtFreePhysical(handle);
+        return FAILED;
+    }
+    std::lock_guard lock(g_mutex);
+    mock_allocation_handles.emplace(*ptr, handle);
+    return SUCCESS;
+}
+Status AdxlEngine::FreeMem(void* ptr) {
+    std::lock_guard lock(g_mutex);
+    auto it = mock_allocation_handles.find(ptr);
+    if (it == mock_allocation_handles.end()) return FAILED;
+    aclrtFreePhysical(it->second);
+    aclrtReleaseMemAddress(ptr);
+    mock_allocation_handles.erase(it);
+    return SUCCESS;
 }
 
 void AdxlEngine::Finalize() {}
@@ -984,15 +1027,14 @@ TEST_F(AscendDirectTransportTest,
 // Install tests (dummy real mode, RoCE)
 // -----------------------------------------------------------------------------
 
-TEST_F(AscendDirectTransportTest, Install_DummyRealModeSkipsGetDevice) {
+TEST_F(AscendDirectTransportTest,
+       Install_DummyRealModeDoesNotRequireCallerDevice) {
     globalConfig().ascend_agent_mode = true;
-    const int get_device_calls_before = mock_acl::get_get_device_call_count();
+    // Optional local-copy stream warmup may query the caller device; agent
+    // installation must still succeed when no caller device is available.
+    g_get_device_result = ACL_ERROR_FAILURE;
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);
-    // allocateLocalSegmentID uses ContextManager instead of aclrtGetDevice.
-    // With ContextManager pre-initialized in SetUp, transport uses it, so
-    // install should not introduce extra aclrtGetDevice calls.
-    EXPECT_EQ(mock_acl::get_get_device_call_count(), get_device_calls_before);
     globalConfig().ascend_agent_mode = false;
 }
 
@@ -1041,18 +1083,17 @@ TEST_F(AscendDirectTransportTest,
     globalConfig().ascend_agent_mode = false;
 }
 
-// Dummy real mode without RoCE: single engine endpoint, still skips
-// aclrtGetDevice
+// Dummy real mode without RoCE: single endpoint without a caller device.
 TEST_F(AscendDirectTransportTest,
        Install_DummyRealModeWithoutRoce_SingleEndpoint) {
     globalConfig().ascend_agent_mode = true;
     mock_acl::set_device_count(1);
     unsetenv("HCCL_INTRA_ROCE_ENABLE");  // Ensure non-RoCE path
-    const int get_device_calls_before = mock_acl::get_get_device_call_count();
+    // Optional local-copy stream warmup may query the caller device; agent
+    // installation must still succeed when no caller device is available.
+    g_get_device_result = ACL_ERROR_FAILURE;
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);
-    // allocateLocalSegmentID uses ContextManager instead of aclrtGetDevice.
-    EXPECT_EQ(mock_acl::get_get_device_call_count(), get_device_calls_before);
     auto metadata = transport->meta();
     ASSERT_NE(metadata, nullptr);
     auto local_desc = metadata->getSegmentDescByID(0);
@@ -1397,6 +1438,8 @@ TEST_F(AscendDirectTransportTest, Memory_RegisterWithDeviceLocation) {
 }
 
 TEST_F(AscendDirectTransportTest, Memory_RegisterRejectsUnalignedDeviceMem) {
+    setenv("ASCEND_GLOBAL_RESOURCE_CONFIG",
+           R"({"comm_resource_config":{"protocol_desc":"hccs:device"}})", 1);
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);
 

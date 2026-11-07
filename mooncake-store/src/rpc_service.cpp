@@ -5,6 +5,8 @@
 #include <string_view>
 #include <type_traits>
 
+#include <sstream>
+
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
@@ -19,6 +21,12 @@
 
 namespace mooncake {
 namespace {
+
+template <typename T>
+std::vector<tl::expected<T, ErrorCode>> UnavailableBatch(size_t count) {
+    return std::vector<tl::expected<T, ErrorCode>>(
+        count, tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+}
 
 tl::expected<TenantId, ErrorCode> ResolveRequestTenantId(std::string_view raw) {
     TenantId tenant_id{std::string(raw)};
@@ -107,7 +115,18 @@ WrappedMasterService::WrappedMasterService(
     const WrappedMasterServiceConfig& config,
     HttpMetadataServer* http_metadata_server,
     const std::string& http_metadata_remote_url)
-    : master_service_(MasterServiceConfig(config)) {
+    : master_service_(MasterServiceConfig(config)),
+      view_version_(config.view_version),
+      enable_ha_rebuild_(config.enable_ha_rebuild),
+      serving_state_(config.initially_serving ? StoreServingState::SERVING
+                                              : StoreServingState::REBUILDING),
+      rebuild_started_at_(std::chrono::steady_clock::now()) {
+    MasterMetricManager::instance().set_rebuild_state(
+        static_cast<int64_t>(serving_state_.load(std::memory_order_relaxed)));
+    MasterMetricManager::instance().set_rebuild_progress(
+        static_cast<int64_t>(rebuild_expected_clients_.size()),
+        static_cast<int64_t>(rebuild_done_clients_.size()));
+    MasterMetricManager::instance().set_rebuild_duration_ms(0);
     // Configure metadata cleanup on client timeout. Prefer the co-located
     // in-process server; otherwise fall back to a separately-deployed HTTP
     // metadata server derived from the cluster configuration.
@@ -146,13 +165,25 @@ WrappedMasterService::GetRestoreLifecycleState() const {
     return master_service_.GetRestoreLifecycleState();
 }
 
+void WrappedMasterService::SetServing(bool on) {
+    const auto state =
+        on ? StoreServingState::SERVING : StoreServingState::REBUILDING;
+    serving_state_.store(state, std::memory_order_release);
+    MasterMetricManager::instance().set_rebuild_state(
+        static_cast<int64_t>(state));
+}
+
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 WrappedMasterService::CalcCacheStats() {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return MasterMetricManager::instance().calculate_cache_stats();
 }
 
 tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
     const std::string& key, const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "ExistKey",
         [&] {
@@ -171,6 +202,7 @@ tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
 
 std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
+    if (!IsServing()) return UnavailableBatch<bool>(keys.size());
     ScopedVLogTimer timer(1, "BatchExistKey");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys);
@@ -209,6 +241,8 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
 
 tl::expected<bool, ErrorCode> WrappedMasterService::ProbeKey(
     const std::string& key, const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "ProbeKey",
         [&] {
@@ -226,6 +260,7 @@ tl::expected<bool, ErrorCode> WrappedMasterService::ProbeKey(
 std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchProbeKey(
     const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
     const std::string& tenant_id) {
+    if (!IsServing()) return UnavailableBatch<bool>(keys.size());
     ScopedVLogTimer timer(1, "BatchProbeKey");
     timer.LogRequest("keys_count=", keys.size());
 
@@ -242,6 +277,8 @@ tl::expected<
     std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
     ErrorCode>
 WrappedMasterService::BatchQueryIp(const std::vector<UUID>& client_ids) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "BatchQueryIp");
     const size_t total_client_ids = client_ids.size();
     timer.LogRequest("client_ids_count=", total_client_ids);
@@ -282,6 +319,8 @@ tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
     const std::string& segment_name, const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "BatchReplicaClear");
     const size_t total_keys = object_keys.size();
     timer.LogRequest("object_keys_count=", total_keys,
@@ -327,6 +366,8 @@ tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
 WrappedMasterService::GetReplicaListByRegex(const std::string& str,
                                             const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "GetReplicaListByRegex",
         [&] {
@@ -353,6 +394,8 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
 tl::expected<GetReplicaListResponse, ErrorCode>
 WrappedMasterService::GetReplicaList(const std::string& key,
                                      const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "GetReplicaList",
         [&] {
@@ -383,6 +426,8 @@ WrappedMasterService::GetReplicaList(const std::string& key,
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                                           const std::string& tenant_id) {
+    if (!IsServing())
+        return UnavailableBatch<GetReplicaListResponse>(keys.size());
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys);
@@ -439,6 +484,8 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaListForAdmin(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
+    if (!IsServing())
+        return UnavailableBatch<GetReplicaListResponse>(keys.size());
     return WithRequestTenantBatch(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
@@ -451,6 +498,8 @@ WrappedMasterService::BatchGetReplicaListForAdmin(
 tl::expected<GetReplicaListResponse, ErrorCode>
 WrappedMasterService::GetReplicaListForAdmin(const std::string& key,
                                              const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "GetReplicaListForAdmin",
         [&] {
@@ -471,6 +520,8 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
                                const ReplicateConfig& config,
                                const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     auto result = execute_rpc(
         "PutStart",
         [&] {
@@ -497,6 +548,8 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
     ReplicaType replica_type, const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "PutEnd",
         [&] {
@@ -520,6 +573,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
     const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "PutRevoke",
         [&] {
@@ -546,6 +601,11 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                                     const std::vector<uint64_t>& slice_lengths,
                                     const ReplicateConfig& config,
                                     const std::string& tenant_id) {
+    if (!IsServing())
+        return std::vector<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
+            keys.size(),
+            tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
     ScopedVLogTimer timer(1, "BatchPutStart");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -649,6 +709,11 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
     ReplicaType replica_type, const std::string& tenant_id) {
+    if (!IsServing()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            object_metas.size(),
+            tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+    }
     ScopedVLogTimer timer(1, "BatchPutEnd");
     const size_t total_keys = object_metas.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -689,6 +754,11 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type, const std::string& tenant_id) {
+    if (!IsServing()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(),
+            tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+    }
     ScopedVLogTimer timer(1, "BatchPutRevoke");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -736,6 +806,8 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                   const uint64_t slice_length,
                                   const ReplicateConfig& config,
                                   const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "UpsertStart",
         [&] {
@@ -758,6 +830,8 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
     ReplicaType replica_type, const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "UpsertEnd",
         [&] {
@@ -781,6 +855,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
     const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "UpsertRevoke",
         [&] {
@@ -806,6 +882,12 @@ WrappedMasterService::BatchUpsertStart(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
     const std::string& tenant_id) {
+    if (!IsServing()) {
+        return std::vector<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
+            keys.size(),
+            tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+    }
     ScopedVLogTimer timer(1, "BatchUpsertStart");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -863,6 +945,11 @@ WrappedMasterService::BatchUpsertStart(
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
     const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
     const std::string& tenant_id) {
+    if (!IsServing()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            object_metas.size(),
+            tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+    }
     ScopedVLogTimer timer(1, "BatchUpsertEnd");
     const size_t total_keys = object_metas.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -904,6 +991,11 @@ std::vector<tl::expected<void, ErrorCode>>
 WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
                                         const std::vector<std::string>& keys,
                                         const std::string& tenant_id) {
+    if (!IsServing()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(),
+            tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+    }
     ScopedVLogTimer timer(1, "BatchUpsertRevoke");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -943,6 +1035,8 @@ WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
 
 tl::expected<void, ErrorCode> WrappedMasterService::Remove(
     const std::string& key, bool force, const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "Remove",
         [&] {
@@ -961,6 +1055,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::Remove(
 
 tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
     const std::string& str, bool force, const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "RemoveByRegex",
         [&] {
@@ -979,7 +1075,10 @@ tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
         [] { MasterMetricManager::instance().inc_remove_by_regex_failures(); });
 }
 
-long WrappedMasterService::RemoveAll(bool force, const std::string& tenant_id) {
+tl::expected<long, ErrorCode> WrappedMasterService::RemoveAll(
+    bool force, const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "RemoveAll");
     timer.LogRequest("action=remove_all_objects, force=", force,
                      ", tenant_id=", tenant_id);
@@ -1011,6 +1110,7 @@ std::vector<tl::expected<void, ErrorCode>>
 WrappedMasterService::BatchUpdateSoftPin(const std::vector<std::string>& keys,
                                          uint64_t ttl_ms,
                                          const std::string& tenant_id) {
+    if (!IsServing()) return UnavailableBatch<void>(keys.size());
     return WithRequestTenantBatch(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
@@ -1023,6 +1123,11 @@ WrappedMasterService::BatchUpdateSoftPin(const std::vector<std::string>& keys,
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
     const std::vector<std::string>& keys, bool force,
     const std::string& tenant_id) {
+    if (!IsServing()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(),
+            tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+    }
     ScopedVLogTimer timer(1, "BatchRemove");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys, ", force=", force);
@@ -1051,6 +1156,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
     const Segment& segment, const UUID& client_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     TestFailPoint::Wait("rpc_mount_segment_before_service");
     return execute_rpc(
         "MountSegment",
@@ -1066,6 +1173,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountNoFSegment(
     const NoFSegment& segment, const UUID& client_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "MountNoFSegment",
         [&] { return master_service_.MountNoFSegment(segment, client_id); },
@@ -1096,6 +1205,160 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReMountSegment(
         [] { MasterMetricManager::instance().inc_remount_segment_failures(); });
 }
 
+std::vector<tl::expected<KeyReplicaEntry, ErrorCode>>
+WrappedMasterService::BatchGetCommittedRebuildEntries(
+    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    if (!IsServing())
+        return {keys.size(),
+                tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS)};
+    std::vector<tl::expected<KeyReplicaEntry, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (const auto& key : keys)
+        results.emplace_back(
+            master_service_.GetCommittedRebuildEntry(key, tenant_id));
+    return results;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::RebuildMetadata(
+    const std::vector<KeyReplicaEntry>& entries, const UUID& client_id,
+    ViewVersionId view_version) {
+    if (!IsCurrentView(view_version)) {
+        MasterMetricManager::instance().inc_rebuild_stale_epoch_requests();
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+    return execute_rpc(
+        "RebuildMetadata",
+        [&] { return master_service_.RebuildMetadata(entries, client_id); },
+        [&](auto& timer) {
+            timer.LogRequest("entries_count=", entries.size(),
+                             ", client_id=", client_id);
+        },
+        [] { MasterMetricManager::instance().inc_rebuild_metadata_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_rebuild_metadata_failures();
+        });
+}
+
+WrappedMasterService::ClientSet WrappedMasterService::GetAliveClientsSnapshot()
+    const {
+    return master_service_.getAliveClientsSnapshot();
+}
+
+std::string WrappedMasterService::MissingClientsLocked() const {
+    std::ostringstream missing;
+    const char* separator = "";
+    for (const auto& client_id : rebuild_expected_clients_) {
+        if (rebuild_done_clients_.contains(client_id)) continue;
+        missing << separator << client_id.first << "-" << client_id.second;
+        separator = ",";
+    }
+    return missing.str();
+}
+
+void WrappedMasterService::TransitionToLocked(StoreServingState state,
+                                              const char* reason) {
+    const auto previous = serving_state_.load(std::memory_order_acquire);
+    if (previous == state || (previous == StoreServingState::SERVING &&
+                              state == StoreServingState::DEGRADED)) {
+        return;
+    }
+    serving_state_.store(state, std::memory_order_release);
+    MasterMetricManager::instance().set_rebuild_state(
+        static_cast<int64_t>(state));
+    auto& metrics = MasterMetricManager::instance();
+    metrics.set_rebuild_duration_ms(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - rebuild_started_at_)
+            .count());
+    MasterMetricManager::instance().set_rebuild_progress(
+        static_cast<int64_t>(rebuild_expected_clients_.size()),
+        static_cast<int64_t>(rebuild_done_clients_.size()));
+    if (state == StoreServingState::DEGRADED) {
+        metrics.inc_rebuild_force_open();
+    }
+    LOG(INFO) << "[HA-REBUILD-GATE] view=" << view_version_ << " store state="
+              << (state == StoreServingState::SERVING ? "SERVING" : "DEGRADED")
+              << " reason=" << reason
+              << " completed=" << rebuild_done_clients_.size() << "/"
+              << rebuild_expected_clients_.size() << " missing_clients=["
+              << MissingClientsLocked() << "]";
+}
+
+void WrappedMasterService::MaybeFinishRebuildLocked() {
+    if (rebuild_window_locked_ &&
+        rebuild_done_clients_.size() == rebuild_expected_clients_.size())
+        TransitionToLocked(StoreServingState::SERVING,
+                           "all expected clients rebuilt");
+}
+
+void WrappedMasterService::LockRebuildExpectedClients(
+    ClientSet expected_clients) {
+    std::lock_guard<std::mutex> lk(rebuild_mu_);
+    if (rebuild_window_locked_) return;
+    rebuild_window_locked_ = true;
+    rebuild_expected_clients_ = std::move(expected_clients);
+    for (const auto& client_id : rebuild_done_before_lock_) {
+        if (rebuild_expected_clients_.contains(client_id)) {
+            rebuild_done_clients_.insert(client_id);
+        }
+    }
+    rebuild_done_before_lock_.clear();
+    MasterMetricManager::instance().set_rebuild_progress(
+        static_cast<int64_t>(rebuild_expected_clients_.size()),
+        static_cast<int64_t>(rebuild_done_clients_.size()));
+    LOG(INFO) << "[HA-REBUILD-GATE] view=" << view_version_
+              << " handshake window closed; expected_clients="
+              << rebuild_expected_clients_.size()
+              << " completed=" << rebuild_done_clients_.size();
+    MaybeFinishRebuildLocked();
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::SignalRebuildComplete(
+    const UUID& client_id, ViewVersionId view_version) {
+    if (!IsCurrentView(view_version)) {
+        MasterMetricManager::instance().inc_rebuild_stale_epoch_requests();
+        LOG(WARNING) << "[HA-REBUILD-GATE] stale rebuild-complete view="
+                     << view_version << " current_view=" << view_version_;
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+    std::lock_guard<std::mutex> lk(rebuild_mu_);
+    if (!rebuild_window_locked_) {
+        if (rebuild_done_before_lock_.size() >= 10000 &&
+            !rebuild_done_before_lock_.contains(client_id)) {
+            LOG(ERROR) << "[HA-REBUILD-GATE] too many pre-lock completion "
+                          "signals; refusing unbounded growth";
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        rebuild_done_before_lock_.insert(client_id);
+        return {};
+    }
+    if (!rebuild_expected_clients_.contains(client_id)) {
+        LOG(WARNING) << "[HA-REBUILD-GATE] ignoring non-expected client=("
+                     << client_id.first << "," << client_id.second
+                     << ") view=" << view_version_;
+        return {};
+    }
+    rebuild_done_clients_.insert(client_id);
+    MasterMetricManager::instance().set_rebuild_progress(
+        static_cast<int64_t>(rebuild_expected_clients_.size()),
+        static_cast<int64_t>(rebuild_done_clients_.size()));
+    LOG(INFO) << "[HA-REBUILD-GATE] view=" << view_version_
+              << " rebuild-complete from client=(" << client_id.first << ","
+              << client_id.second << "); " << rebuild_done_clients_.size()
+              << "/" << rebuild_expected_clients_.size();
+    MaybeFinishRebuildLocked();
+    return {};
+}
+
+void WrappedMasterService::ForceServingAfterTimeout() {
+    std::lock_guard<std::mutex> lk(rebuild_mu_);
+    if (serving_state_.load(std::memory_order_acquire) ==
+        StoreServingState::REBUILDING) {
+        TransitionToLocked(StoreServingState::DEGRADED, "rebuild timeout");
+    }
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::ReMountNoFSegment(
     const std::vector<NoFSegment>& segments, const UUID& client_id) {
     return execute_rpc(
@@ -1115,6 +1378,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReMountNoFSegment(
 
 tl::expected<void, ErrorCode> WrappedMasterService::UnmountSegment(
     const UUID& segment_id, const UUID& client_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "UnmountSegment",
         [&] { return master_service_.UnmountSegment(segment_id, client_id); },
@@ -1128,6 +1393,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::UnmountSegment(
 
 tl::expected<void, ErrorCode> WrappedMasterService::GracefulUnmountSegment(
     const UUID& segment_id, const UUID& client_id, uint64_t grace_period_ms) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "GracefulUnmountSegment",
         [&] {
@@ -1151,6 +1418,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::GracefulUnmountSegment(
 
 tl::expected<void, ErrorCode> WrappedMasterService::UnmountNoFSegment(
     const UUID& segment_id, const UUID& client_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "UnmountNoFSegment",
         [&] {
@@ -1170,6 +1439,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::UnmountNoFSegment(
 
 tl::expected<std::vector<NoFSegment>, ErrorCode>
 WrappedMasterService::GetAllNoFSegments() {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "GetAllNoFSegments",
         [&] { return master_service_.GetAllNoFSegments(); },
@@ -1179,6 +1450,8 @@ WrappedMasterService::GetAllNoFSegments() {
 
 tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>
 WrappedMasterService::GetNoFSegmentsByName(const std::string& segment_name) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "GetNoFSegmentsByName",
         [&] { return master_service_.GetNoFSegmentsByName(segment_name); },
@@ -1190,6 +1463,10 @@ tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
+    if (enable_ha_rebuild_)
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "CopyStart",
         [&] {
@@ -1218,6 +1495,10 @@ WrappedMasterService::DynamicReplicaCopyStart(
     const std::vector<std::string>& tgt_segments,
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch) {
+    if (enable_ha_rebuild_)
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "DynamicReplicaCopyStart",
         [&] {
@@ -1243,6 +1524,8 @@ WrappedMasterService::DynamicReplicaCopyStart(
 tl::expected<void, ErrorCode> WrappedMasterService::CopyEnd(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "CopyEnd",
         [&] {
@@ -1267,6 +1550,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::DynamicReplicaCopyEnd(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "DynamicReplicaCopyEnd",
         [&] {
@@ -1291,6 +1576,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::DynamicReplicaCopyEnd(
 tl::expected<void, ErrorCode> WrappedMasterService::CopyRevoke(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "CopyRevoke",
         [&] {
@@ -1315,6 +1602,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::DynamicReplicaCopyRevoke(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "DynamicReplicaCopyRevoke",
         [&] {
@@ -1339,6 +1628,10 @@ tl::expected<void, ErrorCode> WrappedMasterService::DynamicReplicaCopyRevoke(
 tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     const std::string& src_segment, const std::string& tgt_segment) {
+    if (enable_ha_rebuild_)
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "MoveStart",
         [&] {
@@ -1363,6 +1656,8 @@ tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveStart(
 tl::expected<void, ErrorCode> WrappedMasterService::MoveEnd(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "MoveEnd",
         [&] {
@@ -1386,6 +1681,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::MoveEnd(
 tl::expected<void, ErrorCode> WrappedMasterService::MoveRevoke(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "MoveRevoke",
         [&] {
@@ -1409,6 +1706,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::MoveRevoke(
 tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     ReplicaType replica_type) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "EvictDiskReplica",
         [&] {
@@ -1437,6 +1736,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
 tl::expected<bool, ErrorCode> WrappedMasterService::EvictDiskReplicaIfCurrent(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     ReplicaType replica_type, ReplicaID expected_replica_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "EvictDiskReplicaIfCurrent",
         [&] {
@@ -1468,6 +1769,11 @@ std::vector<tl::expected<void, ErrorCode>>
 WrappedMasterService::BatchEvictDiskReplica(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id, ReplicaType replica_type) {
+    if (!IsServing()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(),
+            tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+    }
     ScopedVLogTimer timer(1, "BatchEvictDiskReplica");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys,
@@ -1505,6 +1811,8 @@ WrappedMasterService::BatchEvictDiskReplica(
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
     const std::string& key, const std::string& tenant_id,
     const std::vector<std::string>& targets) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "CreateCopyTask",
         [&] {
@@ -1528,6 +1836,8 @@ tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateMoveTask(
     const std::string& key, const std::string& tenant_id,
     const std::string& source, const std::string& target) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "CreateMoveTask",
         [&] {
@@ -1550,6 +1860,8 @@ tl::expected<UUID, ErrorCode> WrappedMasterService::CreateMoveTask(
 
 tl::expected<QueryTaskResponse, ErrorCode> WrappedMasterService::QueryTask(
     const UUID& task_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "QueryTask", [&] { return master_service_.QueryTask(task_id); },
         [&](auto& timer) { timer.LogRequest("task_id=", task_id); },
@@ -1559,6 +1871,8 @@ tl::expected<QueryTaskResponse, ErrorCode> WrappedMasterService::QueryTask(
 
 tl::expected<std::vector<TaskAssignment>, ErrorCode>
 WrappedMasterService::FetchTasks(const UUID& client_id, size_t batch_size) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "FetchTasks",
         [&] { return master_service_.FetchTasks(client_id, batch_size); },
@@ -1572,6 +1886,8 @@ WrappedMasterService::FetchTasks(const UUID& client_id, size_t batch_size) {
 
 tl::expected<void, ErrorCode> WrappedMasterService::MarkTaskToComplete(
     const UUID& client_id, const TaskCompleteRequest& request) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return execute_rpc(
         "MarkTaskToComplete",
         [&] { return master_service_.MarkTaskToComplete(client_id, request); },
@@ -1617,6 +1933,8 @@ tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
 }
 
 tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
+    // v0.3.14 Connect() uses this version handshake before remount/replay.
+    // Data readiness is reported separately by /health and the business gate.
     return GetMooncakeStoreVersion();
 }
 
@@ -1627,6 +1945,8 @@ TieredStorageUsageSnapshot WrappedMasterService::GetStorageUsageSnapshot()
 
 tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
 WrappedMasterService::ListTenantQuotaSnapshots() {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     const TenantQuotaPolicy* quota = master_service_.tenant_quota_policy();
     if (quota == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
@@ -1636,6 +1956,8 @@ WrappedMasterService::ListTenantQuotaSnapshots() {
 
 tl::expected<TenantQuotaSnapshot, ErrorCode>
 WrappedMasterService::GetTenantQuotaSnapshot(const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     const TenantQuotaPolicy* quota = master_service_.tenant_quota_policy();
     if (quota == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
@@ -1655,6 +1977,8 @@ WrappedMasterService::GetTenantQuotaSnapshot(const std::string& tenant_id) {
 tl::expected<TenantQuotaSnapshot, ErrorCode>
 WrappedMasterService::UpsertTenantQuotaPolicy(const std::string& tenant_id,
                                               uint64_t requested_quota_bytes) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     TenantQuotaPolicy* quota = master_service_.tenant_quota_policy();
     if (quota == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
@@ -1671,6 +1995,8 @@ WrappedMasterService::UpsertTenantQuotaPolicy(const std::string& tenant_id,
 
 tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
 WrappedMasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     TenantQuotaPolicy* quota = master_service_.tenant_quota_policy();
     if (quota == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
@@ -1687,6 +2013,8 @@ WrappedMasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
 
 tl::expected<uint64_t, ErrorCode>
 WrappedMasterService::GetTenantQuotaAllocatableCapacityBytes() {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     const TenantQuotaPolicy* quota = master_service_.tenant_quota_policy();
     if (quota == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
@@ -1696,6 +2024,8 @@ WrappedMasterService::GetTenantQuotaAllocatableCapacityBytes() {
 
 tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::GetAllKeysForAdmin() {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     // Compatibility endpoint: /get_all_keys historically listed only the
     // default tenant's keys.
     return master_service_.GetAllKeys(TenantId::Default());
@@ -1703,21 +2033,29 @@ WrappedMasterService::GetAllKeysForAdmin() {
 
 tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::GetAllSegmentsForAdmin() {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return master_service_.GetAllSegments();
 }
 
 tl::expected<std::vector<MasterService::SegmentDetailInfo>, ErrorCode>
 WrappedMasterService::GetSegmentsDetailForAdmin() {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return master_service_.GetSegmentsDetail();
 }
 
 tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode>
 WrappedMasterService::QuerySegmentForAdmin(const std::string& segment) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return master_service_.QuerySegments(segment);
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
     const UUID& client_id, bool enable_offloading) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "MountLocalDiskSegment");
     timer.LogRequest("action=mount_local_disk_segment");
     LOG(INFO) << "Mount local disk segment with client id is : " << client_id
@@ -1731,6 +2069,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
 
 tl::expected<void, ErrorCode> WrappedMasterService::UnmountLocalDiskSegment(
     const UUID& client_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "UnmountLocalDiskSegment");
     timer.LogRequest("action=unmount_local_disk_segment");
     LOG(INFO) << "Unmount local disk segment with client id is : " << client_id;
@@ -1743,6 +2083,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::UnmountLocalDiskSegment(
 tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
 WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                              bool enable_offloading) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "OffloadObjectHeartbeat");
     timer.LogRequest("action=offload_object_heartbeat");
     auto result =
@@ -1752,6 +2094,8 @@ WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
 
 tl::expected<bool, ErrorCode> WrappedMasterService::PollRemoveAll(
     const UUID& client_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "PollRemoveAll");
     timer.LogRequest("client_id=", client_id);
     auto result = master_service_.PollRemoveAll(client_id);
@@ -1762,6 +2106,8 @@ tl::expected<bool, ErrorCode> WrappedMasterService::PollRemoveAll(
 
 tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(
     const UUID& client_id, int64_t ssd_total_capacity_bytes) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "ReportSsdCapacity");
     timer.LogRequest("client_id=", client_id,
                      ", ssd_total_capacity_bytes=", ssd_total_capacity_bytes);
@@ -1772,6 +2118,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(
 tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "NotifyOffloadSuccess");
     timer.LogRequest("action=notify_offload_success");
 
@@ -1796,6 +2144,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
 
 tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
 WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "PromotionObjectHeartbeat");
     timer.LogRequest("action=promotion_object_heartbeat");
     return master_service_.PromotionObjectHeartbeat(client_id);
@@ -1804,6 +2154,8 @@ WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
 tl::expected<void, ErrorCode> WrappedMasterService::RegisterPrefetchTask(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "RegisterPrefetchTask");
     timer.LogRequest("action=register_prefetch_task");
     auto result = WithRequestTenant(
@@ -1821,6 +2173,8 @@ tl::expected<PromotionAllocStartResponse, ErrorCode>
 WrappedMasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     uint64_t size, const std::vector<std::string>& preferred_segments) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "PromotionAllocStart");
     timer.LogRequest("action=promotion_alloc_start");
     auto result = WithWriteTenant(
@@ -1836,6 +2190,8 @@ WrappedMasterService::PromotionAllocStart(
 tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionSuccess(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "NotifyPromotionSuccess");
     timer.LogRequest("action=notify_promotion_success");
     auto result = WithRequestTenant(
@@ -1852,6 +2208,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionSuccess(
 tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionFailure(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "NotifyPromotionFailure");
     timer.LogRequest("action=notify_promotion_failure");
     auto result = WithRequestTenant(
@@ -1871,42 +2229,58 @@ tl::expected<int, ErrorCode> WrappedMasterService::GetDfsShardCount() const {
 
 tl::expected<int, ErrorCode> WrappedMasterService::ExpandDfsShards(
     int shard_count) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return master_service_.ExpandDfsShards(shard_count);
 }
 
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return master_service_.CreateDrainJob(request);
 }
 
 tl::expected<QueryJobResponse, ErrorCode> WrappedMasterService::QueryDrainJob(
     const UUID& job_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return master_service_.QueryDrainJob(job_id);
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::CancelDrainJob(
     const UUID& job_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return master_service_.CancelDrainJob(job_id);
 }
 
 tl::expected<SegmentStatus, ErrorCode> WrappedMasterService::QuerySegmentStatus(
     const std::string& segment_name) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return master_service_.QuerySegmentStatus(segment_name);
 }
 
 tl::expected<SegmentStatus, ErrorCode>
 WrappedMasterService::QuerySegmentStatusById(const UUID& segment_id) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return master_service_.QuerySegmentStatusById(segment_id);
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::SetSegmentStatus(
     const std::string& segment_name, SegmentStatus status) {
+    if (!IsServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return master_service_.SetSegmentStatus(segment_name, status);
 }
 
 WeightMetadataStore::Result<WeightRevisionMetadata>
 WrappedMasterService::BeginWeightImport(const BeginWeightImportRequest& request,
                                         const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(WeightManagementError::NOT_READY);
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
@@ -1917,6 +2291,8 @@ WrappedMasterService::BeginWeightImport(const BeginWeightImportRequest& request,
 WeightMetadataStore::Result<WeightRevisionMetadata>
 WrappedMasterService::CommitWeightImport(
     const CommitWeightImportRequest& request, const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(WeightManagementError::NOT_READY);
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
@@ -1927,6 +2303,8 @@ WrappedMasterService::CommitWeightImport(
 WeightMetadataStore::Result<WeightRevisionMetadata>
 WrappedMasterService::AbortWeightImport(const AbortWeightImportRequest& request,
                                         const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(WeightManagementError::NOT_READY);
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
@@ -1937,6 +2315,8 @@ WrappedMasterService::AbortWeightImport(const AbortWeightImportRequest& request,
 WeightMetadataStore::Result<WeightRevisionView>
 WrappedMasterService::GetWeightRevision(const GetWeightRevisionRequest& request,
                                         const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(WeightManagementError::NOT_READY);
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
         [this](const auto& bound) {
@@ -1947,6 +2327,8 @@ WrappedMasterService::GetWeightRevision(const GetWeightRevisionRequest& request,
 WeightMetadataStore::Result<ListWeightRevisionsResponse>
 WrappedMasterService::ListWeightRevisions(
     const ListWeightRevisionsRequest& request, const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(WeightManagementError::NOT_READY);
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
         [this](const auto& bound) {
@@ -1958,6 +2340,8 @@ WeightMetadataStore::Result<WeightRevisionLease>
 WrappedMasterService::AcquireWeightRevisionLease(
     const AcquireWeightRevisionLeaseRequest& request,
     const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(WeightManagementError::NOT_READY);
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
@@ -1969,6 +2353,8 @@ WeightMetadataStore::Result<WeightRevisionLease>
 WrappedMasterService::RenewWeightRevisionLease(
     const RenewWeightRevisionLeaseRequest& request,
     const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(WeightManagementError::NOT_READY);
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
@@ -1980,6 +2366,8 @@ WeightMetadataStore::Result<void>
 WrappedMasterService::ReleaseWeightRevisionLease(
     const ReleaseWeightRevisionLeaseRequest& request,
     const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(WeightManagementError::NOT_READY);
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
@@ -1991,6 +2379,8 @@ WeightMetadataStore::Result<WeightResidencyOperation>
 WrappedMasterService::StartWeightResidencyOperation(
     const StartWeightResidencyOperationRequest& request,
     const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(WeightManagementError::NOT_READY);
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
@@ -2001,6 +2391,8 @@ WrappedMasterService::StartWeightResidencyOperation(
 WeightMetadataStore::Result<WeightResidencyOperation>
 WrappedMasterService::QueryWeightOperation(
     const QueryWeightOperationRequest& request, const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(WeightManagementError::NOT_READY);
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
         [this](const auto& bound) {
@@ -2011,6 +2403,8 @@ WrappedMasterService::QueryWeightOperation(
 WeightMetadataStore::Result<WeightRevisionMetadata>
 WrappedMasterService::DeleteWeightRevision(
     const DeleteWeightRevisionRequest& request, const std::string& tenant_id) {
+    if (!IsServing())
+        return tl::make_unexpected(WeightManagementError::NOT_READY);
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
@@ -2093,6 +2487,9 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::BatchRemove, &WrappedMasterService::MountSegment,
         &WrappedMasterService::MountNoFSegment,
         &WrappedMasterService::ReMountSegment,
+        &WrappedMasterService::RebuildMetadata,
+        &WrappedMasterService::BatchGetCommittedRebuildEntries,
+        &WrappedMasterService::SignalRebuildComplete,
         &WrappedMasterService::ReMountNoFSegment,
         &WrappedMasterService::UnmountSegment,
         &WrappedMasterService::GracefulUnmountSegment,

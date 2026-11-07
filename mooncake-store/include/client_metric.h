@@ -971,6 +971,8 @@ struct ClientMetric {
     MasterClientMetric master_client_metric;
     TransferOperationMetric transfer_operation_metric;
     SsdMetric ssd_metric;
+    ylt::metric::counter_t rebuild_failed_batches;
+    ylt::metric::counter_t rebuild_retries;
     DfsMetric dfs_metric;
 #ifdef USE_NOF
     NofMetric nof_metric;

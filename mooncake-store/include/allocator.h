@@ -77,11 +77,13 @@ class AllocatedBuffer {
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                     void* buffer_ptr, std::size_t size,
                     std::optional<offset_allocator::OffsetAllocationHandle>&&
-                        offset_handle = std::nullopt)
+                        offset_handle = std::nullopt,
+                    int64_t allocation_epoch = 0)
         : allocator_(std::move(allocator)),
           buffer_ptr_(buffer_ptr),
           size_(size),
-          offset_handle_(std::move(offset_handle)) {}
+          offset_handle_(std::move(offset_handle)),
+          allocation_epoch_(allocation_epoch) {}
 
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                     const Descriptor& descriptor);
@@ -96,6 +98,7 @@ class AllocatedBuffer {
     [[nodiscard]] void* data() const noexcept { return buffer_ptr_; }
 
     [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
+    void setAllocationEpoch(int64_t epoch) { allocation_epoch_ = epoch; }
 
     [[nodiscard]] bool isAllocatorValid() const {
         return !allocator_.expired() && segment_lifetime_.isAvailable();
@@ -147,8 +150,18 @@ class AllocatedBuffer {
         uintptr_t buffer_address_;
         std::string protocol_;
         std::string transport_endpoint_;
+        struct_pack::compatible<int64_t, 5> allocation_epoch_;
+        struct_pack::compatible<uint64_t, 5> allocation_size_;
+        struct_pack::compatible<UUID, 5> segment_id_;
+        int64_t allocationEpoch() const {
+            return allocation_epoch_.value_or(0);
+        }
+        uint64_t allocationExtent() const {
+            return allocation_size_.value_or(size_);
+        }
         YLT_REFL(Descriptor, size_, buffer_address_, protocol_,
-                 transport_endpoint_);
+                 transport_endpoint_, allocation_epoch_, allocation_size_,
+                 segment_id_);
     };
 
     void change_to_cxl(std::string client_segment_name);
@@ -172,6 +185,8 @@ class AllocatedBuffer {
     // RAII handle for buffer allocated by offset allocator
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};
+    int64_t allocation_epoch_{0};
+    UUID segment_id_{};
 
     friend class Replica;
     friend class SegmentAllocatorRegistration;
@@ -392,6 +407,11 @@ class OffsetBufferAllocator
 
     void deallocate(AllocatedBuffer* handle) override;
 
+    void setAllocationEpoch(int64_t epoch) { allocation_epoch_ = epoch; }
+    std::unique_ptr<AllocatedBuffer> AllocateForRebuild(size_t size,
+                                                        void* address,
+                                                        size_t extent = 0);
+
     size_t capacity() const override { return total_size_; }
     size_t size() const override { return GetUsageBytes(); }
     uintptr_t base() const override { return base_; }
@@ -421,6 +441,7 @@ class OffsetBufferAllocator
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
+    int64_t allocation_epoch_{0};
 };
 
 struct RestoredOffsetBufferAllocator {
