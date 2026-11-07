@@ -5,7 +5,7 @@ set(prefix
 file(REMOVE_RECURSE "${prefix}")
 
 get_filename_component(library_dir "${TRANSFER_ENGINE_LIBRARY}" DIRECTORY)
-if("@BUILD_SHARED_LIBS@")
+if("@MOONCAKE_LIBRARY_TYPE@" STREQUAL "SHARED")
   set(consumer_flags "${TRANSFER_ENGINE_LIBRARY}" "-Wl,-rpath,${library_dir}"
                      -o "${prefix}/consumer")
 else()
@@ -46,7 +46,7 @@ if(NOT compile_result EQUAL 0)
   )
 endif()
 
-if(NOT "@BUILD_SHARED_LIBS@")
+if(NOT "@MOONCAKE_LIBRARY_TYPE@" STREQUAL "SHARED")
   return()
 endif()
 
