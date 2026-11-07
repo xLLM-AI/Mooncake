@@ -319,6 +319,11 @@ class TransferEngine {
 
     int syncSegmentCache(const std::string& segment_name = "");
 
+    // Republish existing registration metadata without rebuilding the engine.
+    // Native TENT advertises its RPC endpoint in the segment descriptor.
+    int republishLocalMetadata(const std::string& server_name,
+                               bool rpc_metadata);
+
     std::shared_ptr<TransferMetadata> getMetadata();
 
     bool checkOverlap(void* addr, uint64_t length);

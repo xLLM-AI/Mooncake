@@ -15,6 +15,7 @@
 #include "tent/transfer_engine.h"
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/runtime/control_plane.h"
 #include "tent/runtime/topology.h"
 #include <glog/logging.h>
 
@@ -82,6 +83,12 @@ Status TransferEngine::closeSegment(SegmentID handle) {
 
 Status TransferEngine::getSegmentInfo(SegmentID handle, SegmentInfo& info) {
     return impl_->getSegmentInfo(handle, info);
+}
+
+Status TransferEngine::synchronizeLocalMetadata() {
+    if (!impl_->available())
+        return Status::InvalidEntry("Transfer engine is unavailable");
+    return impl_->metadata_->segmentManager().synchronizeLocal();
 }
 
 Status TransferEngine::allocateLocalMemory(void** addr, size_t size,

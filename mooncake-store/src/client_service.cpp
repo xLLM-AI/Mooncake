@@ -6243,12 +6243,8 @@ void Client::StorageHeartbeatThreadMain() {
             return master_client_.ReMountSegment(segments);
         };
         auto publish_metadata = [&](bool rpc) -> tl::expected<void, ErrorCode> {
-            auto metadata = transfer_engine_->getMetadata();
-            if (!metadata)
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             const int rc =
-                rpc ? metadata->rePublishRpcMetaEntry(local_hostname_)
-                    : metadata->updateLocalSegmentDesc();
+                transfer_engine_->republishLocalMetadata(local_hostname_, rpc);
             (rpc ? rpc_meta_publish_pending_ : segment_desc_publish_pending_)
                 .store(rc != 0);
             if (rc != 0) return tl::make_unexpected(ErrorCode::RPC_FAIL);
