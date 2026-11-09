@@ -197,6 +197,15 @@ endif()
 add_store_test(master_metrics_test master_metrics_test.cpp)
 add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
+if(TARGET Mooncake::liburing)
+  # Compile the same production implementation into this test so linker
+  # wrappers also work when mooncake_store itself is a shared library.
+  target_sources(posix_file_test PRIVATE ../src/uring_file.cpp)
+  target_link_options(
+    posix_file_test PRIVATE "LINKER:--wrap=io_uring_submit_and_wait"
+    "LINKER:--wrap=io_uring_unregister_buffers")
+endif()
+set_tests_properties(posix_file_test PROPERTIES TIMEOUT 180)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 add_store_test(nvmeof_initiator_test nvmeof_initiator_test.cpp)

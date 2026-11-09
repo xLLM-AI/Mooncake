@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <fcntl.h>
@@ -25,9 +26,31 @@
 #include "file_interface.h"
 #include "../src/iovec_cursor.h"
 #include "../src/uring_submit.h"
-#include "../src/uring_test_hooks.h"
 #ifdef USE_URING
 #include <liburing.h>
+
+// Linker wrappers are test-local: production exposes no reset/exit hook.
+namespace {
+thread_local bool fail_next_uring_submit = false;
+thread_local std::function<void()>* before_uring_unregister = nullptr;
+}  // namespace
+extern "C" int __real_io_uring_submit_and_wait(struct io_uring*, unsigned);
+extern "C" int __wrap_io_uring_submit_and_wait(struct io_uring* ring,
+                                               unsigned wait_nr) {
+    if (fail_next_uring_submit) {
+        fail_next_uring_submit = false;
+        return -EIO;
+    }
+    return __real_io_uring_submit_and_wait(ring, wait_nr);
+}
+extern "C" int __real_io_uring_unregister_buffers(struct io_uring*);
+extern "C" int __wrap_io_uring_unregister_buffers(struct io_uring* ring) {
+    // Consume before calling: the controlled thread exit pauses only once.
+    auto* hook = before_uring_unregister;
+    before_uring_unregister = nullptr;
+    if (hook) (*hook)();
+    return __real_io_uring_unregister_buffers(ring);
+}
 #endif
 
 namespace mooncake {
@@ -1006,7 +1029,10 @@ TEST_F(PosixFileTest, UringResetRingReclonesTheRegistration) {
     ASSERT_TRUE(fixed);
 
     worker.run([&] {
-        uring_testing::reset_thread_ring();
+        fail_next_uring_submit = true;
+        EXPECT_FALSE(uringReadBlock(test_fd, test_filename, buffer.base(), 0,
+                                    'A', nullptr));
+        EXPECT_FALSE(fail_next_uring_submit);
         ok = uringReadBlock(test_fd, test_filename,
                             buffer.base() + UringRemappableBuffer::kBlock, 1,
                             'B', &fixed);
@@ -1034,23 +1060,42 @@ TEST_F(PosixFileTest, UringUnregisterWaitsForAnExitingThreadsClone) {
     ASSERT_TRUE(UringFile::register_global_buffer(buffer.base(),
                                                   UringRemappableBuffer::kLen));
 
-    std::atomic<bool> exiting{false};
-    std::atomic<bool> hooked{false};
-    uring_testing::set_ring_exit_hook([&] {
-        if (hooked.exchange(true)) return;
-        exiting = true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    });
+    std::promise<void> exiting, release_exit, unregister_entered;
+    auto exit_started = exiting.get_future();
+    auto release = release_exit.get_future().share();
+    auto unregister_started = unregister_entered.get_future();
     bool ok = false, fixed = false;
+    // Lives until reader.join(), including the reader's TLS destruction.
+    std::function<void()> on_exit = [&] {
+        exiting.set_value();
+        release.wait();
+    };
     std::thread reader([&] {
         ok = uringReadBlock(test_fd, test_filename, buffer.base(), 0, 'A',
                             &fixed);
+        before_uring_unregister = &on_exit;
     });
-    while (!exiting) std::this_thread::yield();
-    UringFile::unregister_global_buffer();
-    const long pinned_after = pinnedKib();
+    const auto exit_status = exit_started.wait_for(std::chrono::seconds(10));
+    if (exit_status != std::future_status::ready) {
+        release_exit.set_value();
+        reader.join();
+        UringFile::unregister_global_buffer();
+    }
+    ASSERT_EQ(exit_status, std::future_status::ready);
+    auto unregistered = std::async(std::launch::async, [&] {
+        unregister_entered.set_value();
+        UringFile::unregister_global_buffer();
+        return pinnedKib();
+    });
+    unregister_started.wait();
+    // The exiting ring holds the source lock until its clone is unpinned.
+    EXPECT_EQ(unregistered.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    release_exit.set_value();
+    EXPECT_EQ(unregistered.wait_for(std::chrono::seconds(10)),
+              std::future_status::ready);
+    const long pinned_after = unregistered.get();
     reader.join();
-    uring_testing::set_ring_exit_hook(nullptr);
 
     EXPECT_TRUE(ok);
     EXPECT_TRUE(fixed);
@@ -1272,6 +1317,26 @@ static bool UringAvailable() {
     if (io_uring_queue_init(2, &ring, 0) < 0) return false;
     io_uring_queue_exit(&ring);
     return true;
+}
+
+// Exercise actual error recovery through public I/O even on pre-clone systems.
+TEST_F(PosixFileTest, UringFailedSubmissionRecreatesRingForNextRead) {
+    if (!UringAvailable()) GTEST_SKIP() << "io_uring is unavailable";
+    constexpr std::string_view data = "after-reset";
+    ASSERT_EQ(pwrite(test_fd, data.data(), data.size(), 0),
+              static_cast<ssize_t>(data.size()));
+    int fd = dup(test_fd);
+    ASSERT_GE(fd, 0);
+    UringFile file(test_filename, fd, 32, false);
+    std::array<char, data.size()> buf{};
+    UringFile::ReadDesc desc{buf.data(), buf.size(), 0};
+    fail_next_uring_submit = true;
+    EXPECT_FALSE(file.batch_read(&desc, 1));
+    EXPECT_FALSE(fail_next_uring_submit);
+    ASSERT_TRUE(file.batch_read(&desc, 1));
+    EXPECT_EQ(desc.error, ErrorCode::OK);
+    EXPECT_EQ(desc.bytes_read, data.size());
+    EXPECT_EQ(std::string_view(buf.data(), buf.size()), data);
 }
 
 // A failed CQE keeps its errno, as a failed syscall does in PosixFile.
