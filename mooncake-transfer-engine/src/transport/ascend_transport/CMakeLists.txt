@@ -52,6 +52,10 @@ else()
 endif()
 
 target_link_libraries(ascend_transport PRIVATE glog::glog)
+if(MOONCAKE_LIBRARY_TYPE STREQUAL "STATIC")
+    # Declare the existing config/transport archive cycle for CMake's rescans.
+    target_link_libraries(ascend_transport PRIVATE transfer_engine)
+endif()
 
 if (USE_ASCEND)
     target_link_libraries(ascend_transport PRIVATE ascend_transport_mem)

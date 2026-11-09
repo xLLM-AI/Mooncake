@@ -52,6 +52,7 @@
 #include "promotion_candidate_tracker.h"
 #include "rpc_types.h"
 #include "replica.h"
+#include "rebuild_types.h"
 #include "ha/ha_types.h"
 #include "ha/snapshot/batch_oplog/promotion.h"
 #include "task_manager.h"
@@ -198,6 +199,22 @@ class MasterService {
      */
     auto ReMountSegment(const std::vector<Segment>& segments,
                         const UUID& client_id) -> tl::expected<void, ErrorCode>;
+
+    std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
+
+    /**
+     * @brief HA rebuild: accept object-level metadata (key -> replica location)
+     * resent by a client after the master restarted empty, and rebuild it into
+     * the tenant object route. For an existing key, MERGE the incoming
+     * replica(s) (multi-replica redundancy recovery) rather than skipping.
+     * Idempotent per (endpoint,address).
+     */
+    auto RebuildMetadata(const std::vector<KeyReplicaEntry>& entries,
+                         const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
+
+    tl::expected<KeyReplicaEntry, ErrorCode> GetCommittedRebuildEntry(
+        const std::string& key, const std::string& tenant_id);
 
     /**
      * @brief Re-mount NoF SSD segments, invoked when the client is the first
@@ -1287,6 +1304,11 @@ class MasterService {
 
     mutable SoftPinDeadlineIndex soft_pin_deadline_index_;
 
+    std::optional<Replica> DescriptorToReplica(const Replica::Descriptor& desc);
+    static void AdvanceReplicaIdHighWaterMark(ReplicaID next_id);
+    bool ReplicaAlreadyPresent(const ObjectMetadata& meta,
+                               const Replica::Descriptor& descriptor) const;
+
     static bool HasCompletedMemoryCacheReplica(const ObjectMetadata& metadata);
     static bool HasCompletedDiskCacheReplica(const ObjectMetadata& metadata);
     static void SyncCacheTotalAccounting(ObjectMetadata& metadata);
@@ -1918,6 +1940,7 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     ViewVersionId view_version_;
+    const int64_t allocation_epoch_;
 
     // Client related members
     mutable std::shared_mutex client_mutex_;

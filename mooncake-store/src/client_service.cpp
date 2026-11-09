@@ -5,6 +5,8 @@
 
 #include "ascii_string.h"
 #include "allocator.h"
+#include "rebuild_retry.h"
+#include "common/base64.h"
 #include "segment.h"
 #include "nof/nof_runtime.h"
 
@@ -72,6 +74,12 @@ namespace {
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
+
+// Notifications travel as JSON strings: binary struct_pack needs base64.
+std::string EncodeRebuildNotify(const RebuildNotify& notification) {
+    const auto bytes = struct_pack::serialize(notification);
+    return base64::Encode(std::string(bytes.begin(), bytes.end()));
+}
 
 class ScopedObjectChecksumBuffer {
    public:
@@ -468,6 +476,8 @@ Client::Client(const std::string& local_hostname,
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
+    const char* rebuild = std::getenv("MC_ENABLE_HA_REBUILD");
+    enable_ha_rebuild_ = rebuild && std::string_view(rebuild) == "1";
     LOG(INFO) << "client_id=" << client_id_;
     if (!host_id_.empty()) {
         LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
@@ -500,6 +510,12 @@ Client::~Client() {
     storage_heartbeat_running_ = false;
     if (storage_heartbeat_thread_.joinable()) {
         storage_heartbeat_thread_.join();
+    }
+
+    // === HA rebuild: stop the notify-receiving loop (set flag then join).
+    rebuild_notify_thread_running_.store(false);
+    if (rebuild_notify_thread_.joinable()) {
+        rebuild_notify_thread_.join();
     }
 
     leader_monitor_running_ = false;
@@ -831,10 +847,26 @@ void Client::EnterHaRuntimeMode() {
 }
 
 ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
-    if (!metrics_) return master_client_.Connect(address);
-
-    return metrics_->master_heartbeat_metric.ObserveConnect(
-        [this, &address] { return master_client_.Connect(address); });
+    if (enable_ha_rebuild_) {
+        std::lock_guard lock(local_replica_table_mutex_);
+        rebuild_connection_pending_ = true;
+        ++rebuild_connection_generation_;
+    }
+    auto result =
+        metrics_
+            ? metrics_->master_heartbeat_metric.ObserveConnect(
+                  [this, &address] { return master_client_.Connect(address); })
+            : master_client_.Connect(address);
+    if (!enable_ha_rebuild_) return result;
+    if (result != ErrorCode::OK) {
+        ++rebuild_connection_generation_;
+        return result;
+    }
+    auto ping = master_client_.Ping();
+    const auto generation = ++rebuild_connection_generation_;
+    if (!ping) return ping.error();
+    return ObserveRebuildEpoch(*ping, generation) ? ErrorCode::OK
+                                                  : ErrorCode::INVALID_VERSION;
 }
 
 ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
@@ -1321,6 +1353,12 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         LOG(ERROR) << "Failed to initialize local hot cache";
     }
 
+    if (client->enable_ha_rebuild_) {
+        client->rebuild_notify_thread_running_.store(true);
+        client->rebuild_notify_thread_ =
+            std::thread(&Client::RebuildNotifyLoop, client.get());
+    }
+
     return client;
 }
 
@@ -1561,7 +1599,7 @@ tl::expected<uint64_t, ErrorCode> Client::ComputeObjectChecksumForSlices(
 tl::expected<void, ErrorCode> Client::VerifyObjectChecksum(
     const std::string& object_key, const std::vector<Slice>& slices,
     size_t object_size, std::optional<uint64_t> expected_checksum) {
-    if (!object_checksum_enabled_) {
+    if (!object_checksum_enabled_ && !enable_ha_rebuild_) {
         return {};
     }
     if (!expected_checksum.has_value()) {
@@ -2080,7 +2118,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
     std::optional<uint64_t> object_checksum;
-    if (object_checksum_enabled_) {
+    if (object_checksum_enabled_ || enable_ha_rebuild_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
             key, slices, CalculateSliceSize(slices));
         if (!checksum_result) {
@@ -2116,6 +2154,16 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
             VLOG(1) << "object_already_exists key=" << key;
+            // Already committed: ownership maintenance must not turn an
+            // idempotent Put into a failure (or wait for an offline owner).
+            auto recorded = BatchRecordCommittedReplicas(
+                {key}, master_client_.tenant_id(), false);
+            if (!recorded.front()) {
+                if (metrics_) metrics_->rebuild_failed_batches.inc();
+                LOG(WARNING)
+                    << "Ownership maintenance for existing key=" << key
+                    << " failed: " << toString(recorded.front().error());
+            }
             return {};
         }
         if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
@@ -2232,6 +2280,568 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         return tl::unexpected(finalize_decision.error);
     }
 
+    {
+        auto recorded = RecordCommittedReplicas(
+            key, master_client_.tenant_id(),
+            finalize_decision.end_type == ReplicaType::MEMORY ||
+                finalize_decision.end_type == ReplicaType::ALL);
+        if (!recorded) return recorded;
+    }
+
+    return {};
+}
+
+// HA ownership recording and bounded acknowledgement retries.
+
+tl::expected<void, ErrorCode> Client::RecordCommittedReplicas(
+    const std::string& key, const std::string& tenant_id,
+    bool memory_committed) {
+    if (!enable_ha_rebuild_ || !memory_committed) return {};
+    return BatchRecordCommittedReplicas({key}, tenant_id).front();
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchRecordCommittedReplicas(
+    const std::vector<std::string>& keys, const std::string& tenant_id,
+    bool wait_for_ack) {
+    std::vector<tl::expected<void, ErrorCode>> results(keys.size());
+    if (!enable_ha_rebuild_ || keys.empty()) return results;
+    auto committed =
+        master_client_.BatchGetCommittedRebuildEntries(keys, tenant_id);
+    if (committed.size() != keys.size())
+        return {keys.size(), tl::make_unexpected(ErrorCode::RPC_FAIL)};
+    struct OwnerBatch {
+        std::vector<KeyReplicaEntry> entries;
+        std::vector<size_t> indices;
+    };
+    std::unordered_map<std::string, OwnerBatch> by_endpoint;
+    for (size_t index = 0; index < committed.size(); ++index) {
+        if (!committed[index]) {
+            results[index] = tl::make_unexpected(committed[index].error());
+            continue;
+        }
+        auto& entry = *committed[index];
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>> owned;
+        for (const auto& replica : entry.replicas) {
+            if (!replica.is_memory_replica()) continue;
+            const auto& endpoint = RebuildBuffer(replica).transport_endpoint_;
+            owned[endpoint].push_back(replica);
+        }
+        for (auto& [endpoint, replicas] : owned) {
+            entry.replicas = std::move(replicas);
+            auto& batch = by_endpoint[endpoint];
+            batch.entries.push_back(entry);
+            batch.indices.push_back(index);
+        }
+    }
+    std::vector<NotifyTicket> tickets;
+    tickets.reserve(by_endpoint.size());
+    std::vector<std::vector<size_t>> request_indices;
+    for (auto& [endpoint, batch] : by_endpoint) {
+        if (IsMyEndpoint(endpoint)) {
+            auto result = ApplyOwnedRebuildEntries(batch.entries);
+            if (!result)
+                for (const auto index : batch.indices)
+                    results[index] = tl::make_unexpected(result.error());
+        } else {
+            tickets.emplace_back(ParkPendingNotify(endpoint, batch.entries));
+            request_indices.emplace_back(std::move(batch.indices));
+        }
+    }
+    if (wait_for_ack && !tickets.empty() && !WaitForPendingNotifies(tickets)) {
+        std::lock_guard<std::mutex> lock(pending_notifies_mutex_);
+        for (size_t i = 0; i < tickets.size(); ++i) {
+            if (tickets[i]->state == PendingRebuildNotify::State::ACKED)
+                continue;
+            for (const auto index : request_indices[i])
+                if (results[index])
+                    results[index] = tl::make_unexpected(tickets[i]->error);
+        }
+    }
+    return results;
+}
+
+bool Client::IsMyEndpoint(const std::string& ep) {
+    std::lock_guard<std::mutex> lk(mounted_segments_mutex_);
+    for (const auto& [id, seg] : mounted_segments_) {
+        if (seg.te_endpoint == ep) return true;
+    }
+    return false;
+}
+
+void Client::SendUpsertNotify(const std::string& ep,
+                              const std::vector<KeyReplicaEntry>& entries,
+                              uint64_t request_id) {
+    RebuildNotify n;
+    n.sender_client_id = UuidToString(client_id_);
+    n.op = RebuildNotifyOp::UPSERT;
+    n.entries = entries;
+    n.request_id = request_id;
+    n.reply_endpoint = GetSegmentEndpoint();
+    TransferMetadata::NotifyDesc desc;
+    desc.name = n.sender_client_id;
+    desc.notify_msg = EncodeRebuildNotify(n);
+    int rc = transfer_engine_->sendNotifyByName(ep, desc);
+    if (rc != 0) {
+        LOG(WARNING) << "sendNotify UPSERT to " << ep << " rc=" << rc
+                     << " (will retry)";
+    }
+}
+
+void Client::DropPendingNotifyLocked(uint64_t request_id, const char* reason,
+                                     bool capacity) {
+    auto it = pending_notifies_.find(request_id);
+    if (it == pending_notifies_.end()) return;
+    auto& ticket = *it->second;
+    ticket.state = PendingRebuildNotify::State::DROPPED;
+    pending_notify_entries_ -= ticket.entries.size();
+    pending_notify_bytes_ -= ticket.encoded_entries.size();
+    pending_notifies_.erase(it);
+    if (metrics_) {
+        metrics_->rebuild_failed_batches.inc();
+        if (capacity) metrics_->rebuild_notify_capacity_drops.inc();
+    }
+    LOG(WARNING) << "[HA-REBUILD] dropped ownership notification request="
+                 << request_id << " reason=" << reason;
+    pending_notifies_cv_.notify_all();
+}
+
+Client::NotifyTicket Client::ParkPendingNotify(
+    const std::string& ep, const std::vector<KeyReplicaEntry>& entries) {
+    auto encoded = struct_pack::serialize(entries);
+    std::lock_guard<std::mutex> lk(pending_notifies_mutex_);
+    // Coalesce exact retries only. Replacing a different version/key could
+    // incorrectly ACK the writer whose record was overwritten.
+    for (const auto& [id, pending] : pending_notifies_) {
+        if (pending->endpoint == ep && pending->encoded_entries == encoded)
+            return pending;
+    }
+    auto ticket = std::make_shared<PendingRebuildNotify>();
+    ticket->endpoint = ep;
+    ticket->request_id = next_notify_id_++;
+    ticket->created_at = ticket->next_retry = std::chrono::steady_clock::now();
+    // Reserve room for other owners. Capacity pressure may evict only this
+    // endpoint's own work, never an unrelated writer awaiting a healthy ACK.
+    const auto reject = [&] {
+        ticket->state = PendingRebuildNotify::State::DROPPED;
+        if (metrics_) {
+            metrics_->rebuild_failed_batches.inc();
+            metrics_->rebuild_notify_capacity_drops.inc();
+        }
+        LOG(WARNING) << "[HA-REBUILD] ownership queue capacity exceeded ep="
+                     << ep;
+        return ticket;
+    };
+    if (entries.size() > kMaxPendingNotifyEntries / 4 ||
+        encoded.size() > kMaxPendingNotifyBytes / 4)
+        return reject();
+    for (;;) {
+        size_t messages = 0, entry_count = entries.size(),
+               bytes = encoded.size();
+        auto oldest = pending_notifies_.end();
+        for (auto it = pending_notifies_.begin(); it != pending_notifies_.end();
+             ++it) {
+            if (it->second->endpoint != ep) continue;
+            ++messages;
+            entry_count += it->second->entries.size();
+            bytes += it->second->encoded_entries.size();
+            if (oldest == pending_notifies_.end() || it->first < oldest->first)
+                oldest = it;
+        }
+        if (messages < kMaxPendingNotifies / 4 &&
+            entry_count <= kMaxPendingNotifyEntries / 4 &&
+            bytes <= kMaxPendingNotifyBytes / 4 &&
+            pending_notifies_.size() < kMaxPendingNotifies &&
+            pending_notify_entries_ + entries.size() <=
+                kMaxPendingNotifyEntries &&
+            pending_notify_bytes_ + encoded.size() <= kMaxPendingNotifyBytes)
+            break;
+        if (oldest == pending_notifies_.end()) return reject();
+        DropPendingNotifyLocked(oldest->first, "endpoint capacity", true);
+    }
+    ticket->entries = entries;
+    ticket->encoded_entries = std::move(encoded);
+    pending_notify_entries_ += entries.size();
+    pending_notify_bytes_ += ticket->encoded_entries.size();
+    pending_notifies_.emplace(ticket->request_id, ticket);
+    return ticket;
+}
+
+void Client::FlushPendingNotifies() {
+    std::vector<NotifyTicket> due;
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(pending_notifies_mutex_);
+        for (auto it = pending_notifies_.begin();
+             it != pending_notifies_.end();) {
+            auto ticket = (it++)->second;
+            if (now - ticket->created_at >= kNotifyTtl ||
+                (ticket->attempts >= kMaxNotifyAttempts &&
+                 now >= ticket->next_retry)) {
+                DropPendingNotifyLocked(ticket->request_id, "retry/TTL limit");
+                continue;
+            }
+            // Bound each sweep; copy shared tickets, not the entire table.
+            if (now < ticket->next_retry || due.size() >= 64) continue;
+            const auto delay = std::chrono::milliseconds(
+                std::min<int64_t>(100LL << ticket->attempts, 10000));
+            ++ticket->attempts;
+            ticket->next_retry = now + delay;
+            due.emplace_back(std::move(ticket));
+        }
+    }
+    for (const auto& ticket : due)
+        SendUpsertNotify(ticket->endpoint, ticket->entries, ticket->request_id);
+}
+
+bool Client::WaitForPendingNotifies(const std::vector<NotifyTicket>& tickets) {
+    std::unique_lock<std::mutex> lock(pending_notifies_mutex_);
+    pending_notifies_cv_.wait_for(
+        lock, std::chrono::milliseconds(rebuild_notify_timeout_ms_.load()),
+        [&] {
+            return std::all_of(
+                tickets.begin(), tickets.end(), [](const auto& t) {
+                    return t->state != PendingRebuildNotify::State::PENDING;
+                });
+        });
+    // Expiration/eviction is failure, never an acknowledgement.
+    return std::all_of(tickets.begin(), tickets.end(), [](const auto& t) {
+        return t->state == PendingRebuildNotify::State::ACKED;
+    });
+}
+
+bool Client::ObserveRebuildEpoch(const PingResponse& response,
+                                 uint64_t connection_generation) {
+    std::lock_guard lock(local_replica_table_mutex_);
+    // A pre-connect/in-progress heartbeat cannot confirm the new endpoint.
+    // A fresh heartbeat may finish the handshake after a transient Ping error.
+    if ((connection_generation & 1) ||
+        connection_generation != rebuild_connection_generation_.load())
+        return false;
+    const auto epoch =
+        response.allocation_epoch.value_or(response.view_version_id);
+    if (epoch < rebuild_master_epoch_) return false;
+    rebuild_master_epoch_ = epoch;
+    rebuild_notify_view_ = response.view_version_id;
+    rebuild_connection_pending_ = false;
+    return true;
+}
+
+bool Client::IsActiveOwnedReplica(const Replica::Descriptor& replica) const {
+    const auto& buffer = RebuildBuffer(replica);
+    return std::any_of(
+        mounted_segments_.begin(), mounted_segments_.end(),
+        [&](const auto& mounted) {
+            const auto& segment = mounted.second;
+            return segment.te_endpoint == buffer.transport_endpoint_ &&
+                   (!buffer.segment_id_ || *buffer.segment_id_ == segment.id) &&
+                   buffer.buffer_address_ >= segment.base &&
+                   buffer.buffer_address_ - segment.base < segment.size &&
+                   buffer.allocationExtent() <=
+                       segment.size - (buffer.buffer_address_ - segment.base);
+        });
+}
+
+void Client::UpdateRebuildFenceMetrics() {
+    const auto usage = local_replica_table_.GetFenceUsage();
+    if (metrics_) {
+        metrics_->rebuild_fence_keys.update(usage.keys);
+        metrics_->rebuild_fence_bytes.update(usage.bytes);
+        metrics_->rebuild_fence_ranges.update(usage.ranges);
+    }
+    const bool near = usage.near_limit();
+    if (near && !rebuild_fence_warned_)
+        LOG(WARNING) << "[HA-REBUILD] ownership fences at or above 80% budget: "
+                     << "keys=" << usage.keys << "/" << usage.key_limit
+                     << " bytes=" << usage.bytes << "/" << usage.byte_limit
+                     << " ranges=" << usage.ranges << "/" << usage.range_limit;
+    rebuild_fence_warned_ = near;
+}
+
+tl::expected<void, ErrorCode> Client::ApplyOwnedRebuildEntries(
+    const std::vector<KeyReplicaEntry>& entries) {
+    std::vector<KeyReplicaEntry> replay;
+    ViewVersionId view;
+    int64_t epoch;
+    uint64_t replay_id = 0;
+    {
+        // Same short lock order as unmount. A validated allocation cannot be
+        // inserted after its segment has been successfully removed.
+        std::lock_guard segments_lock(mounted_segments_mutex_);
+        std::lock_guard table_lock(local_replica_table_mutex_);
+        for (const auto& entry : entries) {
+            if (entry.replicas.empty() || entry.size == 0)
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            for (const auto& replica : entry.replicas) {
+                if (!replica.is_memory_replica())
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                const auto& buffer = RebuildBuffer(replica);
+                if (buffer.size_ != entry.size ||
+                    buffer.allocationExtent() < entry.size)
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                const bool owned = IsActiveOwnedReplica(replica);
+                if (!owned)
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+        view = rebuild_replay_view_.value_or(rebuild_notify_view_);
+        epoch = rebuild_master_epoch_;
+        for (const auto& entry : entries) {
+            auto canonical = entry;
+            if (canonical.tenant_id.empty()) canonical.tenant_id = "default";
+            canonical.version = GetRebuildVersion(canonical);
+            auto needed = canonical;
+            needed.replicas.clear();
+            for (const auto& replica : canonical.replicas) {
+                auto recorded = local_replica_table_.Record(canonical, replica);
+                UpdateRebuildFenceMetrics();
+                if (!recorded) {
+                    // Earlier entries/replicas may already need replay. A
+                    // later admission failure must not let completion pass;
+                    // a subsequent snapshot covers this failed work ticket.
+                    if (!replay.empty() || !needed.replicas.empty()) {
+                        owned_replay_pending_[next_owned_replay_id_++] = true;
+                        rebuild_retry_pending_.store(true);
+                        owned_replay_cv_.notify_all();
+                    }
+                    if (metrics_) {
+                        metrics_->rebuild_failed_batches.inc();
+                        metrics_->rebuild_fence_exhausted.inc();
+                    }
+                    LOG(WARNING) << "[HA-REBUILD] REBUILD_FENCE_EXHAUSTED: "
+                                    "ownership history, not segment space";
+                    return tl::make_unexpected(recorded.error());
+                }
+                if (local_replica_table_.NeedsReplay(canonical, replica, epoch))
+                    needed.replicas.push_back(replica);
+            }
+            if (!needed.replicas.empty()) replay.push_back(std::move(needed));
+        }
+        if (rebuild_connection_pending_) {
+            rebuild_retry_pending_.store(true);
+            return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+        }
+        if (!replay.empty()) {
+            replay_id = next_owned_replay_id_++;
+            owned_replay_pending_[replay_id] = false;
+        }
+    }
+    if (!replay_id) return {};
+    auto result = ReplayRebuildEntries(replay, view);
+    {
+        std::lock_guard lock(local_replica_table_mutex_);
+        auto pending = owned_replay_pending_.find(replay_id);
+        if (pending != owned_replay_pending_.end()) {
+            if (result) {
+                for (const auto& entry : replay)
+                    local_replica_table_.MarkReplayed(entry, epoch);
+                owned_replay_pending_.erase(pending);
+            } else {
+                pending->second = true;
+                rebuild_retry_pending_.store(true);
+            }
+        }
+        owned_replay_cv_.notify_all();
+    }
+    return result;
+}
+
+// --- notify receive loop -----------------------------------------------------
+void Client::RebuildNotifyLoop() {
+    while (rebuild_notify_thread_running_.load()) {
+        FlushPendingNotifies();
+        std::vector<TransferMetadata::NotifyDesc> notifies;
+        int rc = rebuild_notifies_paused_.load()
+                     ? -1
+                     : transfer_engine_->getNotifies(notifies);
+        if (rc == 0) {
+            for (auto& notification : notifies) {
+                // Reverse of the send side: base64-decode the JSON-carried
+                // string back to binary, then struct_pack-deserialize.
+                std::string bin = base64::Decode(notification.notify_msg);
+                RebuildNotify n;
+                auto ec =
+                    struct_pack::deserialize_to(n, bin.data(), bin.size());
+                if (ec != struct_pack::errc::ok) continue;
+                if (n.op == RebuildNotifyOp::ACK ||
+                    n.op == RebuildNotifyOp::NACK) {
+                    if (n.sender_client_id != UuidToString(client_id_))
+                        continue;
+                    std::lock_guard<std::mutex> lock(pending_notifies_mutex_);
+                    auto pending = pending_notifies_.find(n.request_id);
+                    if (pending != pending_notifies_.end() &&
+                        pending->second->endpoint == n.reply_endpoint) {
+                        auto& ticket = *pending->second;
+                        ticket.state =
+                            n.op == RebuildNotifyOp::ACK
+                                ? PendingRebuildNotify::State::ACKED
+                                : PendingRebuildNotify::State::REJECTED;
+                        if (n.op == RebuildNotifyOp::NACK) {
+                            ticket.error =
+                                n.error.value_or(ErrorCode::INVALID_PARAMS);
+                            if (ticket.error == ErrorCode::OK)
+                                ticket.error = ErrorCode::INVALID_PARAMS;
+                        }
+                        pending_notify_entries_ -= ticket.entries.size();
+                        pending_notify_bytes_ -= ticket.encoded_entries.size();
+                        pending_notifies_.erase(pending);
+                        pending_notifies_cv_.notify_all();
+                    }
+                    continue;
+                }
+                if (n.op != RebuildNotifyOp::UPSERT) continue;
+                auto applied = ApplyOwnedRebuildEntries(n.entries);
+                RebuildNotify acknowledgement;
+                acknowledgement.sender_client_id = n.sender_client_id;
+                acknowledgement.op =
+                    applied ? RebuildNotifyOp::ACK : RebuildNotifyOp::NACK;
+                if (!applied) acknowledgement.error = applied.error();
+                acknowledgement.request_id = n.request_id;
+                acknowledgement.reply_endpoint = GetSegmentEndpoint();
+                TransferMetadata::NotifyDesc reply;
+                reply.name = UuidToString(client_id_);
+                reply.notify_msg = EncodeRebuildNotify(acknowledgement);
+                transfer_engine_->sendNotifyByName(n.reply_endpoint, reply);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+// --- reconnect resend --------------------------------------------------------
+// On reconnect, snapshot the local table and resend it (batched) to the empty
+// new master via the RebuildMetadata RPC.
+tl::expected<void, ErrorCode> Client::ReplayRebuildEntries(
+    std::vector<KeyReplicaEntry>& entries, ViewVersionId view_version) {
+    // ACK loss can leave an old ownership record after its bytes were reused.
+    // Validate while mounted; never hold a memory/table lock across the RPC.
+    for (auto& entry : entries) {
+        std::optional<ErrorCode> error;
+        std::erase_if(
+            entry.replicas, [&](const auto& replica) {
+                if (error || !replica.is_memory_replica()) return false;
+                const auto& buffer = RebuildBuffer(replica);
+                if (!entry.size || buffer.size_ != entry.size ||
+                    buffer.allocationExtent() < entry.size)
+                    return false;
+                std::lock_guard segments_lock(mounted_segments_mutex_);
+                auto checked =
+                    IsActiveOwnedReplica(replica)
+                        ? VerifyObjectChecksum(
+                              entry.key,
+                              {{reinterpret_cast<void*>(buffer.buffer_address_),
+                                entry.size}},
+                              entry.size,
+                              entry.object_checksum.value_or(std::nullopt))
+                        : tl::expected<void, ErrorCode>(tl::make_unexpected(
+                              ErrorCode::CHECKSUM_MISMATCH));
+                if (checked) return false;
+                if (checked.error() != ErrorCode::CHECKSUM_MISMATCH) {
+                    error = checked.error();
+                    return false;
+                }
+                auto rejected = entry;
+                rejected.replicas = {replica};
+                std::lock_guard table_lock(local_replica_table_mutex_);
+                local_replica_table_.ForgetSnapshotEntry(rejected);
+                UpdateRebuildFenceMetrics();
+                if (metrics_) metrics_->rebuild_failed_batches.inc();
+                LOG(WARNING)
+                    << "[HA-REBUILD] discarding changed/retired replica key="
+                    << entry.key;
+                return true;
+            });
+        if (error) return tl::make_unexpected(*error);
+    }
+    std::erase_if(entries,
+                  [](const auto& entry) { return entry.replicas.empty(); });
+    if (entries.empty()) return {};
+    auto result = master_client_.RebuildMetadata(entries, view_version);
+    if (result || result.error() != ErrorCode::INVALID_PARAMS) return result;
+    // Keep the wire API unchanged. Isolate a poison row only on permanent
+    // validation failure; transport/stale-view failures must remain retryable.
+    for (const auto& entry : entries) {
+        result = master_client_.RebuildMetadata({entry}, view_version);
+        if (result) continue;
+        if (metrics_) metrics_->rebuild_failed_batches.inc();
+        if (result.error() != ErrorCode::INVALID_PARAMS) return result;
+        LOG(WARNING) << "[HA-REBUILD] quarantining invalid metadata key="
+                     << entry.key << " tenant=" << entry.tenant_id
+                     << " view=" << view_version;
+        std::lock_guard<std::mutex> lock(local_replica_table_mutex_);
+        if (rebuild_replay_view_ == view_version) {
+            local_replica_table_.ForgetSnapshotEntry(entry);
+            UpdateRebuildFenceMetrics();
+        }
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::ResendLocalReplicaTable(
+    ViewVersionId view_version) {
+    const auto generation = rebuild_connection_generation_.load();
+    auto ping = master_client_.Ping();
+    if (!ping) return tl::make_unexpected(ping.error());
+    if (!ObserveRebuildEpoch(*ping, generation))
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    const auto epoch = ping->allocation_epoch.value_or(ping->view_version_id);
+    std::vector<KeyReplicaEntry> snapshot;
+    uint64_t replay_cutoff;
+    {
+        std::lock_guard<std::mutex> lock(local_replica_table_mutex_);
+        if (rebuild_replay_view_ != view_version) owned_replay_pending_.clear();
+        rebuild_replay_view_ = view_version;
+        snapshot = local_replica_table_.Snapshot();
+        replay_cutoff = next_owned_replay_id_;
+    }
+    constexpr size_t kBatchSize = 256;
+    for (size_t i = 0; i < snapshot.size(); i += kBatchSize) {
+        std::vector<KeyReplicaEntry> batch(
+            snapshot.begin() + i,
+            snapshot.begin() + std::min(i + kBatchSize, snapshot.size()));
+        auto result = ReplayRebuildEntries(batch, view_version);
+        if (!result) {
+            if (metrics_) metrics_->rebuild_failed_batches.inc();
+            LOG(ERROR) << "RebuildMetadata resend failed: "
+                       << toString(result.error());
+            return tl::make_unexpected(result.error());
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(local_replica_table_mutex_);
+        if (rebuild_replay_view_ != view_version ||
+            rebuild_master_epoch_ != epoch) {
+            rebuild_retry_pending_.store(true);
+            return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+        }
+        // Snapshot covered older tickets, not notifications accepted during
+        // RPCs.
+        for (const auto& entry : snapshot)
+            local_replica_table_.MarkReplayed(entry, epoch);
+        owned_replay_pending_.erase(
+            owned_replay_pending_.begin(),
+            owned_replay_pending_.lower_bound(replay_cutoff));
+        owned_replay_cv_.notify_all();
+    }
+    rebuild_snapshot_count_.fetch_add(1);
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::WaitForOwnedReplays(
+    ViewVersionId view_version) {
+    std::unique_lock<std::mutex> lock(local_replica_table_mutex_);
+    owned_replay_cv_.wait_for(
+        lock, std::chrono::milliseconds(rebuild_notify_timeout_ms_.load()),
+        [&] {
+            return rebuild_replay_view_ != view_version ||
+                   owned_replay_pending_.empty() ||
+                   std::any_of(owned_replay_pending_.begin(),
+                               owned_replay_pending_.end(),
+                               [](const auto& entry) { return entry.second; });
+        });
+    if (rebuild_replay_view_ != view_version)
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    if (!owned_replay_pending_.empty())
+        return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
     return {};
 }
 
@@ -2298,7 +2908,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
     std::optional<uint64_t> object_checksum;
-    if (object_checksum_enabled_) {
+    if (object_checksum_enabled_ || enable_ha_rebuild_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
             key, slices, CalculateSliceSize(slices));
         if (!checksum_result) {
@@ -2416,6 +3026,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     const auto finalize_decision =
         DetermineFinalizeDecision(client_cfg, transfer_summary);
     if (finalize_decision.end_type.has_value()) {
+        if (before_upsert_end_for_test_) before_upsert_end_for_test_();
         auto end_result = master_client_.UpsertEnd(
             ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
         if (!end_result) {
@@ -2444,7 +3055,10 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         hot_cache_->RemoveHotKey(key);
     }
 
-    return {};
+    return RecordCommittedReplicas(
+        key, master_client_.tenant_id(),
+        finalize_decision.end_type == ReplicaType::MEMORY ||
+            finalize_decision.end_type == ReplicaType::ALL);
 }
 
 // TODO: `client.cpp` is too long, consider split it into multiple files
@@ -2576,7 +3190,7 @@ std::vector<PutOperation> Client::CreatePutOperations(
 }
 
 void Client::ComputeBatchObjectChecksums(std::vector<PutOperation>& ops) {
-    if (!object_checksum_enabled_) {
+    if (!object_checksum_enabled_ && !enable_ha_rebuild_) {
         return;
     }
     for (auto& op : ops) {
@@ -3532,6 +4146,7 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     std::vector<std::string> finalized_keys;
     if (!successful_object_metas.empty()) {
         finalized_keys.reserve(successful_object_metas.size());
+        if (before_upsert_end_for_test_) before_upsert_end_for_test_();
         auto end_responses =
             master_client_.BatchUpsertEnd(successful_object_metas);
         if (end_responses.size() != successful_object_metas.size()) {
@@ -3615,7 +4230,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     const std::vector<PutOperation>& ops) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(ops.size());
+    std::vector<std::string> committed_keys;
+    std::vector<size_t> committed_indices;
+    if (enable_ha_rebuild_) {
+        committed_keys.reserve(ops.size());
+        committed_indices.reserve(ops.size());
+    }
 
+    std::vector<std::string> existing_keys;
     int no_available_handle_count = 0;
     for (const auto& op : ops) {
         // With the new structure, result is always set (never nullopt)
@@ -3628,6 +4250,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
             // unreachable for BatchUpsert — kept for BatchPut compatibility.
             if (op.result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
                 results.back() = {};
+                if (enable_ha_rebuild_) {
+                    existing_keys.push_back(op.key);
+                }
                 continue;
             }
             if (op.result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
@@ -3640,6 +4265,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
                                    : "");
             }
         } else {
+            if (enable_ha_rebuild_ &&
+                op.transfer_summary.failed_memory_transfers == 0 &&
+                op.transfer_summary.successful_memory_transfers > 0) {
+                committed_keys.push_back(op.key);
+                committed_indices.push_back(results.size() - 1);
+            }
             VLOG(1) << "Operation for key " << op.key
                     << " completed successfully";
         }
@@ -3649,6 +4280,23 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
                      << " keys" << PUT_NO_SPACE_HELPER_STR;
     }
 
+    if (!existing_keys.empty()) {
+        auto recorded = BatchRecordCommittedReplicas(
+            existing_keys, master_client_.tenant_id(), false);
+        for (size_t i = 0; i < recorded.size(); ++i) {
+            if (recorded[i]) continue;
+            if (metrics_) metrics_->rebuild_failed_batches.inc();
+            LOG(WARNING) << "Ownership maintenance for existing key="
+                         << existing_keys[i]
+                         << " failed: " << toString(recorded[i].error());
+        }
+    }
+    if (!committed_keys.empty()) {
+        auto recorded = BatchRecordCommittedReplicas(
+            committed_keys, master_client_.tenant_id());
+        for (size_t index = 0; index < recorded.size(); ++index)
+            results[committed_indices[index]] = std::move(recorded[index]);
+    }
     return results;
 }
 
@@ -4001,6 +4649,12 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
         // engine, we can continue
     }
 
+    if (enable_ha_rebuild_) {
+        std::lock_guard table_lock(local_replica_table_mutex_);
+        local_replica_table_.ForgetRegion(it->second.base, it->second.size,
+                                          mounted_segments_.size() == 1);
+        UpdateRebuildFenceMetrics();
+    }
     mounted_segments_.erase(it);
     return {};
 }
@@ -4118,6 +4772,13 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentById(
         return tl::unexpected(err);
     }
 
+    if (enable_ha_rebuild_) {
+        std::lock_guard table_lock(local_replica_table_mutex_);
+        local_replica_table_.ForgetRegion(segment->second.base,
+                                          segment->second.size,
+                                          mounted_segments_.size() == 1);
+        UpdateRebuildFenceMetrics();
+    }
     gracefully_unmounting_segments_.emplace(segment->first, segment->second);
     if (cleanup_callback) {
         graceful_unmount_cleanup_callbacks_[segment->first] =
@@ -4617,6 +5278,8 @@ tl::expected<void, ErrorCode> Client::Copy(
     const std::string& source, const std::vector<std::string>& targets,
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch) {
+    if (enable_ha_rebuild_)
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     LOG(INFO) << "action=replica_copy_start" << ", key=" << key
               << ", targets_count=" << targets.size();
 
@@ -4697,6 +5360,11 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& tenant_id,
                                            const std::string& source,
                                            const std::string& target) {
+    if (enable_ha_rebuild_) {
+        LOG(WARNING)
+            << "Move is unavailable while MC_ENABLE_HA_REBUILD is enabled";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
     LOG(INFO) << "action=replica_move_start" << ", key=" << key
               << ", source_segment=" << source << ", target_segment=" << target;
 
@@ -5610,58 +6278,120 @@ void Client::StorageHeartbeatThreadMain() {
     int ping_fail_count = 0;
 
     auto remount_segment = [this]() {
-        // This lock must be held until the remount rpc is finished,
-        // otherwise there will be corner cases, e.g., a segment is
-        // unmounted successfully first, and then remounted again in
-        // this thread.
-        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        std::vector<Segment> segments;
-        for (auto it : mounted_segments_) {
-            auto& segment = it.second;
-            segments.emplace_back(segment);
-        }
-        auto remount_result = master_client_.ReMountSegment(segments);
-        if (!remount_result) {
-            ErrorCode err = remount_result.error();
-            LOG(ERROR) << "Failed to remount segments: " << err;
-        }
-        // Re-publish Transfer Engine segment descriptors to the HTTP
-        // metadata server.  When Master (which hosts the HTTP metadata
-        // server in the same process) is killed and restarted, all
-        // in-memory KV entries are lost.  ReMountSegment above only
-        // restores Master-side allocation state; it does NOT write back
-        // the transport-level segment descriptors.  Without this, remote
-        // peers get HTTP 404 when querying our segment descriptor and
-        // data transfers fail.
-        auto metadata = transfer_engine_->getMetadata();
-        if (metadata) {
-            int rc = metadata->updateLocalSegmentDesc();
-            if (rc != 0) {
-                LOG(ERROR) << "Failed to re-publish segment descriptor "
-                           << "to metadata server, rc=" << rc
-                           << ", will retry in next heartbeat cycle";
-                segment_desc_publish_pending_.store(true);
-            } else {
-                segment_desc_publish_pending_.store(false);
+        rebuild_retry_pending_.store(true);
+        constexpr int kMaxAttempts = 3;
+        constexpr int kBackoffMs[kMaxAttempts] = {100, 500, 1000};
+        auto wait_before_retry = [&](int attempt) {
+            if (metrics_) metrics_->rebuild_retries.inc();
+            int remaining_ms = kBackoffMs[attempt];
+            while (storage_heartbeat_running_.load() && remaining_ms > 0) {
+                const int sleep_ms = std::min(remaining_ms, 50);
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(sleep_ms));
+                remaining_ms -= sleep_ms;
             }
-            // Also re-publish RPC meta entry (mooncake/rpc_meta/<hostname>).
-            // Remote peers need this to locate our RDMA RPC port for
-            // handshake.  Like segment descriptors, this entry is lost
-            // when the HTTP metadata server is cleared on Master restart.
-            rc = metadata->rePublishRpcMetaEntry(local_hostname_);
-            if (rc != 0) {
-                LOG(ERROR) << "Failed to re-publish RPC meta entry "
-                           << "to metadata server, rc=" << rc
-                           << ", will retry in next heartbeat cycle";
-                rpc_meta_publish_pending_.store(true);
-            } else {
-                rpc_meta_publish_pending_.store(false);
+            return storage_heartbeat_running_.load();
+        };
+
+        ViewVersionId view_version = 0;
+        {
+            std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+            if (current_master_view_.has_value()) {
+                view_version = current_master_view_->view_version;
             }
         }
-        // Note: LOCAL_DISK segment remount is NOT done here.
-        // It is handled by FileStorage::Heartbeat() when it detects
-        // SEGMENT_NOT_FOUND, which also triggers ScanMeta to
-        // re-register offloaded object metadata.
+
+        RebuildRecoveryOps ops;
+        ops.remount = [&]() -> tl::expected<void, ErrorCode> {
+            std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+            std::vector<Segment> segments;
+            segments.reserve(mounted_segments_.size());
+            for (const auto& [id, segment] : mounted_segments_) {
+                segments.emplace_back(segment);
+            }
+            return master_client_.ReMountSegment(segments);
+        };
+        auto publish_metadata = [&](bool rpc) -> tl::expected<void, ErrorCode> {
+            const int rc =
+                transfer_engine_->republishLocalMetadata(local_hostname_, rpc);
+            (rpc ? rpc_meta_publish_pending_ : segment_desc_publish_pending_)
+                .store(rc != 0);
+            if (rc != 0) return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            return {};
+        };
+        ops.publish_segment_descriptor = [&] {
+            return publish_metadata(false);
+        };
+        ops.publish_rpc_metadata = [&] { return publish_metadata(true); };
+        ops.resend_metadata = [&] {
+            if (!enable_ha_rebuild_) return tl::expected<void, ErrorCode>{};
+            return ResendLocalReplicaTable(view_version);
+        };
+        ops.signal_complete = [&] {
+            if (!enable_ha_rebuild_) return tl::expected<void, ErrorCode>{};
+            auto replayed = WaitForOwnedReplays(view_version);
+            if (!replayed) return replayed;
+            uint64_t generation;
+            int64_t epoch;
+            {
+                std::lock_guard lock(local_replica_table_mutex_);
+                if (rebuild_connection_pending_)
+                    return tl::expected<void, ErrorCode>{
+                        tl::make_unexpected(ErrorCode::INVALID_VERSION)};
+                generation = rebuild_connection_generation_.load();
+                epoch = rebuild_master_epoch_;
+            }
+            auto complete = master_client_.SignalRebuildComplete(view_version);
+            if (complete) {
+                std::lock_guard lock(local_replica_table_mutex_);
+                if (generation != rebuild_connection_generation_.load() ||
+                    epoch != rebuild_master_epoch_ ||
+                    rebuild_replay_view_ != view_version)
+                    return tl::expected<void, ErrorCode>{
+                        tl::make_unexpected(ErrorCode::INVALID_VERSION)};
+                rebuild_replay_view_.reset();
+                // Retire this attempt under the same lock as its window.
+                // A later notify/connection failure may request another retry.
+                rebuild_retry_pending_.store(!owned_replay_pending_.empty());
+            }
+            return complete;
+        };
+        ops.refresh_view = [&]() {
+            if (leader_coordinator_) {
+                auto current_view = leader_coordinator_->ReadCurrentView();
+                if (!current_view || !current_view.value().has_value()) {
+                    return false;
+                }
+                if (SwitchLeader(current_view.value().value()) !=
+                    ErrorCode::OK) {
+                    return false;
+                }
+            }
+            std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+            if (!current_master_view_.has_value() ||
+                current_master_view_->view_version == view_version) {
+                return false;
+            }
+            view_version = current_master_view_->view_version;
+            return true;
+        };
+        auto result = RunRebuildRecovery(ops, kMaxAttempts, wait_before_retry);
+        if (result) {
+            LOG(INFO)
+                << "[HA-REBUILD] client sent rebuild-complete signal view="
+                << view_version;
+            return;
+        }
+        if (result.error() == ErrorCode::INVALID_VERSION) {
+            LOG(WARNING)
+                << "HA metadata rebuild remains pending after stale view="
+                << view_version
+                << "; waiting for the current view to be retried";
+            return;
+        }
+        LOG(ERROR) << "HA metadata rebuild attempt exhausted: "
+                   << toString(result.error())
+                   << "; waiting for the next heartbeat/remount trigger";
     };
     // Use another thread to remount segments to avoid blocking the ping
     // thread
@@ -5675,6 +6405,7 @@ void Client::StorageHeartbeatThreadMain() {
             remount_segment_future = std::future<void>();
         }
 
+        const auto generation = rebuild_connection_generation_.load();
         auto ping_result = metrics_
                                ? metrics_->master_heartbeat_metric.ObservePing(
                                      [this] { return master_client_.Ping(); })
@@ -5684,48 +6415,25 @@ void Client::StorageHeartbeatThreadMain() {
             ping_fail_count = 0;
             last_ping_success_.store(true);
             auto& ping_response = ping_result.value();
+            if (enable_ha_rebuild_)
+                ObserveRebuildEpoch(ping_response, generation);
+            if (!leader_coordinator_) {
+                std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+                current_master_view_ = ha::MasterView{
+                    direct_master_address_, ping_response.view_version_id};
+            }
             if (ping_response.client_status == ClientStatus::NEED_REMOUNT &&
                 !remount_segment_future.valid()) {
                 // Ensure at most one remount segment thread is running
                 remount_segment_future =
                     std::async(std::launch::async, remount_segment);
-            } else if (segment_desc_publish_pending_.load() &&
+            } else if ((segment_desc_publish_pending_.load() ||
+                        rpc_meta_publish_pending_.load() ||
+                        rebuild_retry_pending_.load()) &&
                        !remount_segment_future.valid()) {
-                // Previous remount succeeded but updateLocalSegmentDesc()
-                // failed (e.g. transient HTTP error).  Retry it directly
-                // without re-running ReMountSegment.
-                auto metadata = transfer_engine_->getMetadata();
-                if (metadata) {
-                    int rc = metadata->updateLocalSegmentDesc();
-                    if (rc != 0) {
-                        LOG(ERROR)
-                            << "Retry: failed to re-publish segment "
-                            << "descriptor to metadata server, rc=" << rc;
-                    } else {
-                        LOG(INFO) << "Retry: successfully re-published "
-                                  << "segment descriptor to metadata server";
-                        segment_desc_publish_pending_.store(false);
-                    }
-                }
-            } else if (rpc_meta_publish_pending_.load() &&
-                       !remount_segment_future.valid()) {
-                // Previous remount succeeded but rePublishRpcMetaEntry()
-                // failed.  Retry it directly.
-                auto metadata = transfer_engine_->getMetadata();
-                if (metadata) {
-                    int rc = metadata->rePublishRpcMetaEntry(local_hostname_);
-                    if (rc != 0) {
-                        LOG(ERROR)
-                            << "Retry: failed to re-publish RPC "
-                            << "meta entry to metadata server, rc=" << rc;
-                    } else {
-                        LOG(INFO) << "Retry: successfully re-published "
-                                  << "RPC meta entry to metadata server";
-                        rpc_meta_publish_pending_.store(false);
-                    }
-                }
+                remount_segment_future =
+                    std::async(std::launch::async, remount_segment);
             }
-
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(success_ping_interval_ms));
             continue;

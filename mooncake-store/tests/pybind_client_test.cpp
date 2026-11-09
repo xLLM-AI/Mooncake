@@ -1493,6 +1493,7 @@ TEST_F(RealClientTest, TestSetupExistTransferEngine) {
 
     // The auto discover has some problems in GitHub CI, so disable it here.
     transfer_engine->setAutoDiscover(false);
+    transfer_engine->setAutoInstallTransport(false);
     auto init_ret = transfer_engine->init("P2PHANDSHAKE", "localhost:17813");
     ASSERT_EQ(init_ret, 0) << "Transfer engine initialization should succeed";
     if (FLAGS_protocol == "tcp") {

@@ -57,6 +57,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     tenant/quota_policy_store.cpp
     weight_metadata_store.cpp
     rpc_service.cpp
+    rebuild_retry.cpp
     master_admin_service.cpp
     offset_allocator.cpp
     http_metadata_server.cpp

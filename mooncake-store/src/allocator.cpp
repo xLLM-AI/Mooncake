@@ -79,7 +79,9 @@ AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
     : allocator_(std::move(allocator)),
       buffer_ptr_(reinterpret_cast<void*>(descriptor.buffer_address_)),
       size_(descriptor.size_),
-      protocol(descriptor.protocol_) {
+      protocol(descriptor.protocol_),
+      allocation_epoch_(descriptor.allocationEpoch()),
+      segment_id_(descriptor.segment_id_.value_or(UUID{})) {
     if (protocol == "cxl") {
         segment_name_ = descriptor.transport_endpoint_;
     }
@@ -114,8 +116,13 @@ std::string AllocatedBuffer::getTransportEndpoint(
 AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor(
     std::optional<SegmentLocality>* locality) const {
     return {static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol,
-            getTransportEndpoint(locality)};
+            reinterpret_cast<uintptr_t>(buffer_ptr_),
+            this->protocol,
+            getTransportEndpoint(locality),
+            allocation_epoch_,
+            offset_handle_ ? offset_handle_->extent() : size_,
+            segment_id_ == UUID{} ? std::optional<UUID>{}
+                                  : std::optional<UUID>{segment_id_}};
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {
@@ -428,7 +435,8 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         // Create a custom AllocatedBuffer that manages the
         // OffsetAllocationHandle
         allocated_buffer = std::make_unique<AllocatedBuffer>(
-            shared_from_this(), buffer_ptr, size, std::move(allocation_handle));
+            shared_from_this(), buffer_ptr, size, std::move(allocation_handle),
+            allocation_epoch_);
         VLOG(1) << "allocation_succeeded size=" << size
                 << " segment=" << segment_name_ << " address=" << buffer_ptr;
     } catch (const std::exception& e) {
@@ -439,6 +447,45 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         return nullptr;
     }
 
+    RecordAllocation(size);
+    if (replica_type_ == ReplicaType::MEMORY) {
+        MasterMetricManager::instance().inc_allocated_mem_size(segment_name_,
+                                                               size);
+    } else if (replica_type_ == ReplicaType::NOF_SSD) {
+        MasterMetricManager::instance().inc_allocated_nof_size(segment_name_,
+                                                               size);
+    }
+    return allocated_buffer;
+}
+
+std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::AllocateForRebuild(
+    size_t size, void* real_addr, size_t extent) {
+    if (!offset_allocator_) {
+        LOG(ERROR) << "allocator_status=not_initialized";
+        return nullptr;
+    }
+    std::unique_ptr<AllocatedBuffer> allocated_buffer = nullptr;
+    try {
+        auto allocation_handle = offset_allocator_->reserve(
+            reinterpret_cast<uintptr_t>(real_addr), size, extent);
+        if (!allocation_handle) {
+            VLOG(1) << "rebuild_allocation_failed size=" << size
+                    << " segment=" << segment_name_
+                    << " current_size=" << GetUsageBytes();
+            return nullptr;
+        }
+        allocated_buffer = std::make_unique<AllocatedBuffer>(
+            shared_from_this(), real_addr, size, std::move(allocation_handle));
+        VLOG(1) << "rebuild_allocation_succeeded size=" << size
+                << " segment=" << segment_name_
+                << " real_address=" << real_addr;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "rebuild_allocation_exception error=" << e.what();
+        return nullptr;
+    } catch (...) {
+        LOG(ERROR) << "rebuild_allocation_unknown_exception";
+        return nullptr;
+    }
     RecordAllocation(size);
     if (replica_type_ == ReplicaType::MEMORY) {
         MasterMetricManager::instance().inc_allocated_mem_size(segment_name_,

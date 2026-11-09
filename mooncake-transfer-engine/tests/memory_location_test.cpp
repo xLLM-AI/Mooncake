@@ -71,10 +71,14 @@ TEST(MemoryLocationTest, MallocMultipleNodes) {
     std::string locationa = "cpu:" + std::to_string(nodea);
     std::string locationb = "cpu:" + std::to_string(nodeb);
 
-    int size = 4096 * 10;
+    const int page_size = static_cast<int>(sysconf(_SC_PAGESIZE));
+    ASSERT_GT(page_size, 0);
+    const int half_page = page_size / 2;
+    int size = page_size * 10;
     void *addr = numa_alloc_onnode(size, nodea);
     ASSERT_NE(addr, nullptr);
-    ASSERT_EQ((uint64_t)addr % 4096, static_cast<uint64_t>(0));  // page aligned
+    ASSERT_EQ((uint64_t)addr % page_size,
+              static_cast<uint64_t>(0));  // page aligned
 
     bool only_first_page = false;
 
@@ -84,8 +88,8 @@ TEST(MemoryLocationTest, MallocMultipleNodes) {
     int rc;
 
     // move first two pages & last one page to nodeb
-    void *pages[3] = {addr, (void *)((uint64_t)addr + 4096),
-                      (void *)((uint64_t)addr + 4096 * 9)};
+    void *pages[3] = {addr, (void *)((uint64_t)addr + page_size),
+                      (void *)((uint64_t)addr + page_size * 9)};
     int nodes[3] = {nodeb, nodeb, nodeb};
     int status[3];
     rc = numa_move_pages(0, 3, pages, nodes, status, MPOL_MF_MOVE);
@@ -95,10 +99,10 @@ TEST(MemoryLocationTest, MallocMultipleNodes) {
     ASSERT_EQ(rc, 0);
 
     // not page aligned
-    void *start = (void *)((uint64_t)addr + 1024 * 2);
+    void *start = (void *)((uint64_t)addr + half_page);
 
-    auto entries =
-        mooncake::getMemoryLocation(start, size - 1024 * 4, only_first_page);
+    auto entries = mooncake::getMemoryLocation(start, size - half_page * 2,
+                                               only_first_page);
 
     if (nodea == nodeb) {
         // only one numa node
@@ -107,7 +111,7 @@ TEST(MemoryLocationTest, MallocMultipleNodes) {
         // check the first memory location
         EXPECT_EQ(entries[0].start, reinterpret_cast<uint64_t>(start));
         EXPECT_EQ(entries[0].location, locationa);
-        EXPECT_EQ(entries[0].len, static_cast<size_t>(size - 1024 * 4));
+        EXPECT_EQ(entries[0].len, static_cast<size_t>(size - half_page * 2));
 
     } else {
         ASSERT_EQ(entries.size(), static_cast<size_t>(3));
@@ -115,19 +119,20 @@ TEST(MemoryLocationTest, MallocMultipleNodes) {
         // check the first memory location
         EXPECT_EQ(entries[0].start, reinterpret_cast<uint64_t>(start));
         EXPECT_EQ(entries[0].location, locationb);
-        EXPECT_EQ(entries[0].len, static_cast<size_t>(4096 * 2 - 1024 * 2));
+        EXPECT_EQ(entries[0].len,
+                  static_cast<size_t>(page_size * 2 - half_page));
 
         // check the second memory location
         EXPECT_EQ(entries[1].start,
-                  reinterpret_cast<uint64_t>(addr) + 4096 * 2);
+                  reinterpret_cast<uint64_t>(addr) + page_size * 2);
         EXPECT_EQ(entries[1].location, locationa);
-        EXPECT_EQ(entries[1].len, static_cast<size_t>(4096 * 7));
+        EXPECT_EQ(entries[1].len, static_cast<size_t>(page_size * 7));
 
         // check the third memory location
         EXPECT_EQ(entries[2].start,
-                  reinterpret_cast<uint64_t>(addr) + 4096 * 9);
+                  reinterpret_cast<uint64_t>(addr) + page_size * 9);
         EXPECT_EQ(entries[2].location, locationb);
-        EXPECT_EQ(entries[2].len, static_cast<size_t>(4096 - 1024 * 2));
+        EXPECT_EQ(entries[2].len, static_cast<size_t>(page_size - half_page));
     }
 
     numa_free(addr, size);

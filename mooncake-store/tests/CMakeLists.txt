@@ -584,3 +584,17 @@ target_include_directories(hf3fs_resource_manager_test BEFORE
 target_link_libraries(hf3fs_resource_manager_test PRIVATE gtest gtest_main
                                                           pthread)
 add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)
+
+add_store_test(ha_rebuild_gate_test ha_rebuild_gate_test.cpp)
+add_store_test(rebuild_retry_test rebuild_retry_test.cpp)
+add_store_test(rebuild_replica_table_test rebuild_replica_table_test.cpp)
+add_store_test(master_rebuild_replay_test master_rebuild_replay_test.cpp)
+add_store_test(client_metadata_rebuild_test client_metadata_rebuild_test.cpp)
+set_tests_properties(client_metadata_rebuild_test
+                     PROPERTIES ENVIRONMENT "MC_ENABLE_HA_REBUILD=1")
+add_executable(ha_recovery_live_main ha_recovery_live_main.cpp)
+target_include_directories(ha_recovery_live_main
+                           PRIVATE ${MOONCAKE_STORE_TESTS_SOURCE_DIR})
+target_link_libraries(
+  ha_recovery_live_main PRIVATE mooncake_store transfer_engine glog::glog
+                                gflags::gflags pthread)

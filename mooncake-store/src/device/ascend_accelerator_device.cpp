@@ -9,6 +9,9 @@
 
 namespace mooncake {
 namespace device {
+
+void EnsureAscendAcceleratorDeviceLinked() {}
+
 namespace {
 
 void FreeAscendPinnedHostBuffer(void* addr) { aclrtFreeHost(addr); }

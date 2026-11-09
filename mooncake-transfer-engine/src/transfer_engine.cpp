@@ -1315,6 +1315,20 @@ std::optional<tent::IntentType> toTentIntent(int intent_type) {
 
 }  // namespace
 
+int TransferEngine::republishLocalMetadata(const std::string& server_name,
+                                           bool rpc_metadata) {
+#ifdef USE_TENT
+    if (use_tent_) {
+        if (!impl_tent_) return ERR_CONTEXT;
+        return impl_tent_->synchronizeLocalMetadata().ok() ? 0 : ERR_METADATA;
+    }
+#endif
+    auto metadata = impl_ ? impl_->getMetadata() : nullptr;
+    if (!metadata) return ERR_METADATA;
+    return rpc_metadata ? metadata->rePublishRpcMetaEntry(server_name)
+                        : metadata->updateLocalSegmentDesc();
+}
+
 int TransferEngine::getSegmentBuffers(SegmentHandle handle,
                                       std::vector<SegmentBufferInfo>& buffers) {
     buffers.clear();

@@ -8,30 +8,11 @@
 #include <vector>
 
 #include "client_service.h"
+#include "client_test_peer.h"
 #include "config.h"
 #include "transfer_engine.h"
 
 namespace mooncake {
-
-// Exercise the production Store initialization path without a master or HCA.
-// Failed RDMA installation still leaves the prepared topology inspectable.
-class ClientTransportInitTestPeer {
-   public:
-    static std::shared_ptr<Client> Make() {
-        auto client = std::shared_ptr<Client>(
-            new Client("127.0.0.1:0", P2PHANDSHAKE, "rdma"));
-        client->transfer_engine_ = std::make_shared<TransferEngine>(false);
-        return client;
-    }
-    static ErrorCode Init(Client& client, const std::string& protocol,
-                          const std::optional<std::string>& devices) {
-        return client.InitTransferEngine("127.0.0.1:0", P2PHANDSHAKE, protocol,
-                                         devices);
-    }
-    static TransferEngine& Engine(Client& client) {
-        return *client.transfer_engine_;
-    }
-};
 
 namespace {
 class ScopedInitEnv {

@@ -161,8 +161,19 @@ TEST(HcaAffinityTest, SessionAndAffinityExtensionsRemainWireCompatible) {
               current->per_key_preferred_hca_names);
 }
 
+// Freeze the pre-extension buffer schema as well as the memory wrapper.
+// Using the current descriptor here would produce a hybrid "legacy" payload.
+struct LegacyAllocatedBufferDescriptor {
+    uint64_t size_;
+    uintptr_t buffer_address_;
+    std::string protocol_;
+    std::string transport_endpoint_;
+};
+YLT_REFL(LegacyAllocatedBufferDescriptor, size_, buffer_address_, protocol_,
+         transport_endpoint_);
+
 struct LegacyMemoryDescriptor {
-    AllocatedBuffer::Descriptor buffer_descriptor;
+    LegacyAllocatedBufferDescriptor buffer_descriptor;
 };
 YLT_REFL(LegacyMemoryDescriptor, buffer_descriptor);
 
@@ -196,6 +207,14 @@ TEST(HcaAffinityTest, ReadLocalityIsCompatibleInsideReplicaVariant) {
         struct_pack::serialize(*old_reader));
     ASSERT_TRUE(new_reader);
     EXPECT_FALSE(new_reader->get_memory_descriptor().locality);
+    const auto& restored =
+        new_reader->get_memory_descriptor().buffer_descriptor;
+    EXPECT_EQ(restored.buffer_address_,
+              memory.buffer_descriptor.buffer_address_);
+    EXPECT_EQ(restored.size_, memory.buffer_descriptor.size_);
+    EXPECT_FALSE(restored.allocation_epoch_);
+    EXPECT_FALSE(restored.allocation_size_);
+    EXPECT_FALSE(restored.segment_id_);
 }
 
 struct LegacySegment {

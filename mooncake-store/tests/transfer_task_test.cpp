@@ -195,6 +195,7 @@ TEST_F(TransferTaskTest, MemcpyWorkerPoolMultipleOperations) {
 }
 
 TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedCpuBuffers) {
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
     constexpr size_t kBufferSize = 512;
     constexpr size_t kFragmentCount = 128;
     std::vector<char> source(kBufferSize), destination(kBufferSize, 0);
@@ -218,28 +219,34 @@ TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedCpuBuffers) {
                                          "cpu:0"),
               0);
 
-    ASSERT_TRUE(engine
-                    .transferScatter({{
-                        .opcode = TransferRequest::READ,
-                        .remote_segment = engine.getLocalIpAndPort(),
-                        .remote_base_offset =
-                            reinterpret_cast<uintptr_t>(source.data()),
-                        .remote_size = source.size(),
-                        .local_buffer = destination.data(),
-                        .local_capacity = destination.size(),
-                        .local_offsets = destination_offsets,
-                        .remote_offsets = source_offsets,
-                        .lengths = lengths,
-                        .on_fragment_complete =
-                            [&](size_t i, const Status& status) {
-                                EXPECT_TRUE(status.ok());
-                                ++completions[i];
-                            },
-                    }})
-                    .ok());
+    const bool uncancellable = engine.isUsingTent();
+    const auto result = engine.transferScatter({{
+        .opcode = TransferRequest::READ,
+        .remote_segment = engine.getLocalIpAndPort(),
+        .remote_base_offset = reinterpret_cast<uintptr_t>(source.data()),
+        .remote_size = source.size(),
+        .local_buffer = destination.data(),
+        .local_capacity = destination.size(),
+        .local_offsets = destination_offsets,
+        .remote_offsets = source_offsets,
+        .lengths = lengths,
+        .on_fragment_complete =
+            [&](size_t i, const Status& status) {
+                EXPECT_EQ(status.ok(), !uncancellable);
+                if (uncancellable) {
+                    EXPECT_TRUE(status.IsNotImplemented());
+                }
+                ++completions[i];
+            },
+    }});
+    // Standard TENT TCP deliberately rejects the cancellable scatter API.
+    EXPECT_EQ(result.ok(), !uncancellable);
+    if (uncancellable) {
+        EXPECT_TRUE(result.IsNotImplemented());
+    }
     for (size_t i = 0; i < kFragmentCount; ++i) {
         EXPECT_EQ(destination[destination_offsets[i]],
-                  source[source_offsets[i]]);
+                  uncancellable ? 0 : source[source_offsets[i]]);
         EXPECT_EQ(completions[i], 1u);
     }
 }

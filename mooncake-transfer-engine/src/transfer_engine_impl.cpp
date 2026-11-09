@@ -175,7 +175,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     LOG(INFO) << "Transfer Engine parseHostNameWithPortAscend. server_name: "
               << host_name << " port: " << port
               << " devicePhyId: " << devicePhyId;
-    local_server_name_ = host_name + ":" + std::to_string(port);
+    // Strip only an explicit device suffix; keep logical metadata names intact.
+    local_server_name_ = devicePhyId >= 0
+                             ? host_name + ":" + std::to_string(port)
+                             : local_server_name;
 #else
     auto [host_name, port] = parseHostNameWithPort(local_server_name);
     LOG(INFO) << "Transfer Engine parseHostNameWithPort. server_name: "
