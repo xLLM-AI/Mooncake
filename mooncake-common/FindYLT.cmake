@@ -47,6 +47,15 @@ FetchContent_Populate(yalantinglibs)
 # Explicit non-Git SOURCE_DIR overrides retain FetchContent's existing bypass.
 if(EXISTS "${yalantinglibs_SOURCE_DIR}/.git")
   find_package(Git REQUIRED)
+  execute_process(
+    COMMAND ${GIT_EXECUTABLE} -C ${yalantinglibs_SOURCE_DIR} rev-parse HEAD
+    OUTPUT_VARIABLE YLT_SOURCE_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE YLT_HEAD_RESULT)
+  if(NOT YLT_HEAD_RESULT EQUAL 0 OR NOT YLT_SOURCE_COMMIT STREQUAL YLT_COMMIT)
+    message(
+      FATAL_ERROR "yalantinglibs checkout does not match the pinned commit")
+  endif()
   file(MAKE_DIRECTORY "${yalantinglibs_BINARY_DIR}")
   set(YLT_SOURCE_ARCHIVE "${yalantinglibs_BINARY_DIR}/pinned-source.tar")
   execute_process(
