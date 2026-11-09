@@ -56,6 +56,17 @@ if(EXISTS "${yalantinglibs_SOURCE_DIR}/.git")
     message(
       FATAL_ERROR "yalantinglibs checkout does not match the pinned commit")
   endif()
+  # The archive hashes the commit, while CMake compiles the working tree.
+  # Reject local edits and untracked source files that could shadow headers.
+  execute_process(
+    COMMAND ${GIT_EXECUTABLE} -C ${yalantinglibs_SOURCE_DIR} status --porcelain
+            --untracked-files=all
+    OUTPUT_VARIABLE YLT_SOURCE_STATUS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE YLT_STATUS_RESULT)
+  if(NOT YLT_STATUS_RESULT EQUAL 0 OR NOT YLT_SOURCE_STATUS STREQUAL "")
+    message(FATAL_ERROR "yalantinglibs pinned checkout must be clean")
+  endif()
   file(MAKE_DIRECTORY "${yalantinglibs_BINARY_DIR}")
   set(YLT_SOURCE_ARCHIVE "${yalantinglibs_BINARY_DIR}/pinned-source.tar")
   execute_process(
