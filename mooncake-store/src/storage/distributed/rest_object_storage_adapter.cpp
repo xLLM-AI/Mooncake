@@ -478,10 +478,10 @@ RestObjectStorageAdapter::Request(
         response.body = std::move(context.error_body);
         // Preserve 404/416 when their oversized error body is aborted
         // locally, without masking other transport failures.
-        const bool range_error = method == "GET" &&
-                                    (response.status == 404 || response.status == 416) &&
-                                    result == CURLE_WRITE_ERROR &&
-                                    context.download_context.overflow;
+        const bool range_error =
+            method == "GET" &&
+            (response.status == 404 || response.status == 416) &&
+            result == CURLE_WRITE_ERROR && context.download_context.overflow;
         const bool transient =
             IsTransientFailure(result, response.status,
                                context.download_context.overflow, context.curl);
@@ -819,7 +819,8 @@ tl::expected<size_t, ErrorCode> RestObjectStorageAdapter::GetRange(
     if (response->status == 404)
         return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
     if (response->status != 206 || response->transferred != len ||
-        !object_storage_http::MatchesContentRange(response->headers, first, len))
+        !object_storage_http::MatchesContentRange(response->headers, first,
+                                                  len))
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     return len;
 }

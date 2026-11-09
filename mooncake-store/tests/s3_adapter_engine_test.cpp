@@ -1727,7 +1727,6 @@ TEST(S3ObjectStorageAdapterEngineTest,
         << server.requests()[0];
 }
 
-
 TEST(S3ObjectStorageAdapterEngineTest,
      PreservesLarge416WithoutMaskingTruncatedResponses) {
     using Server = test::OssFaultHttpServer;

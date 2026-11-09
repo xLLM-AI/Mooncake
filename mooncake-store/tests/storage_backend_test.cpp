@@ -5853,5 +5853,4 @@ TEST_F(StorageBackendTest, BucketBackendReportsFailedSyscallErrno) {
     EXPECT_EQ(reported.size(), 2u);
 }
 
-
 }  // namespace mooncake::test

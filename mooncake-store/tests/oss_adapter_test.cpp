@@ -1611,7 +1611,6 @@ TEST(OssObjectStorageAdapterTest, StorageBackendFactoryRunsObjectHealthCheck) {
     EXPECT_EQ(server.requests()[2].rfind("DELETE ", 0), 0U);
 }
 
-
 TEST(OssObjectStorageAdapterTest, ValidatesContentRangeForSingleAndBatchReads) {
     using Server = test::OssFaultHttpServer;
     const std::vector<std::string> invalid{"",

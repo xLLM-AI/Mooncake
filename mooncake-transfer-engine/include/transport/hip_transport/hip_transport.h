@@ -87,7 +87,8 @@ class HipTransport : public Transport {
         std::vector<PendingTransfer>& pending_transfers);
 
     Status submitTasks(
-        const std::vector<std::pair<TransferTask*, const TransferRequest*>>& tasks);
+        const std::vector<std::pair<TransferTask*, const TransferRequest*>>&
+            tasks);
 
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
         remap_entries_;

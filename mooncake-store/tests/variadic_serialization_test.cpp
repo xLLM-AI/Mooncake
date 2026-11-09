@@ -80,8 +80,8 @@ TEST(VariadicSerializationTest, RealRpcPreservesLaterFieldsWithNdebug) {
     auto started = server.async_start();
     ASSERT_FALSE(started.hasResult());
     coro_rpc::coro_rpc_client client;
-    ASSERT_FALSE(syncAwait(client.connect("127.0.0.1",
-                                          std::to_string(ports.front()))));
+    ASSERT_FALSE(
+        syncAwait(client.connect("127.0.0.1", std::to_string(ports.front()))));
     for (int affinity = 0; affinity < 3; ++affinity) {
         SCOPED_TRACE(affinity);
         ReplicateConfig config;
@@ -89,8 +89,11 @@ TEST(VariadicSerializationTest, RealRpcPreservesLaterFieldsWithNdebug) {
         config.preferred_hca_names = std::vector<std::string>{"mlx5_0"};
         config.per_key_preferred_hca_names =
             std::vector<std::vector<std::string>>{{"mlx5_1"}};
-        if (affinity == 1) config.residency_affinity_ids = std::vector<std::string>{};
-        if (affinity == 2) config.residency_affinity_ids = std::vector<std::string>{"affinity-a"};
+        if (affinity == 1)
+            config.residency_affinity_ids = std::vector<std::string>{};
+        if (affinity == 2)
+            config.residency_affinity_ids =
+                std::vector<std::string>{"affinity-a"};
         auto reply = syncAwait(client.call<&VariadicRpcService::Echo>(
             UUID{1, 2}, ObjectMeta{"key", uint64_t{0x123456789abcdef}},
             std::string("tenant-a"), uint64_t{4096}, config));
@@ -103,9 +106,13 @@ TEST(VariadicSerializationTest, RealRpcPreservesLaterFieldsWithNdebug) {
         EXPECT_EQ(bytes, 4096u);
         EXPECT_EQ(actual.session_ids, config.session_ids);
         EXPECT_EQ(actual.preferred_hca_names, config.preferred_hca_names);
-        EXPECT_EQ(actual.per_key_preferred_hca_names, config.per_key_preferred_hca_names);
-        ASSERT_EQ(bool(actual.residency_affinity_ids), bool(config.residency_affinity_ids));
-        if (config.residency_affinity_ids) EXPECT_EQ(actual.residency_affinity_ids.value(), config.residency_affinity_ids.value());
+        EXPECT_EQ(actual.per_key_preferred_hca_names,
+                  config.per_key_preferred_hca_names);
+        ASSERT_EQ(bool(actual.residency_affinity_ids),
+                  bool(config.residency_affinity_ids));
+        if (config.residency_affinity_ids)
+            EXPECT_EQ(actual.residency_affinity_ids.value(),
+                      config.residency_affinity_ids.value());
     }
 }
 

@@ -135,11 +135,11 @@ TEST(HipTransportTest, InvalidRemoteRequestFailsWholeBatch) {
     ASSERT_EQ(cudaGetDeviceCount(&devices), cudaSuccess);
     if (devices < 1) GTEST_SKIP() << "Needs a HIP GPU";
     TransferEngine owner(false), peer(false);
-    ASSERT_EQ(owner.init(P2PHANDSHAKE, "127.0.0.1:17814",
-                         "127.0.0.1", 17814), 0);
+    ASSERT_EQ(owner.init(P2PHANDSHAKE, "127.0.0.1:17814", "127.0.0.1", 17814),
+              0);
     ASSERT_NE(owner.installTransport("hip", nullptr), nullptr);
-    ASSERT_EQ(peer.init(P2PHANDSHAKE, "127.0.0.1:17815",
-                        "127.0.0.1", 17815), 0);
+    ASSERT_EQ(peer.init(P2PHANDSHAKE, "127.0.0.1:17815", "127.0.0.1", 17815),
+              0);
     auto* transport = peer.installTransport("hip", nullptr);
     ASSERT_NE(transport, nullptr);
     void* src = allocOnDevice(kLen, 0);
@@ -169,7 +169,8 @@ TEST(HipTransportTest, InvalidRemoteRequestFailsWholeBatch) {
     }
     EXPECT_TRUE(peer.freeBatchID(batch).ok());
     std::vector<unsigned char> output(kLen);
-    ASSERT_EQ(cudaMemcpy(output.data(), dst, kLen, cudaMemcpyDefault), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(output.data(), dst, kLen, cudaMemcpyDefault),
+              cudaSuccess);
     EXPECT_TRUE(std::all_of(output.begin(), output.end(),
                             [](auto byte) { return byte == 0; }));
     EXPECT_EQ(owner.unregisterLocalMemory(dst), 0);

@@ -520,7 +520,8 @@ Status HipTransport::synchronizePendingTransfers(
             LOG(ERROR) << "HipTransport: hipEventSynchronize failed: "
                        << hipGetErrorString(err);
             pt.slice->markFailed();
-            status = Status::Memory("HipTransport: event synchronization failed");
+            status =
+                Status::Memory("HipTransport: event synchronization failed");
         }
 
         // Return event to pool
@@ -599,7 +600,8 @@ Status HipTransport::submitTransferTask(
 }
 
 Status HipTransport::submitTasks(
-    const std::vector<std::pair<TransferTask*, const TransferRequest*>>& tasks) {
+    const std::vector<std::pair<TransferTask*, const TransferRequest*>>&
+        tasks) {
     // Resolve the entire batch before copying any prefix. Select the local
     // device before IPC import, preserving #3548 allocation-base relocation.
     HipDeviceGuard device_guard;
