@@ -393,7 +393,9 @@ size_t CountRequestsFor(const std::vector<std::string>& received,
 void CheckMixedGetBatch(bool timeout) {
     using Server = test::OssFaultHttpServer;
     Server server(
-        {{"waiting", timeout ? Server::Stall() : Server::Gate(206, "first")},
+        {{"waiting", timeout ? Server::Stall()
+                             : Server::Gate(206, "first",
+                                            "Content-Range: bytes 0-4/5\r\n")},
          {"missing", Server::Reply(404, "")},
          {"reset", Server::Reset()},
          {"large-error", Server::Reply(404, std::string(512, 'x'))},
@@ -403,7 +405,8 @@ void CheckMixedGetBatch(bool timeout) {
          {"short", Server::Reply(206, "val")},
          {"oversized", Server::Reply(206, "too-long")},
          {"unavailable", Server::Reply(503, "busy!")},
-         {"tail", Server::Reply(206, "later")}},
+         {"tail",
+          Server::Reply(206, "later", "Content-Range: bytes 0-4/5\r\n")}},
         true);
     ScopedEnvironment environment;
     ConfigureFaultEndpoint(environment, server.port());
@@ -633,7 +636,9 @@ TEST(S3ObjectStorageAdapterEngineTest, BatchConnectionLimitAppliesToGetAndPut) {
             for (size_t i = 0; i < count; ++i) {
                 const auto key = std::to_string(i);
                 routes.emplace(
-                    key, Server::Gate(upload ? 200 : 206, upload ? "" : "x"));
+                    key, Server::Gate(
+                             upload ? 200 : 206, upload ? "" : "x",
+                             upload ? "" : "Content-Range: bytes 0-0/1\r\n"));
                 gets.push_back({key, &buffers[i], 1});
                 puts.push_back({key, &iov, 1});
             }
@@ -845,12 +850,17 @@ TEST(S3ObjectStorageAdapterEngineTest,
          Server::Reply(206, "val", "Content-Range: bytes 0-2/3\r\n")},
         {"unsatisfiable-range", Server::Reply(416, "error")},
         {"full-200", Server::Reply(200, "value")},
-        {"full-206", Server::Reply(206, "value")},
+        {"missing-range", Server::Reply(206, "value")},
+        {"wrong-range",
+         Server::Reply(206, "value", "Content-Range: bytes 1-5/6\r\n")},
+        {"full-206",
+         Server::Reply(206, "value", "Content-Range: bytes 0-4/5\r\n")},
     });
-    const std::array<const char*, 5> keys{"short-200", "clipped-range",
-                                          "unsatisfiable-range", "full-200",
-                                          "full-206"};
-    constexpr size_t invalid_count = 4;
+    const std::array<const char*, 7> keys{
+        "short-200", "clipped-range", "unsatisfiable-range",
+        "full-200",  "missing-range", "wrong-range",
+        "full-206"};
+    constexpr size_t invalid_count = 6;
     ScopedEnvironment environment;
     ConfigureFaultEndpoint(environment, server.port());
     S3ObjectStorageAdapter adapter("/fault-test/");
@@ -1508,14 +1518,16 @@ TEST(S3ObjectStorageAdapterEngineTest,
 TEST(S3ObjectStorageAdapterEngineTest,
      GetRangeAndBatchDistinguishNotFoundFromTransferFailures) {
     using Server = test::OssFaultHttpServer;
-    Server server({{"missing", Server::Reply(404, std::string(512, 'x'))},
-                   {"truncated-error",
-                    Server::Raw("HTTP/1.1 404 Test\r\nContent-Length: 5\r\n"
-                                "Connection: close\r\n\r\nxx")},
-                   {"large-error", Server::Reply(503, std::string(512, 'x'))},
-                   {"oversized", Server::Reply(206, "too-long")},
-                   {"present", Server::Reply(206, "value")}},
-                  true);
+    Server server(
+        {{"missing", Server::Reply(404, std::string(512, 'x'))},
+         {"truncated-error",
+          Server::Raw("HTTP/1.1 404 Test\r\nContent-Length: 5\r\n"
+                      "Connection: close\r\n\r\nxx")},
+         {"large-error", Server::Reply(503, std::string(512, 'x'))},
+         {"oversized", Server::Reply(206, "too-long")},
+         {"present",
+          Server::Reply(206, "value", "Content-Range: bytes 0-4/5\r\n")}},
+        true);
     ScopedEnvironment environment;
     ConfigureFaultEndpoint(environment, server.port());
     S3ObjectStorageAdapter adapter("/get-error-mapping/");
