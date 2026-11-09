@@ -1645,13 +1645,12 @@ TEST(OssObjectStorageAdapterTest, ValidatesContentRangeForSingleAndBatchReads) {
     ConfigureFaultEndpoint(environment, server.port());
     OssObjectStorageAdapter adapter("/range-validation/");
     ASSERT_TRUE(adapter.Init());
-    ObjectStorageAdapter& generic = adapter;
     std::array<char, 7> output;
     for (size_t i = 0; i < invalid.size(); ++i) {
         SCOPED_TRACE(invalid[i]);
         const auto key = "bad-" + std::to_string(i);
         output.fill('!');
-        const auto single = generic.GetRange(key, output.data() + 1, 5, 0);
+        const auto single = adapter.GetRange(key, output.data() + 1, 5, 0);
         ASSERT_FALSE(single);
         EXPECT_EQ(single.error(), ErrorCode::FILE_READ_FAIL);
         const auto batch = adapter.GetBatch({{key, output.data() + 1, 5}});
@@ -1662,14 +1661,14 @@ TEST(OssObjectStorageAdapterTest, ValidatesContentRangeForSingleAndBatchReads) {
         EXPECT_EQ(output.back(), '!');
     }
     for (const char* key : {"known", "unknown"}) {
-        EXPECT_TRUE(generic.GetRange(key, output.data() + 1, 5, 0));
+        EXPECT_TRUE(adapter.GetRange(key, output.data() + 1, 5, 0));
         const auto batch = adapter.GetBatch({{key, output.data() + 1, 5}});
         ASSERT_EQ(batch.size(), 1U);
         EXPECT_TRUE(batch[0]);
     }
-    EXPECT_TRUE(generic.GetRange("offset", output.data() + 1, 5, 5));
+    EXPECT_TRUE(adapter.GetRange("offset", output.data() + 1, 5, 5));
     const auto wrong_offset =
-        generic.GetRange("offset", output.data() + 1, 5, 4);
+        adapter.GetRange("offset", output.data() + 1, 5, 4);
     ASSERT_FALSE(wrong_offset);
     EXPECT_EQ(wrong_offset.error(), ErrorCode::FILE_READ_FAIL);
     server.Stop();
