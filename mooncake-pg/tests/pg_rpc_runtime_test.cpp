@@ -69,8 +69,12 @@ TEST(PgRpcRuntimeTest, ShutdownDrainsRunningCallbackBeforeOwnerDestruction) {
                                                 release.wait();
                                                 callback_finished.store(true);
                                             });
-    ASSERT_EQ(entered.wait_for(std::chrono::seconds(10)),
-              std::future_status::ready);
+    const auto callback_status = entered.wait_for(std::chrono::seconds(10));
+    if (callback_status != std::future_status::ready) {
+        release_callback.set_value();
+        client.shutdown();
+    }
+    ASSERT_EQ(callback_status, std::future_status::ready);
     auto stopped = std::async(std::launch::async, [&] {
         shutdown_entered.set_value();
         client.shutdown();
