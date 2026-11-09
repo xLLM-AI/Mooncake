@@ -1,7 +1,7 @@
 // Mooncake's Release flags intentionally keep assertions enabled. Force the
 // NDEBUG path that disables YLT type literals in production RPC builds.
 #ifndef NDEBUG
-#define NDEBUG
+#define NDEBUG 1
 #endif
 
 #include <gtest/gtest.h>
@@ -110,9 +110,10 @@ TEST(VariadicSerializationTest, RealRpcPreservesLaterFieldsWithNdebug) {
                   config.per_key_preferred_hca_names);
         ASSERT_EQ(bool(actual.residency_affinity_ids),
                   bool(config.residency_affinity_ids));
-        if (config.residency_affinity_ids)
+        if (config.residency_affinity_ids) {
             EXPECT_EQ(actual.residency_affinity_ids.value(),
                       config.residency_affinity_ids.value());
+        }
     }
 }
 
