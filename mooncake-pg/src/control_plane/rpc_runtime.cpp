@@ -89,8 +89,17 @@ void RpcClient::spawn(async_simple::coro::Lazy<void> task) {
         --state->pending_tasks;
         state->drained.notify_all();
     };
-    auto executor = coro_io::get_global_executor();
-    std::move(task).via(executor).start(std::move(complete));
+    try {
+        auto executor = coro_io::get_global_executor();
+        std::move(task).via(executor).start(std::move(complete));
+    } catch (...) {
+        // A failed launch never invokes complete; return its admission before
+        // propagating the error so owner-side shutdown cannot wait forever.
+        std::lock_guard<std::mutex> lock(state->mutex);
+        --state->pending_tasks;
+        state->drained.notify_all();
+        throw;
+    }
 }
 
 void RpcClient::shutdown() {

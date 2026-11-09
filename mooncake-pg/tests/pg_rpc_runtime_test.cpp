@@ -2,11 +2,29 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <future>
+#include <new>
 #include <thread>
 #include <vector>
 
 #include "control_plane/rpc_runtime.h"
+
+namespace {
+thread_local int allocations_until_failure = 0;
+}  // namespace
+
+// Fault injection stays in the test executable, on the launching thread.
+[[gnu::noinline]] void* operator new(size_t size) {
+    if (allocations_until_failure > 0 && --allocations_until_failure == 0)
+        throw std::bad_alloc();
+    if (void* ptr = std::malloc(size ? size : 1)) return ptr;
+    throw std::bad_alloc();
+}
+[[gnu::noinline]] void operator delete(void* ptr) noexcept { std::free(ptr); }
+[[gnu::noinline]] void operator delete(void* ptr, size_t) noexcept {
+    std::free(ptr);
+}
 
 namespace mooncake {
 namespace {
@@ -49,6 +67,34 @@ TEST(PgRpcRuntimeTest, CachedClientHandlesCallsFromMultipleOwnerThreads) {
     // their executor only after every spawned coroutine has been drained.
     client.shutdown();
     EXPECT_EQ(completed.load(), kThreads * kPerThread);
+}
+
+TEST(PgRpcRuntimeTest, LaunchFailureDoesNotLeakShutdownAdmission) {
+    RpcTestService service;
+    RpcServer server;
+    server.registerHandler<&RpcTestService::Echo>(&service);
+    ASSERT_TRUE(server.start());
+    const auto addr = server.getListenAddr("127.0.0.1");
+    // Executor initialization is not the operation whose admission is tested.
+    (void)coro_io::get_global_executor();
+    int launch_failures = 0;
+    // Exercise allocation points without depending on a coroutine-frame size
+    // or on the exact number of allocations in one standard-library version.
+    for (int nth = 1; nth <= 8; ++nth) {
+        SCOPED_TRACE(nth);
+        RpcClient client(std::chrono::milliseconds(100));
+        allocations_until_failure = nth;
+        try {
+            client.callAsync<&RpcTestService::Echo>(addr, 42,
+                                                    [](PGResult<int>) {});
+        } catch (const std::exception&) {
+            ++launch_failures;
+        }
+        allocations_until_failure = 0;
+        // A leaked pending-task count hangs here (bounded by CTest TIMEOUT).
+        client.shutdown();
+    }
+    EXPECT_GT(launch_failures, 0);
 }
 
 TEST(PgRpcRuntimeTest, ShutdownDrainsRunningCallbackBeforeOwnerDestruction) {
