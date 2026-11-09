@@ -26,8 +26,11 @@ else()
 endif()
 
 set(YLT_COMMIT 54f9c0642386e7860e8e11ada698c484dc562d7d)
-set(YLT_ARCHIVE_SHA256
-    11040b1d3f859599e5453ef7e9b5f84f8afa2388b057330f4c667973e5b20f01)
+# SHA256 of the canonical tar payload of the audited upstream archive
+# (gzip archive: 11040b1d3f859599e5453ef7e9b5f84f8afa2388b057330f4c667973e5b20f01).
+# Git versions use different gzip encoders; the uncompressed tar is identical.
+set(YLT_TAR_SHA256
+    141d3020bbbb2f9fc2dc2a180f43e1fa17d03d986ab4c9fb06af09165e4e0710)
 set(YLT_GIT_REPOSITORY
     "https://gitee.com/mirrors/yalantinglibs.git"
     CACHE STRING "Git mirror for the pinned yalantinglibs source")
@@ -39,16 +42,16 @@ FetchContent_Declare(
 # Exclude from install for CMake before 3.28
 FetchContent_GetProperties(yalantinglibs)
 FetchContent_Populate(yalantinglibs)
-# A canonical archive exported from Gitee is byte-identical to the audited
-# upstream archive. Keep its SHA256 validation, not just the Git commit pin.
+# Validate Gitee's canonical source tar against the audited upstream payload,
+# not just the Git commit pin.
 # Explicit non-Git SOURCE_DIR overrides retain FetchContent's existing bypass.
 if(EXISTS "${yalantinglibs_SOURCE_DIR}/.git")
   find_package(Git REQUIRED)
   file(MAKE_DIRECTORY "${yalantinglibs_BINARY_DIR}")
-  set(YLT_SOURCE_ARCHIVE "${yalantinglibs_BINARY_DIR}/pinned-source.tar.gz")
+  set(YLT_SOURCE_ARCHIVE "${yalantinglibs_BINARY_DIR}/pinned-source.tar")
   execute_process(
     COMMAND
-      ${GIT_EXECUTABLE} -C ${yalantinglibs_SOURCE_DIR} archive --format=tar.gz
+      ${GIT_EXECUTABLE} -C ${yalantinglibs_SOURCE_DIR} archive --format=tar
       --prefix=yalantinglibs-${YLT_COMMIT}/ --output=${YLT_SOURCE_ARCHIVE}
       ${YLT_COMMIT}
     RESULT_VARIABLE YLT_ARCHIVE_RESULT)
@@ -56,7 +59,7 @@ if(EXISTS "${yalantinglibs_SOURCE_DIR}/.git")
     message(FATAL_ERROR "Cannot verify the pinned yalantinglibs Git source")
   endif()
   file(SHA256 "${YLT_SOURCE_ARCHIVE}" YLT_ACTUAL_SHA256)
-  if(NOT YLT_ACTUAL_SHA256 STREQUAL YLT_ARCHIVE_SHA256)
+  if(NOT YLT_ACTUAL_SHA256 STREQUAL YLT_TAR_SHA256)
     message(FATAL_ERROR "yalantinglibs source archive SHA256 mismatch")
   endif()
 endif()
