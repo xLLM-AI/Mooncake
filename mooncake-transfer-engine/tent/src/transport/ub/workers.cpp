@@ -280,12 +280,8 @@ Status UbWorkers::submit(const UbTask::Ptr& task, uint64_t device_mask) {
     return submitBatch({task}, device_mask);
 }
 
-thread_local bool UbWorkers::fail_second_enqueue_for_test_ = false;
-
 Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
                               uint64_t device_mask) {
-    const bool fail_second_enqueue =
-        std::exchange(fail_second_enqueue_for_test_, false);
     if (!accepting_.load(std::memory_order_acquire)) {
         return Status::InvalidArgument(
             "UB workers are not accepting work" LOC_MARK);
@@ -340,9 +336,6 @@ Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
             std::array<size_t, PRIO_LOW + 1> inserted_counts{};
             try {
                 for (size_t index = 0; index < pending.size(); ++index) {
-                    if (fail_second_enqueue && index == 1) {
-                        throw std::length_error("Injected UB enqueue failure");
-                    }
                     const auto& item = pending[index];
                     queues_[item.priority].push_back(item);
                     ++inserted_counts[item.priority];

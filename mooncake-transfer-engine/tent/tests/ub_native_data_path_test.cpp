@@ -6,7 +6,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -26,14 +28,40 @@
 #include "tent/transport/ub/ub_transport.h"
 #include "tent/transport/ub/workers.h"
 
-namespace mooncake::tent::ub {
+namespace {
+// Test-local allocation failure, using the same replacement-new approach as
+// tcp_regression_test. No production friend or private-state hook is needed.
+thread_local int allocation_blocks_until_failure = 0;
+thread_local int injected_allocation_failures = 0;
+}  // namespace
 
-class UbWorkersTestPeer {
-   public:
-    static void failSecondEnqueue() {
-        UbWorkers::fail_second_enqueue_for_test_ = true;
+[[gnu::noinline]] void* operator new(size_t size) {
+    if (size == 512 && allocation_blocks_until_failure > 0 &&
+        --allocation_blocks_until_failure == 0) {
+        ++injected_allocation_failures;
+        throw std::bad_alloc();
     }
-};
+    if (void* ptr = std::malloc(size ? size : 1)) return ptr;
+    throw std::bad_alloc();
+}
+[[gnu::noinline]] void operator delete(void* ptr) noexcept { std::free(ptr); }
+[[gnu::noinline]] void operator delete(void* ptr, size_t) noexcept {
+    std::free(ptr);
+}
+[[gnu::noinline]] void* operator new(size_t size,
+                                     const std::nothrow_t&) noexcept {
+    try {
+        return ::operator new(size);
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    }
+}
+[[gnu::noinline]] void operator delete(void* ptr,
+                                       const std::nothrow_t&) noexcept {
+    ::operator delete(ptr);
+}
+
+namespace mooncake::tent::ub {
 
 namespace {
 
@@ -579,21 +607,34 @@ TEST(UbNativeDataPathTest,
     EXPECT_EQ(workers.inflightCount(), 0U);
     EXPECT_EQ(valid_slice->snapshot().state, UbSliceState::kInitial);
 
-    auto rollback_task = UbTask::create(invalid_batch_request);
-    auto rollback_slice = rollback_task->addSlice(UbSliceSpec{
-        source.data(), reinterpret_cast<uint64_t>(target.data()), 16, 0, 1});
-    ASSERT_NE(rollback_slice, nullptr);
-    ASSERT_TRUE(rollback_task->seal());
+    std::vector<UbTask::Ptr> rollback_tasks{valid_task};
+    std::vector<UbSlice::Ptr> rollback_slices{valid_slice};
+    rollback_tasks.reserve(9);
+    rollback_slices.reserve(9);
+    for (size_t i = 1; i < 9; ++i) {
+        auto task = UbTask::create(invalid_batch_request);
+        auto slice = task->addSlice(
+            UbSliceSpec{source.data(),
+                        reinterpret_cast<uint64_t>(target.data()), 16, 0, 1});
+        ASSERT_NE(slice, nullptr);
+        ASSERT_TRUE(task->seal());
+        rollback_tasks.push_back(task);
+        rollback_slices.push_back(slice);
+    }
 
-    // Both slices are marked queued and the first is inserted before the
-    // second enqueue throws.
-    UbWorkersTestPeer::failSecondEnqueue();
-    EXPECT_TRUE(
-        workers.submitBatch({valid_task, rollback_task}).IsInternalError());
+    // For libstdc++'s 512-byte deque blocks: the first matching allocation is
+    // batch preparation, the second grows the queue after an inserted prefix.
+    injected_allocation_failures = 0;
+    allocation_blocks_until_failure = 2;
+    const auto enqueue_status = workers.submitBatch(rollback_tasks);
+    allocation_blocks_until_failure = 0;
+    EXPECT_EQ(injected_allocation_failures, 1);
+    EXPECT_TRUE(enqueue_status.IsInternalError());
     EXPECT_EQ(workers.queuedCount(), 0U);
     EXPECT_EQ(workers.inflightCount(), 0U);
-    EXPECT_EQ(valid_slice->snapshot().state, UbSliceState::kCanceled);
-    EXPECT_EQ(rollback_slice->snapshot().state, UbSliceState::kCanceled);
+    for (const auto& slice : rollback_slices) {
+        EXPECT_EQ(slice->snapshot().state, UbSliceState::kCanceled);
+    }
 
     adapter->holdNextCompletion();
     adapter->dropNextQuiescedCompletion();
