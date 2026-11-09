@@ -995,7 +995,7 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     EXPECT_TRUE(transport.freeSubBatch(rejected_batch).ok());
 
     Transport::SubBatchRef batch = nullptr;
-    ASSERT_TRUE(transport.allocateSubBatch(batch, 3).ok());
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 16).ok());
     Request request{};
     request.opcode = Request::WRITE;
     request.source = source.data();
@@ -1020,11 +1020,14 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     ASSERT_EQ(batch->size(), 1U);
     auto single_slice_request = request;
     single_slice_request.length = 16;
-    UbWorkersTestPeer::failSecondEnqueue();
-    EXPECT_TRUE(transport
-                    .submitTransferTasks(
-                        batch, {single_slice_request, single_slice_request})
-                    .IsInternalError());
+    const std::vector<Request> failed_append(9, single_slice_request);
+    injected_allocation_failures = 0;
+    allocation_blocks_until_failure = 2;
+    const auto append_status =
+        transport.submitTransferTasks(batch, failed_append);
+    allocation_blocks_until_failure = 0;
+    EXPECT_EQ(injected_allocation_failures, 1);
+    EXPECT_TRUE(append_status.IsInternalError());
     EXPECT_EQ(batch->size(), 1U);
     transfer = TransferStatus{PENDING, 0};
     ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
