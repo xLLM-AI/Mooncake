@@ -801,14 +801,6 @@ class FileStorageTest : public ::testing::Test {
         return fileStorage.CheckFilesystem(sync_first);
     }
 
-    static std::vector<int> DiskRootFds(FileStorage& fileStorage) {
-        std::vector<int> fds;
-        for (const auto& root : fileStorage.disk_roots_) {
-            fds.push_back(root.fd);
-        }
-        return fds;
-    }
-
     static tl::expected<void, ErrorCode> InitStorageBackend(
         FileStorage& fileStorage) {
         return fileStorage.storage_backend_->Init();
@@ -2423,22 +2415,6 @@ TEST_F(FileStorageTest, DiskFenceEnodevFencesWithoutFilesystemCheck) {
 // With several disks in storage_filepath, the filesystem check opens and
 // checks every root, instead of stat-ing the whole list as one path (ENOENT,
 // which would let a dead disk go unfenced).
-TEST_F(FileStorageTest, DiskFenceChecksEveryOffloadRoot) {
-    const auto root_a = fs::path(data_path) / "fence_root_a";
-    const auto root_b = fs::path(data_path) / "fence_root_b";
-    fs::create_directories(root_a);
-    fs::create_directories(root_b);
-    auto config = FileStorageConfig::FromEnvironment();
-    config.storage_filepath = root_a.string() + "," + root_b.string();
-    FileStorage file_storage(config, nullptr, "localhost:9004");
-    const std::vector<int> fds = DiskRootFds(file_storage);
-    ASSERT_EQ(fds.size(), 2u);
-    EXPECT_GE(fds[0], 0);
-    EXPECT_GE(fds[1], 0);
-    EXPECT_EQ(CheckFilesystemOf(file_storage, /*sync_first=*/false), 0);
-    EXPECT_EQ(CheckFilesystemOf(file_storage, /*sync_first=*/true), 0);
-}
-
 // A task carried across a bucket deferral (#3006) is NACKed by the fence:
 // nothing re-emits the pool afterwards, and the task would pin its source
 // replica until the master's TTL reaper.

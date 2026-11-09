@@ -438,8 +438,8 @@ class FileStorage {
     // Set on the first disk failure retry cannot fix; cleared only by a
     // store restart. Reads and offload stop as soon as it is set.
     std::atomic<bool> disk_fenced_{false};
-    // The offload roots (storage_filepath may list several disks), each held
-    // open for CheckFilesystem; fd is -1 where the open failed.
+    // The existing single offload root, held open for CheckFilesystem;
+    // fd is -1 where the open failed.
     struct DiskRoot {
         std::string path;
         int fd;

@@ -129,8 +129,9 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         }
     }
 
-    for (auto& path : ResolveOffloadDiskPaths(config_.storage_filepath)) {
-        if (path.empty()) continue;
+    // v0.3.14 owns exactly one offload directory. Do not import the
+    // post-tag multi-disk configuration parser as a dependency of fencing.
+    if (auto path = config_.storage_filepath; !path.empty()) {
         const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         PLOG_IF(WARNING, fd < 0) << "open " << path;
         disk_roots_.push_back(DiskRoot{std::move(path), fd});
