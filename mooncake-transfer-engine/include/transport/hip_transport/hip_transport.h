@@ -79,12 +79,15 @@ class HipTransport : public Transport {
     };
 
     // Start async transfer and return pending transfer info
-    Status startAsyncTransfer(const TransferRequest& request,
-                              TransferTask& task, PendingTransfer& pending);
+    Status startAsyncTransfer(Slice* slice, int device_id,
+                              PendingTransfer& pending);
 
     // Synchronize pending transfers
-    void synchronizePendingTransfers(
+    Status synchronizePendingTransfers(
         std::vector<PendingTransfer>& pending_transfers);
+
+    Status submitTasks(
+        const std::vector<std::pair<TransferTask*, const TransferRequest*>>& tasks);
 
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
         remap_entries_;

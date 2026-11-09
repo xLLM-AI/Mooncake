@@ -453,42 +453,14 @@ int HipTransport::install(std::string& local_server_name,
     return 0;
 }
 
-Status HipTransport::startAsyncTransfer(const TransferRequest& request,
-                                        TransferTask& task,
+Status HipTransport::startAsyncTransfer(Slice* slice, int device_id,
                                         PendingTransfer& pending) {
+    if (!checkHip(hipSetDevice(device_id),
+                  "HipTransport: failed to set device context")) {
+        slice->markFailed();
+        return Status::InvalidArgument("failed to set device context");
+    }
     hipError_t err;
-    int device_id;
-
-    HipDeviceGuard device_guard;
-
-    if (setDeviceContext(request.source, device_id) != 0) {
-        return Status::InvalidArgument("Failed to set device context");
-    }
-
-    // Relocate shared memory address if needed
-    uint64_t dest_addr = request.target_offset;
-    if (request.target_id != LOCAL_SEGMENT_ID) {
-        int rc = relocateSharedMemoryAddress(dest_addr, request.length,
-                                             request.target_id);
-        if (rc) return Status::Memory("device memory not registered");
-    }
-
-    task.total_bytes = request.length;
-
-    // Allocate and configure slice
-    Slice* slice = getSliceCache().allocate();
-    slice->source_addr = (char*)request.source;
-    slice->local.dest_addr = (char*)dest_addr;
-    slice->length = request.length;
-    slice->opcode = request.opcode;
-    slice->task = &task;
-    slice->target_id = request.target_id;
-    slice->status = Slice::PENDING;
-
-    task.slice_list.push_back(slice);
-
-    __sync_fetch_and_add(&task.slice_count, 1);
-
     // Get event and stream from pools
     hipEvent_t event = event_pool_.getEvent(device_id);
     hipStream_t stream = stream_pool_.getNextStream(device_id);
@@ -519,6 +491,9 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
     // Record event on the stream
     err = hipEventRecord(event, stream);
     if (!checkHip(err, "HipTransport: hipEventRecord failed")) {
+        // The copy was enqueued, but no event tracks it. Drain the original
+        // synchronous stream before publishing failure or recycling the event.
+        (void)hipStreamSynchronize(stream);
         slice->markFailed();
         event_pool_.putEvent(event, device_id);
         return Status::Memory("HipTransport: Failed to record event");
@@ -532,9 +507,11 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
     return Status::OK();
 }
 
-void HipTransport::synchronizePendingTransfers(
+Status HipTransport::synchronizePendingTransfers(
     std::vector<PendingTransfer>& pending_transfers) {
+    Status status = Status::OK();
     for (auto& pt : pending_transfers) {
+        (void)hipSetDevice(pt.device_id);
         // Wait for event to complete
         hipError_t err = hipEventSynchronize(pt.event);
         if (err == hipSuccess) {
@@ -543,11 +520,13 @@ void HipTransport::synchronizePendingTransfers(
             LOG(ERROR) << "HipTransport: hipEventSynchronize failed: "
                        << hipGetErrorString(err);
             pt.slice->markFailed();
+            status = Status::Memory("HipTransport: event synchronization failed");
         }
 
         // Return event to pool
         event_pool_.putEvent(pt.event, pt.device_id);
     }
+    return status;
 }
 
 Status HipTransport::submitTransfer(
@@ -564,30 +543,12 @@ Status HipTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
-    // Submit async transfers and collect pending transfer info
-    std::vector<PendingTransfer> pending_transfers;
-    pending_transfers.reserve(entries.size());
-
-    for (auto& request : entries) {
-        TransferTask& task = batch_desc.task_list[task_id];
-        ++task_id;
-
-        PendingTransfer pending;
-        Status status = startAsyncTransfer(request, task, pending);
-        if (!status.ok()) {
-            // Clean up any pending transfers we've already created
-            for (auto& pt : pending_transfers) {
-                event_pool_.putEvent(pt.event, pt.device_id);
-            }
-            return status;
-        }
-        pending_transfers.push_back(pending);
+    std::vector<std::pair<TransferTask*, const TransferRequest*>> tasks;
+    tasks.reserve(entries.size());
+    for (const auto& request : entries) {
+        tasks.emplace_back(&batch_desc.task_list[task_id++], &request);
     }
-
-    // Synchronize all pending transfers and mark slices as complete
-    synchronizePendingTransfers(pending_transfers);
-
-    return Status::OK();
+    return submitTasks(tasks);
 }
 
 Status HipTransport::getTransferStatus(BatchID batch_id, size_t task_id,
@@ -628,32 +589,71 @@ Status HipTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
 Status HipTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
-    // Submit async transfers and collect pending transfer info
-    std::vector<PendingTransfer> pending_transfers;
-    pending_transfers.reserve(task_list.size());
+    std::vector<std::pair<TransferTask*, const TransferRequest*>> tasks;
+    tasks.reserve(task_list.size());
+    for (auto* task : task_list) {
+        assert(task && task->request);
+        tasks.emplace_back(task, task->request);
+    }
+    return submitTasks(tasks);
+}
 
-    for (auto* task_ptr : task_list) {
-        assert(task_ptr);
-        auto& task = *task_ptr;
-        assert(task.request);
-        auto& request = *task.request;
-
-        PendingTransfer pending;
-        Status status = startAsyncTransfer(request, task, pending);
-        if (!status.ok()) {
-            // Clean up any pending transfers we've already created
-            for (auto& pt : pending_transfers) {
-                event_pool_.putEvent(pt.event, pt.device_id);
-            }
-            return status;
+Status HipTransport::submitTasks(
+    const std::vector<std::pair<TransferTask*, const TransferRequest*>>& tasks) {
+    // Resolve the entire batch before copying any prefix. Select the local
+    // device before IPC import, preserving #3548 allocation-base relocation.
+    HipDeviceGuard device_guard;
+    std::vector<uint64_t> dest_addrs(tasks.size());
+    std::vector<int> device_ids(tasks.size(), -1);
+    Status status = Status::OK();
+    for (size_t i = 0; i < tasks.size() && status.ok(); ++i) {
+        const auto& request = *tasks[i].second;
+        dest_addrs[i] = request.target_offset;
+        if (setDeviceContext(request.source, device_ids[i]) != 0) {
+            status = Status::InvalidArgument("failed to set device context");
+        } else if (request.target_id != LOCAL_SEGMENT_ID &&
+                   relocateSharedMemoryAddress(dest_addrs[i], request.length,
+                                               request.target_id)) {
+            status = Status::Memory("device memory not registered");
         }
-        pending_transfers.push_back(pending);
     }
 
-    // Synchronize all pending transfers and mark slices as complete
-    synchronizePendingTransfers(pending_transfers);
+    // Even rejected/unsubmitted tasks need a terminal failed slice: zero
+    // slices otherwise read as COMPLETED and leave event-driven waiters stuck.
+    std::vector<Slice*> slices;
+    slices.reserve(tasks.size());
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        auto& task = *tasks[i].first;
+        const auto& request = *tasks[i].second;
+        task.total_bytes = request.length;
+        auto* slice = getSliceCache().allocate();
+        slice->source_addr = (char*)request.source;
+        slice->local.dest_addr = (char*)dest_addrs[i];
+        slice->length = request.length;
+        slice->opcode = request.opcode;
+        slice->task = &task;
+        slice->target_id = request.target_id;
+        slice->status = Slice::PENDING;
+        task.slice_list.push_back(slice);
+        __sync_fetch_and_add(&task.slice_count, 1);
+        slices.push_back(slice);
+    }
 
-    return Status::OK();
+    std::vector<PendingTransfer> pending;
+    pending.reserve(tasks.size());
+    for (size_t i = 0; i < slices.size(); ++i) {
+        if (!status.ok()) {
+            slices[i]->markFailed();
+            continue;
+        }
+        PendingTransfer transfer;
+        status = startAsyncTransfer(slices[i], device_ids[i], transfer);
+        if (status.ok()) pending.push_back(transfer);
+    }
+    // Retain the v0.3.14 synchronous/event-driven semantics, including on
+    // errors: never recycle an event or allow free while a copy is in flight.
+    auto drain_status = synchronizePendingTransfers(pending);
+    return status.ok() ? drain_status : status;
 }
 
 namespace {
@@ -881,6 +881,7 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                                               uint64_t length,
                                               uint64_t target_id) {
     auto desc = metadata_->getSegmentDescByID(target_id);
+    if (!desc) return ERR_INVALID_ARGUMENT;
 
     // Search for matching buffer entry
     for (auto& entry : desc->buffers) {
