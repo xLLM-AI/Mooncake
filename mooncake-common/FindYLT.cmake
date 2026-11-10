@@ -26,14 +26,25 @@ else()
 endif()
 
 set(YLT_COMMIT 54f9c0642386e7860e8e11ada698c484dc562d7d)
-# SHA256 of the canonical tar payload of the audited upstream archive
-# (gzip archive: 11040b1d3f859599e5453ef7e9b5f84f8afa2388b057330f4c667973e5b20f01).
-# Git versions use different gzip encoders; the uncompressed tar is identical.
+# Reproduce the canonical source tar hash from a checkout containing this pin:
+# rev=54f9c0642386e7860e8e11ada698c484dc562d7d
+# git -C /path/to/yalantinglibs archive --format=tar \
+#   --prefix="yalantinglibs-${rev}/" "${rev}" | sha256sum
+# The audited GitHub archive (not Gitee's HTML archive/download page) has gzip
+# SHA256 11040b1d3f859599e5453ef7e9b5f84f8afa2388b057330f4c667973e5b20f01.
+# `gzip -dc audited.tar.gz | sha256sum` gives the same tar hash below, including
+# the yalantinglibs-<full-sha>/ prefix. Gzip encoders can differ across Git versions.
 set(YLT_TAR_SHA256
     141d3020bbbb2f9fc2dc2a180f43e1fa17d03d986ab4c9fb06af09165e4e0710)
+# GH_MIRROR / ASCEND_GITHUB_MIRROR_URLS rewrites GitHub archive URLs, not this
+# Git source. Set -DYLT_GIT_REPOSITORY=<git-repository> to redirect YLT explicitly.
 set(YLT_GIT_REPOSITORY
     "https://gitee.com/mirrors/yalantinglibs.git"
     CACHE STRING "Git mirror for the pinned yalantinglibs source")
+option(YLT_ALLOW_UNVERIFIED_SOURCE
+       "Allow YLT sources without Git metadata, bypassing source verification"
+       OFF)
+message(STATUS "YLT Git source: ${YLT_GIT_REPOSITORY} @ ${YLT_COMMIT}")
 FetchContent_Declare(
   yalantinglibs
   GIT_REPOSITORY ${YLT_GIT_REPOSITORY}
@@ -44,7 +55,7 @@ FetchContent_GetProperties(yalantinglibs)
 FetchContent_Populate(yalantinglibs)
 # Validate Gitee's canonical source tar against the audited upstream payload,
 # not just the Git commit pin.
-# Explicit non-Git SOURCE_DIR overrides retain FetchContent's existing bypass.
+# Every source without Git metadata requires an explicit, logged opt-out.
 if(EXISTS "${yalantinglibs_SOURCE_DIR}/.git")
   find_package(Git REQUIRED)
   execute_process(
@@ -82,6 +93,20 @@ if(EXISTS "${yalantinglibs_SOURCE_DIR}/.git")
   if(NOT YLT_ACTUAL_SHA256 STREQUAL YLT_TAR_SHA256)
     message(FATAL_ERROR "yalantinglibs source archive SHA256 mismatch")
   endif()
+  message(
+    STATUS "YLT source verified: pinned HEAD, clean checkout and tar SHA256")
+elseif(YLT_ALLOW_UNVERIFIED_SOURCE)
+  message(
+    WARNING
+      "YLT source is UNVERIFIED: ${yalantinglibs_SOURCE_DIR} has no .git. "
+      "HEAD, working-tree cleanliness and tar SHA256 checks were skipped by "
+      "explicit YLT_ALLOW_UNVERIFIED_SOURCE=ON; expected pin ${YLT_COMMIT}.")
+else()
+  message(
+    FATAL_ERROR
+      "YLT source has no .git; cannot verify the pin, working tree or tar SHA256. "
+      "Set -DYLT_ALLOW_UNVERIFIED_SOURCE=ON to opt out explicitly (with a warning)."
+  )
 endif()
 add_subdirectory(${yalantinglibs_SOURCE_DIR} ${yalantinglibs_BINARY_DIR}
                  EXCLUDE_FROM_ALL)
