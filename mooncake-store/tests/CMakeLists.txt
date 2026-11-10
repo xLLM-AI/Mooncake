@@ -206,6 +206,18 @@ if(TARGET Mooncake::liburing)
     "LINKER:--wrap=io_uring_unregister_buffers")
 endif()
 set_tests_properties(posix_file_test PROPERTIES TIMEOUT 180)
+if(TARGET Mooncake::liburing)
+  add_store_test(file_storage_uring_owner_test
+                 file_storage_uring_owner_test.cpp ../src/uring_file.cpp)
+  target_link_options(
+    file_storage_uring_owner_test
+    PRIVATE
+    "LINKER:--wrap=io_uring_register_buffers"
+    "LINKER:--wrap=io_uring_clone_buffers"
+    "LINKER:--wrap=io_uring_unregister_buffers"
+    "LINKER:--wrap=io_uring_submit_and_wait")
+  set_tests_properties(file_storage_uring_owner_test PROPERTIES TIMEOUT 60)
+endif()
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 add_store_test(nvmeof_initiator_test nvmeof_initiator_test.cpp)

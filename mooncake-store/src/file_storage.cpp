@@ -152,12 +152,14 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         if (aligned_allocator) {
             void* base_ptr = aligned_allocator->get_base_pointer();
             size_t size = aligned_allocator->get_total_size();
-            if (UringFile::register_global_buffer(base_ptr, size)) {
-                uring_buffer_registered_ = true;
+            uring_buffer_registration_ =
+                UringFile::acquire_global_buffer(base_ptr, size);
+            if (uring_buffer_registration_) {
                 LOG(INFO) << "Successfully registered buffer with UringFile: "
                           << "base=" << base_ptr << ", size=" << size;
             } else {
-                LOG(WARNING) << "Failed to register buffer with UringFile";
+                LOG(WARNING) << "Fixed buffer unavailable or already owned; "
+                                "using unfixed I/O";
             }
         }
     }
@@ -183,7 +185,7 @@ FileStorage::~FileStorage() {
     // it would otherwise keep the freed pages pinned for the process lifetime.
     // The owner stops issuing I/O through this FileStorage before destroying
     // it.
-    if (uring_buffer_registered_) UringFile::unregister_global_buffer();
+    UringFile::release_global_buffer(uring_buffer_registration_);
 #endif
     for (const auto& root : disk_roots_) {
         if (root.fd >= 0) ::close(root.fd);

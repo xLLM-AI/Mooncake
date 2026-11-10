@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <sys/uio.h>
@@ -239,14 +240,17 @@ class UringFile : public StorageFile {
     // Must be called after write_aligned and before writing dependent metadata.
     tl::expected<void, ErrorCode> datasync() override;
 
-    // Buffer registration — delegates to the shared ring (process-wide).
-    // Static variant: no file instance needed. Must be called once from a
-    // single thread before I/O threads begin. Other threads lazily pick up
-    // the registration on their first I/O call via ensure_buf_registered().
+    // Only one live owner may register a process-wide fixed buffer. Zero
+    // means unavailable/occupied: additional owners use unfixed I/O. Release
+    // only this token, after ALL I/O on its buffer stops and before freeing it.
+    // A stale token cannot revoke a later registration, even at the same
+    // address.
+    static uint64_t acquire_global_buffer(void *buffer, size_t length);
+    static void release_global_buffer(uint64_t token);
+
+    // Legacy global pair: cannot replace or unregister a token-owned buffer.
+    // The caller must stop all I/O on its buffer before unregistering it.
     static bool register_global_buffer(void *buffer, size_t length);
-    // Unpins the buffer: releases the shared registration and every I/O
-    // thread's clone of it. Call after all I/O on the buffer has stopped and
-    // before the buffer is freed.
     static void unregister_global_buffer();
 
     bool register_buffer(void *buffer, size_t length);
@@ -255,6 +259,7 @@ class UringFile : public StorageFile {
 
    private:
     bool use_direct_io_;
+    uint64_t buffer_registration_ = 0;
     static constexpr size_t ALIGNMENT_ = 4096;
 
     /// After a failed ring call: keep the errno of its first failed CQE.

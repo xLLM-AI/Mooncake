@@ -40,7 +40,8 @@ static constexpr size_t kMaxFixedBufBytes = 1ULL << 30;
 // ============================================================================
 // GlobalBufInfo — process-wide buffer registration state.
 //
-// register_buffer() is called once from the storage-backend init path. The
+// Only one live owner can acquire this registration. Additional storage
+// instances use unfixed I/O, never replace another owner's table. The owned
 // buffer is registered (and its pages pinned) once, on a source ring that does
 // no I/O. Each thread-local ring clones that buffer table lazily on first I/O,
 // which shares the pinned pages instead of pinning the buffer again: with
@@ -61,6 +62,8 @@ struct GlobalBufInfo {
     std::mutex source_mu;
     struct io_uring source{};
     bool source_ready = false;
+    // Only the legacy global API may release this token without an argument.
+    uint64_t legacy_registration = 0;
     // Changes whenever the source registration is created or released.
     std::atomic<uint64_t> generation{0};
 };
@@ -87,27 +90,35 @@ static void revoke_cloned_buffers_locked();
 // whose clone is dropped mid-I/O fails that I/O. Unregistering first makes
 // the unpin synchronous: io_uring_queue_exit() alone leaves it to the
 // kernel's deferred ring teardown.
-static void release_source_registration() {
+static bool release_source_registration(uint64_t token, bool legacy = false) {
     std::lock_guard<std::mutex> lock(g_buf.source_mu);
-    if (!g_buf.source_ready) return;
+    if (legacy) token = g_buf.legacy_registration;
+    if (!token || !g_buf.source_ready ||
+        token != g_buf.generation.load(std::memory_order_relaxed))
+        return false;
+    g_buf.base.store(nullptr, std::memory_order_release);
+    g_buf.size.store(0, std::memory_order_release);
+    g_buf.legacy_registration = 0;
     g_buf.generation.fetch_add(1, std::memory_order_acq_rel);
     revoke_cloned_buffers_locked();
     io_uring_unregister_buffers(&g_buf.source);
     io_uring_queue_exit(&g_buf.source);
     g_buf.source_ready = false;
+    return true;
 }
 
-// Registers [buffer, buffer + length) on the source ring, replacing any
-// previous registration. Returns false if fixed buffers cannot be shared.
-static bool register_source_buffer(void* buffer, size_t length) {
-    release_source_registration();
+// Acquire a unique owner token, or zero if occupied/unsupported. Do not revoke
+// a live registration: its owner may have fixed I/O between check and submit.
+static uint64_t register_source_buffer(void* buffer, size_t length,
+                                       bool legacy) {
 #ifdef MC_HAVE_URING_CLONE_BUFFERS
     std::lock_guard<std::mutex> lock(g_buf.source_mu);
+    if (g_buf.source_ready) return 0;
     int ret = io_uring_queue_init(1, &g_buf.source, 0);
     if (ret < 0) {
         LOG(WARNING) << "[UringFile] source ring init failed: "
                      << strerror(-ret) << " — using unfixed I/O";
-        return false;
+        return 0;
     }
     std::vector<struct iovec> iovs;
     iovs.reserve((length + kMaxFixedBufBytes - 1) / kMaxFixedBufBytes);
@@ -123,19 +134,24 @@ static bool register_source_buffer(void* buffer, size_t length) {
                      << " buf=" << buffer << " size=" << length
                      << " pieces=" << iovs.size() << " — using unfixed I/O";
         io_uring_queue_exit(&g_buf.source);
-        return false;
+        return 0;
     }
+    g_buf.base.store(buffer, std::memory_order_release);
+    g_buf.size.store(length, std::memory_order_release);
     g_buf.source_ready = true;
-    g_buf.generation.fetch_add(1, std::memory_order_acq_rel);
+    const uint64_t token =
+        g_buf.generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (legacy) g_buf.legacy_registration = token;
     LOG(INFO) << "[UringFile] registered fixed buffer addr=" << buffer
               << " size=" << length << " pieces=" << iovs.size();
-    return true;
+    return token;
 #else
     (void)buffer;
     (void)length;
+    (void)legacy;
     LOG(INFO) << "[UringFile] liburing lacks io_uring_clone_buffers(); "
                  "using unfixed I/O";
-    return false;
+    return 0;
 #endif
 }
 
@@ -887,6 +903,7 @@ UringFile::UringFile(const std::string& filename, int fd,
 }
 
 UringFile::~UringFile() {
+    unregister_buffer();
     auto t0 = std::chrono::steady_clock::now();
 
     if (fd_ >= 0) {
@@ -1294,18 +1311,19 @@ tl::expected<void, ErrorCode> UringFile::datasync() {
 // thread's ring. If the clone fails (kernels before 6.13 reject it), no ring
 // can use the source registration, so its pinned pages are released now
 // instead of at unregister.
-static bool register_and_clone(void* buffer, size_t length) {
-    if (!register_source_buffer(buffer, length)) return false;
-    if (SharedUringRing::instance().ensure_buf_registered()) return true;
-    release_source_registration();
-    return false;
+static uint64_t register_and_clone(void* buffer, size_t length, bool legacy) {
+    const uint64_t token = register_source_buffer(buffer, length, legacy);
+    if (!token) return 0;
+    if (SharedUringRing::instance().ensure_buf_registered()) return token;
+    release_source_registration(token);
+    return 0;
 }
 
-bool UringFile::register_global_buffer(void* buffer, size_t length) {
+static uint64_t acquire_buffer_registration(void* buffer, size_t length,
+                                            bool legacy) {
     if (!buffer || length == 0) {
-        LOG(ERROR)
-            << "[UringFile::register_global_buffer] invalid buffer or length";
-        return false;
+        LOG(ERROR) << "[UringFile] invalid buffer or length";
+        return 0;
     }
     // Disable Transparent Huge Pages on this region before pinning.
     // io_uring uses FOLL_LONGTERM to pin pages; on kernel 5.15 the kernel
@@ -1314,32 +1332,35 @@ bool UringFile::register_global_buffer(void* buffer, size_t length) {
     // MADV_NOHUGEPAGE prevents the kernel from backing this range with THPs,
     // making pin_user_pages() reliable regardless of system THP policy.
     if (madvise(buffer, length, MADV_NOHUGEPAGE) != 0) {
-        LOG(WARNING)
-            << "[UringFile::register_global_buffer] madvise(NOHUGEPAGE)"
-            << " failed errno=" << errno << " (" << strerror(errno)
-            << ") — continuing anyway";
+        LOG(WARNING) << "[UringFile] madvise(NOHUGEPAGE)"
+                     << " failed errno=" << errno << " (" << strerror(errno)
+                     << ") — continuing anyway";
     }
-    g_buf.base.store(buffer, std::memory_order_release);
-    g_buf.size.store(length, std::memory_order_release);
-    bool ok = register_and_clone(buffer, length);
-    if (ok) {
-        LOG(INFO) << "[UringFile::register_global_buffer] registered"
-                  << " addr=" << buffer << " size=" << length;
-    } else {
-        LOG(WARNING)
-            << "[UringFile::register_global_buffer] registration failed"
-            << " addr=" << buffer << " size=" << length
-            << " — I/O will use regular (non-fixed-buffer) io_uring,"
-            << " which is correct but slightly less optimal";
+    const uint64_t token = register_and_clone(buffer, length, legacy);
+    if (!token) {
+        LOG(INFO) << "[UringFile] fixed buffer unavailable or already owned"
+                  << " addr=" << buffer << " size=" << length
+                  << " — I/O will use regular (non-fixed-buffer) io_uring";
     }
-    return ok;
+    return token;
+}
+
+uint64_t UringFile::acquire_global_buffer(void* buffer, size_t length) {
+    return acquire_buffer_registration(buffer, length, false);
+}
+
+void UringFile::release_global_buffer(uint64_t token) {
+    if (release_source_registration(token))
+        SharedUringRing::instance().unregister_buf_local();
+}
+
+bool UringFile::register_global_buffer(void* buffer, size_t length) {
+    return acquire_buffer_registration(buffer, length, true) != 0;
 }
 
 void UringFile::unregister_global_buffer() {
-    g_buf.base.store(nullptr, std::memory_order_release);
-    g_buf.size.store(0, std::memory_order_release);
-    SharedUringRing::instance().unregister_buf_local();
-    release_source_registration();
+    if (release_source_registration(0, true))
+        SharedUringRing::instance().unregister_buf_local();
 }
 
 bool UringFile::register_buffer(void* buffer, size_t length) {
@@ -1357,23 +1378,14 @@ bool UringFile::register_buffer(void* buffer, size_t length) {
             return false;
         }
     }
-    // Publish globally; each thread-local ring clones it lazily on first I/O.
-    g_buf.base.store(buffer, std::memory_order_release);
-    g_buf.size.store(length, std::memory_order_release);
-    // Register once, then clone onto the calling thread's ring immediately.
-    bool ok = register_and_clone(buffer, length);
-    LOG(INFO) << "[UringFile::register_buffer] addr=" << buffer
-              << " size=" << length << " calling-thread-registered=" << ok;
-    return ok;
+    if (buffer_registration_) return false;
+    buffer_registration_ = acquire_global_buffer(buffer, length);
+    return buffer_registration_ != 0;
 }
 
 void UringFile::unregister_buffer() {
-    // Clear the global state so no new thread picks it up.
-    g_buf.base.store(nullptr, std::memory_order_release);
-    g_buf.size.store(0, std::memory_order_release);
-    // Unregister on the calling thread's ring.
-    SharedUringRing::instance().unregister_buf_local();
-    release_source_registration();
+    release_global_buffer(buffer_registration_);
+    buffer_registration_ = 0;
 }
 
 bool UringFile::is_buffer_registered() const {
