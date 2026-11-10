@@ -453,42 +453,14 @@ int HipTransport::install(std::string& local_server_name,
     return 0;
 }
 
-Status HipTransport::startAsyncTransfer(const TransferRequest& request,
-                                        TransferTask& task,
+Status HipTransport::startAsyncTransfer(Slice* slice, int device_id,
                                         PendingTransfer& pending) {
+    if (!checkHip(hipSetDevice(device_id),
+                  "HipTransport: failed to set device context")) {
+        slice->markFailed();
+        return Status::InvalidArgument("failed to set device context");
+    }
     hipError_t err;
-    int device_id;
-
-    HipDeviceGuard device_guard;
-
-    if (setDeviceContext(request.source, device_id) != 0) {
-        return Status::InvalidArgument("Failed to set device context");
-    }
-
-    // Relocate shared memory address if needed
-    uint64_t dest_addr = request.target_offset;
-    if (request.target_id != LOCAL_SEGMENT_ID) {
-        int rc = relocateSharedMemoryAddress(dest_addr, request.length,
-                                             request.target_id);
-        if (rc) return Status::Memory("device memory not registered");
-    }
-
-    task.total_bytes = request.length;
-
-    // Allocate and configure slice
-    Slice* slice = getSliceCache().allocate();
-    slice->source_addr = (char*)request.source;
-    slice->local.dest_addr = (char*)dest_addr;
-    slice->length = request.length;
-    slice->opcode = request.opcode;
-    slice->task = &task;
-    slice->target_id = request.target_id;
-    slice->status = Slice::PENDING;
-
-    task.slice_list.push_back(slice);
-
-    __sync_fetch_and_add(&task.slice_count, 1);
-
     // Get event and stream from pools
     hipEvent_t event = event_pool_.getEvent(device_id);
     hipStream_t stream = stream_pool_.getNextStream(device_id);
@@ -519,6 +491,9 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
     // Record event on the stream
     err = hipEventRecord(event, stream);
     if (!checkHip(err, "HipTransport: hipEventRecord failed")) {
+        // The copy was enqueued, but no event tracks it. Drain the original
+        // synchronous stream before publishing failure or recycling the event.
+        (void)hipStreamSynchronize(stream);
         slice->markFailed();
         event_pool_.putEvent(event, device_id);
         return Status::Memory("HipTransport: Failed to record event");
@@ -532,9 +507,11 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
     return Status::OK();
 }
 
-void HipTransport::synchronizePendingTransfers(
+Status HipTransport::synchronizePendingTransfers(
     std::vector<PendingTransfer>& pending_transfers) {
+    Status status = Status::OK();
     for (auto& pt : pending_transfers) {
+        (void)hipSetDevice(pt.device_id);
         // Wait for event to complete
         hipError_t err = hipEventSynchronize(pt.event);
         if (err == hipSuccess) {
@@ -543,11 +520,14 @@ void HipTransport::synchronizePendingTransfers(
             LOG(ERROR) << "HipTransport: hipEventSynchronize failed: "
                        << hipGetErrorString(err);
             pt.slice->markFailed();
+            status =
+                Status::Memory("HipTransport: event synchronization failed");
         }
 
         // Return event to pool
         event_pool_.putEvent(pt.event, pt.device_id);
     }
+    return status;
 }
 
 Status HipTransport::submitTransfer(
@@ -564,30 +544,12 @@ Status HipTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
-    // Submit async transfers and collect pending transfer info
-    std::vector<PendingTransfer> pending_transfers;
-    pending_transfers.reserve(entries.size());
-
-    for (auto& request : entries) {
-        TransferTask& task = batch_desc.task_list[task_id];
-        ++task_id;
-
-        PendingTransfer pending;
-        Status status = startAsyncTransfer(request, task, pending);
-        if (!status.ok()) {
-            // Clean up any pending transfers we've already created
-            for (auto& pt : pending_transfers) {
-                event_pool_.putEvent(pt.event, pt.device_id);
-            }
-            return status;
-        }
-        pending_transfers.push_back(pending);
+    std::vector<std::pair<TransferTask*, const TransferRequest*>> tasks;
+    tasks.reserve(entries.size());
+    for (const auto& request : entries) {
+        tasks.emplace_back(&batch_desc.task_list[task_id++], &request);
     }
-
-    // Synchronize all pending transfers and mark slices as complete
-    synchronizePendingTransfers(pending_transfers);
-
-    return Status::OK();
+    return submitTasks(tasks);
 }
 
 Status HipTransport::getTransferStatus(BatchID batch_id, size_t task_id,
@@ -628,33 +590,89 @@ Status HipTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
 Status HipTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
-    // Submit async transfers and collect pending transfer info
-    std::vector<PendingTransfer> pending_transfers;
-    pending_transfers.reserve(task_list.size());
+    std::vector<std::pair<TransferTask*, const TransferRequest*>> tasks;
+    tasks.reserve(task_list.size());
+    for (auto* task : task_list) {
+        assert(task && task->request);
+        tasks.emplace_back(task, task->request);
+    }
+    return submitTasks(tasks);
+}
 
-    for (auto* task_ptr : task_list) {
-        assert(task_ptr);
-        auto& task = *task_ptr;
-        assert(task.request);
-        auto& request = *task.request;
-
-        PendingTransfer pending;
-        Status status = startAsyncTransfer(request, task, pending);
-        if (!status.ok()) {
-            // Clean up any pending transfers we've already created
-            for (auto& pt : pending_transfers) {
-                event_pool_.putEvent(pt.event, pt.device_id);
-            }
-            return status;
+Status HipTransport::submitTasks(
+    const std::vector<std::pair<TransferTask*, const TransferRequest*>>&
+        tasks) {
+    // Resolve the entire batch before copying any prefix. Select the local
+    // device before IPC import, preserving #3548 allocation-base relocation.
+    HipDeviceGuard device_guard;
+    std::vector<uint64_t> dest_addrs(tasks.size());
+    std::vector<int> device_ids(tasks.size(), -1);
+    Status status = Status::OK();
+    for (size_t i = 0; i < tasks.size() && status.ok(); ++i) {
+        const auto& request = *tasks[i].second;
+        dest_addrs[i] = request.target_offset;
+        if (setDeviceContext(request.source, device_ids[i]) != 0) {
+            status = Status::InvalidArgument("failed to set device context");
+        } else if (request.target_id != LOCAL_SEGMENT_ID &&
+                   relocateSharedMemoryAddress(dest_addrs[i], request.length,
+                                               request.target_id)) {
+            status = Status::Memory("device memory not registered");
         }
-        pending_transfers.push_back(pending);
     }
 
-    // Synchronize all pending transfers and mark slices as complete
-    synchronizePendingTransfers(pending_transfers);
+    // Even rejected/unsubmitted tasks need a terminal failed slice: zero
+    // slices otherwise read as COMPLETED and leave event-driven waiters stuck.
+    std::vector<Slice*> slices;
+    slices.reserve(tasks.size());
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        auto& task = *tasks[i].first;
+        const auto& request = *tasks[i].second;
+        task.total_bytes = request.length;
+        auto* slice = getSliceCache().allocate();
+        slice->source_addr = (char*)request.source;
+        slice->local.dest_addr = (char*)dest_addrs[i];
+        slice->length = request.length;
+        slice->opcode = request.opcode;
+        slice->task = &task;
+        slice->target_id = request.target_id;
+        slice->status = Slice::PENDING;
+        task.slice_list.push_back(slice);
+        __sync_fetch_and_add(&task.slice_count, 1);
+        slices.push_back(slice);
+    }
 
-    return Status::OK();
+    std::vector<PendingTransfer> pending;
+    pending.reserve(tasks.size());
+    for (size_t i = 0; i < slices.size(); ++i) {
+        if (!status.ok()) {
+            slices[i]->markFailed();
+            continue;
+        }
+        PendingTransfer transfer;
+        status = startAsyncTransfer(slices[i], device_ids[i], transfer);
+        if (status.ok()) pending.push_back(transfer);
+    }
+    // Retain the v0.3.14 synchronous/event-driven semantics, including on
+    // errors: never recycle an event or allow free while a copy is in flight.
+    auto drain_status = synchronizePendingTransfers(pending);
+    return status.ok() ? drain_status : status;
 }
+
+namespace {
+
+// Matches the descs this transport published into the shared local buffer
+// list. Under multi-protocol the protocol field is authoritative; without it,
+// the serialized IPC/fabric handle is the discriminator (only GPU-IPC
+// transports fill shm_name, and they never coexist with HIP in one build).
+bool isOwnDesc(const TransferMetadata::BufferDesc& desc) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    return desc.protocol == "hip";
+#else
+    return !desc.shm_name.empty();
+#endif
+}
+
+}  // namespace
 
 int HipTransport::registerLocalMemory(void* addr, size_t length,
                                       const std::string& location,
@@ -684,27 +702,65 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
                 LOG(INFO) << "HipTransport: skipping non-device memory " << addr
                           << ", leaving it to other transports";
             }
+            skipped_addrs_.insert((uint64_t)addr);
+            return 0;
+        }
+
+        // Resolve the true hipMalloc base address. Framework caching
+        // allocators (PyTorch, etc.) sub-allocate tensors within larger
+        // hipMalloc segments. hipIpcGetMemHandle always returns a handle for
+        // the entire segment, so we must register at segment granularity or
+        // relocateSharedMemoryAddress() maps every sub-range back onto the
+        // segment base and the peer silently reads the wrong bytes.
+        void* base_ptr = nullptr;
+        size_t alloc_size = 0;
+        if (!checkHip(hipMemGetAddressRange((hipDeviceptr_t*)&base_ptr,
+                                            &alloc_size, (hipDeviceptr_t)addr),
+                      "HipTransport: hipMemGetAddressRange failed")) {
+            return -1;
+        }
+
+        // Re-registering the same address is idempotent; a new sub-range of
+        // an already exported allocation just takes another reference.
+        uint64_t base = (uint64_t)base_ptr;
+        if (!registered_addr_to_base_.emplace((uint64_t)addr, base).second) {
+            return 0;
+        }
+        auto it = registered_base_refs_.find(base);
+        if (it != registered_base_refs_.end()) {
+            it->second++;
             return 0;
         }
 
         // Get IPC handle
         hipIpcMemHandle_t handle;
-        if (!checkHip(hipIpcGetMemHandle(&handle, addr),
+        if (!checkHip(hipIpcGetMemHandle(&handle, base_ptr),
                       "HipTransport: hipIpcGetMemHandle failed")) {
+            registered_addr_to_base_.erase((uint64_t)addr);
             return -1;
         }
 
         // Register buffer with metadata
         (void)remote_accessible;
         BufferDesc desc;
-        desc.addr = (uint64_t)addr;
-        desc.length = length;
+        desc.addr = (uint64_t)base_ptr;
+        desc.length = alloc_size;
         desc.name = location;
         desc.shm_name = serializeBinaryData(&handle, sizeof(hipIpcMemHandle_t));
 #ifdef ENABLE_MULTI_PROTOCOL
         desc.protocol = "hip";
 #endif
-        return metadata_->addLocalMemoryBuffer(desc, true);
+        int rc = metadata_->addLocalMemoryBuffer(desc, true);
+        if (rc == 0) {
+            registered_base_refs_[base] = 1;
+        } else {
+            // addLocalMemoryBuffer appends the desc before publishing it;
+            // drop the leftover so a failed registration leaves nothing
+            // behind for a later rollback or unregister to miss.
+            metadata_->removeLocalMemoryBuffer((void*)base, isOwnDesc, false);
+            registered_addr_to_base_.erase((uint64_t)addr);
+        }
+        return rc;
     }
 
     // Fabric memory registration
@@ -716,6 +772,7 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
             LOG(WARNING) << "Memory region " << addr
                          << " is not allocated by hipMemCreate, "
                          << "but it can be used as local buffer";
+            skipped_addrs_.insert((uint64_t)addr);
             return 0;
         }
 
@@ -732,15 +789,38 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
             real_size = (length + granularity - 1) & ~(granularity - 1);
         }
 
+        // Sub-ranges of one allocation share its page-granular registration.
+        // Track aliases and reference-count them like the IPC path so an
+        // unregister cannot consume another alias's registration. The
+        // shareable handle for the page is exported only once, so drop the
+        // retained allocation handle on these fast paths.
+        uint64_t page = (uint64_t)real_addr;
+        if (!registered_addr_to_base_.emplace((uint64_t)addr, page).second) {
+            (void)hipMemRelease(handle);
+            return 0;
+        }
+        auto refs_it = registered_base_refs_.find(page);
+        if (refs_it != registered_base_refs_.end()) {
+            refs_it->second++;
+            (void)hipMemRelease(handle);
+            return 0;
+        }
+
         // Export shareable handle
         hipxFabricHandle export_handle_raw = {};
         if (!checkHip(
                 hipMemExportToShareableHandle(&export_handle_raw, handle,
                                               HIPX_MEM_HANDLE_TYPE_FABRIC, 0),
                 "HipTransport: hipMemExportToShareableHandle failed")) {
+            registered_addr_to_base_.erase((uint64_t)addr);
+            (void)hipMemRelease(handle);
             return -1;
         }
         export_handle_raw.pid = getpid();
+        // The shareable handle keeps the allocation alive on its own; drop
+        // the reference taken above so registrations do not accumulate
+        // retains over the process lifetime.
+        (void)hipMemRelease(handle);
 
         (void)remote_accessible;
         BufferDesc desc;
@@ -749,18 +829,61 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         desc.name = location;
         desc.shm_name = serializeBinaryData((const void*)&export_handle_raw,
                                             sizeof(hipxFabricHandle));
-        return metadata_->addLocalMemoryBuffer(desc, true);
+#ifdef ENABLE_MULTI_PROTOCOL
+        desc.protocol = "hip";
+#endif
+        int rc = metadata_->addLocalMemoryBuffer(desc, true);
+        if (rc == 0) {
+            registered_base_refs_[page] = 1;
+        } else {
+            // addLocalMemoryBuffer appends the desc before publishing it;
+            // drop the leftover so a failed registration leaves nothing
+            // behind for a later rollback or unregister to miss.
+            metadata_->removeLocalMemoryBuffer(real_addr, isOwnDesc, false);
+            registered_addr_to_base_.erase((uint64_t)addr);
+        }
+        return rc;
     }
 }
 
 int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    // Hold register_mutex_ through the metadata removal, mirroring the
+    // register path, so a concurrent register of another sub-range cannot
+    // republish the buffer in between.
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    auto alias_it = registered_addr_to_base_.find((uint64_t)addr);
+    if (alias_it == registered_addr_to_base_.end()) {
+        // The address is not one we registered. If it equals a live base or
+        // page, slab-level cleanup must not drop the shared registration
+        // while its aliases are still alive.
+        if (registered_base_refs_.count((uint64_t)addr)) {
+            return ERR_ADDRESS_NOT_REGISTERED;
+        }
+        // Skipped registrations belong to another transport; addresses we
+        // never saw are invalid or repeated unregisters.
+        if (skipped_addrs_.erase((uint64_t)addr) > 0) {
+            return 0;
+        }
+        return ERR_ADDRESS_NOT_REGISTERED;
+    }
+    uint64_t base = alias_it->second;
+    registered_addr_to_base_.erase(alias_it);
+    skipped_addrs_.erase((uint64_t)addr);
+    // Both maps are updated in pairs under this mutex, so the base always
+    // has a refcount entry here. Only the last alias removes the shared
+    // registration, whether it is keyed by IPC allocation base or fabric
+    // physical page.
+    if (--registered_base_refs_[base] > 0) return 0;
+    registered_base_refs_.erase(base);
+    return metadata_->removeLocalMemoryBuffer((void*)base, isOwnDesc,
+                                              update_metadata);
 }
 
 int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                                               uint64_t length,
                                               uint64_t target_id) {
     auto desc = metadata_->getSegmentDescByID(target_id);
+    if (!desc) return ERR_INVALID_ARGUMENT;
 
     // Search for matching buffer entry
     for (auto& entry : desc->buffers) {

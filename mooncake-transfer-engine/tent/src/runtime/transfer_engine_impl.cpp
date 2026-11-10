@@ -47,6 +47,11 @@
 #include "tent/transport/xpu/xpu_transport.h"
 #endif
 
+#ifdef USE_CUDA
+#include "tent/platform/cuda.h"
+#include "tent/platform/cuda_utils.h"
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -301,6 +306,10 @@ TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf,
       ipv6_(false),
       merge_requests_(true) {
     if (!config_loaded) return;
+    if (!conf_) {
+        LOG(ERROR) << "Cannot construct Transfer Engine with a null config";
+        return;
+    }
     auto preserved = captureExplicitTransferEngineConfig(*conf_);
     // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
     // explicit metadata identity intact.
@@ -975,6 +984,16 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         desc.addr = (uint64_t)addr_list[i];
         desc.length = size_list[i];
 
+        auto& platform = Platform::getLoader();
+#ifdef USE_CUDA
+        // Warm-up can register memory temporarily, so validate it first.
+        auto* cuda = dynamic_cast<CudaPlatform*>(&platform);
+        CudaPointerInfo pointer_info;
+        if (cuda)
+            CHECK_STATUS(
+                cuda->validateMemoryRegistration(addr_list[i], pointer_info));
+#endif
+
         // MR warm-up: pin pages via temp ibv_reg_mr, benefits both
         // subsequent RDMA registration and NUMA probing
         bool pages_pinned = false;
@@ -987,8 +1006,17 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         }
 
         // NUMA probe: skip prefault if warm-up already pinned pages
-        auto entries = Platform::getLoader().getLocation(
-            addr_list[i], size_list[i], pages_pinned);
+        std::vector<RangeLocation> entries;
+#ifdef USE_CUDA
+        if (cuda) {
+            entries = cuda->getLocation(addr_list[i], size_list[i],
+                                        pages_pinned, pointer_info);
+        } else
+#endif
+        {
+            entries =
+                platform.getLocation(addr_list[i], size_list[i], pages_pinned);
+        }
         if (entries.empty())
             return Status::InvalidArgument(
                 "Unable to locate registered memory range" LOC_MARK);

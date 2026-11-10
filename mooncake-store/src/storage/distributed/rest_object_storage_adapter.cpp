@@ -1,4 +1,5 @@
 #include "storage/distributed/rest_object_storage_adapter.h"
+#include "storage/distributed/object_storage_http.h"
 
 #include <curl/curl.h>
 
@@ -8,6 +9,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <ctime>
 #include <cstring>
@@ -262,6 +264,7 @@ struct RestObjectStorageAdapter::RequestContext {
     CURLM* multi = nullptr;
     curl_slist* headers = nullptr;
     std::string error_body;
+    std::map<std::string, std::string> response_headers;
     IovecUploadContext upload_context;
     DownloadContext download_context;
 };
@@ -399,6 +402,14 @@ tl::expected<void, ErrorCode> RestObjectStorageAdapter::PrepareRequest(
 
     const std::string url = BuildUrl(physical_key, query);
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    // Honor custom CA bundles while retaining TLS verification.
+    if (const char* ca_bundle = std::getenv("AWS_CA_BUNDLE");
+        ca_bundle != nullptr && *ca_bundle != '\0') {
+        if (curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle) != CURLE_OK) {
+            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        }
+    }
+
     // Send the path exactly as it was signed. By default libcurl collapses
     // "." and ".." segments, so a key prefix such as "a/../b" (or a key named
     // "..") would reach the service under a different path than the canonical
@@ -408,6 +419,8 @@ tl::expected<void, ErrorCode> RestObjectStorageAdapter::PrepareRequest(
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, context.headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, DownloadCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context.download_context);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &context.response_headers);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 120000L);
@@ -463,12 +476,12 @@ RestObjectStorageAdapter::Request(
                           &response.status);
         response.transferred = context.download_context.transferred;
         response.body = std::move(context.error_body);
-        // A 404 error body may exceed the caller's object buffer. Preserve the
-        // HTTP error only for this local abort, not for other transfer
-        // failures.
-        const bool missing_object = method == "GET" && response.status == 404 &&
-                                    result == CURLE_WRITE_ERROR &&
-                                    context.download_context.overflow;
+        // Preserve 404/416 when their oversized error body is aborted
+        // locally, without masking other transport failures.
+        const bool range_error =
+            method == "GET" &&
+            (response.status == 404 || response.status == 416) &&
+            result == CURLE_WRITE_ERROR && context.download_context.overflow;
         const bool transient =
             IsTransientFailure(result, response.status,
                                context.download_context.overflow, context.curl);
@@ -481,7 +494,7 @@ RestObjectStorageAdapter::Request(
                          << "); retrying";
             continue;
         }
-        if (result != CURLE_OK && !missing_object) {
+        if (result != CURLE_OK && !range_error) {
             LOG(ERROR) << LogName() << " " << method
                        << " request failed: " << curl_easy_strerror(result);
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
@@ -655,12 +668,13 @@ RestObjectStorageAdapter::RequestBatchOnce(
             long status = 0;
             curl_easy_getinfo(message->easy_handle, CURLINFO_RESPONSE_CODE,
                               &status);
-            if (!context->upload && status == 404 &&
+            if (!context->upload && (status == 404 || status == 416) &&
                 (message->data.result == CURLE_OK ||
                  (message->data.result == CURLE_WRITE_ERROR &&
                   context->download_context.overflow))) {
-                results[context->index] =
-                    tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
+                results[context->index] = tl::make_unexpected(
+                    status == 404 ? ErrorCode::FILE_NOT_FOUND
+                                  : ErrorCode::FILE_READ_FAIL);
             } else if (message->data.result != CURLE_OK) {
                 const std::string error =
                     std::string(context->upload ? "PUT" : "GET") +
@@ -679,7 +693,10 @@ RestObjectStorageAdapter::RequestBatchOnce(
                 results[context->index] = context->expected_size;
             } else if (!context->upload && status == 206 &&
                        context->download_context.transferred ==
-                           context->expected_size) {
+                           context->expected_size &&
+                       object_storage_http::MatchesContentRange(
+                           context->response_headers, 0,
+                           context->expected_size)) {
                 results[context->index] = context->download_context.transferred;
             } else {
                 const std::string error =
@@ -801,7 +818,9 @@ tl::expected<size_t, ErrorCode> RestObjectStorageAdapter::GetRange(
     if (!response) return tl::make_unexpected(response.error());
     if (response->status == 404)
         return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
-    if (response->status != 206 || response->transferred != len)
+    if (response->status != 206 || response->transferred != len ||
+        !object_storage_http::MatchesContentRange(response->headers, first,
+                                                  len))
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     return len;
 }

@@ -6,7 +6,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -26,7 +28,41 @@
 #include "tent/transport/ub/ub_transport.h"
 #include "tent/transport/ub/workers.h"
 
+namespace {
+// Test-local allocation failure, using the same replacement-new approach as
+// tcp_regression_test. No production friend or private-state hook is needed.
+thread_local int allocation_blocks_until_failure = 0;
+thread_local int injected_allocation_failures = 0;
+}  // namespace
+
+[[gnu::noinline]] void* operator new(size_t size) {
+    if (size == 512 && allocation_blocks_until_failure > 0 &&
+        --allocation_blocks_until_failure == 0) {
+        ++injected_allocation_failures;
+        throw std::bad_alloc();
+    }
+    if (void* ptr = std::malloc(size ? size : 1)) return ptr;
+    throw std::bad_alloc();
+}
+[[gnu::noinline]] void operator delete(void* ptr) noexcept { std::free(ptr); }
+[[gnu::noinline]] void operator delete(void* ptr, size_t) noexcept {
+    std::free(ptr);
+}
+[[gnu::noinline]] void* operator new(size_t size,
+                                     const std::nothrow_t&) noexcept {
+    try {
+        return ::operator new(size);
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    }
+}
+[[gnu::noinline]] void operator delete(void* ptr,
+                                       const std::nothrow_t&) noexcept {
+    ::operator delete(ptr);
+}
+
 namespace mooncake::tent::ub {
+
 namespace {
 
 class FakeContext final : public Context {
@@ -547,6 +583,59 @@ TEST(UbNativeDataPathTest,
                           (void)endpoints.retire(endpoint);
                       });
     ASSERT_TRUE(workers.start().ok());
+
+    Request invalid_batch_request{};
+    invalid_batch_request.opcode = Request::WRITE;
+    invalid_batch_request.source = source.data();
+    invalid_batch_request.target_id = LOCAL_SEGMENT_ID;
+    invalid_batch_request.target_offset =
+        reinterpret_cast<uint64_t>(target.data());
+    invalid_batch_request.length = 16;
+    auto valid_task = UbTask::create(invalid_batch_request);
+    auto valid_slice = valid_task->addSlice(UbSliceSpec{
+        source.data(), reinterpret_cast<uint64_t>(target.data()), 16, 0, 1});
+    ASSERT_NE(valid_slice, nullptr);
+    ASSERT_TRUE(valid_task->seal());
+    auto unsealed_task = UbTask::create(invalid_batch_request);
+    ASSERT_NE(unsealed_task->addSlice(UbSliceSpec{
+                  source.data(), reinterpret_cast<uint64_t>(target.data()), 16,
+                  0, 1}),
+              nullptr);
+
+    EXPECT_FALSE(workers.submitBatch({valid_task, unsealed_task}).ok());
+    EXPECT_EQ(workers.queuedCount(), 0U);
+    EXPECT_EQ(workers.inflightCount(), 0U);
+    EXPECT_EQ(valid_slice->snapshot().state, UbSliceState::kInitial);
+
+    std::vector<UbTask::Ptr> rollback_tasks{valid_task};
+    std::vector<UbSlice::Ptr> rollback_slices{valid_slice};
+    rollback_tasks.reserve(9);
+    rollback_slices.reserve(9);
+    for (size_t i = 1; i < 9; ++i) {
+        auto task = UbTask::create(invalid_batch_request);
+        auto slice = task->addSlice(
+            UbSliceSpec{source.data(),
+                        reinterpret_cast<uint64_t>(target.data()), 16, 0, 1});
+        ASSERT_NE(slice, nullptr);
+        ASSERT_TRUE(task->seal());
+        rollback_tasks.push_back(task);
+        rollback_slices.push_back(slice);
+    }
+
+    // For libstdc++'s 512-byte deque blocks: the first matching allocation is
+    // batch preparation, the second grows the queue after an inserted prefix.
+    injected_allocation_failures = 0;
+    allocation_blocks_until_failure = 2;
+    const auto enqueue_status = workers.submitBatch(rollback_tasks);
+    allocation_blocks_until_failure = 0;
+    EXPECT_EQ(injected_allocation_failures, 1);
+    EXPECT_TRUE(enqueue_status.IsInternalError());
+    EXPECT_EQ(workers.queuedCount(), 0U);
+    EXPECT_EQ(workers.inflightCount(), 0U);
+    for (const auto& slice : rollback_slices) {
+        EXPECT_EQ(slice->snapshot().state, UbSliceState::kCanceled);
+    }
+
     adapter->holdNextCompletion();
     adapter->dropNextQuiescedCompletion();
 
@@ -906,7 +995,7 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     EXPECT_TRUE(transport.freeSubBatch(rejected_batch).ok());
 
     Transport::SubBatchRef batch = nullptr;
-    ASSERT_TRUE(transport.allocateSubBatch(batch, 2).ok());
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 16).ok());
     Request request{};
     request.opcode = Request::WRITE;
     request.source = source.data();
@@ -928,10 +1017,28 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     EXPECT_EQ(source, target);
     EXPECT_GT(transport.getEstimatedBandwidth(), 0.0);
 
+    ASSERT_EQ(batch->size(), 1U);
+    auto single_slice_request = request;
+    single_slice_request.length = 16;
+    const std::vector<Request> failed_append(9, single_slice_request);
+    injected_allocation_failures = 0;
+    allocation_blocks_until_failure = 2;
+    const auto append_status =
+        transport.submitTransferTasks(batch, failed_append);
+    allocation_blocks_until_failure = 0;
+    EXPECT_EQ(injected_allocation_failures, 1);
+    EXPECT_TRUE(append_status.IsInternalError());
+    EXPECT_EQ(batch->size(), 1U);
+    transfer = TransferStatus{PENDING, 0};
+    ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+    EXPECT_EQ(transfer.s, COMPLETED);
+    EXPECT_EQ(transfer.transferred_bytes, source.size());
+
     source.fill(0);
     Request read_request = request;
     read_request.opcode = Request::READ;
     ASSERT_TRUE(transport.submitTransferTasks(batch, {read_request}).ok());
+    EXPECT_EQ(batch->size(), 2U);
     transfer = TransferStatus{PENDING, 0};
     const auto read_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);

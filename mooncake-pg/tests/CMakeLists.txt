@@ -7,3 +7,17 @@ target_include_directories(
 target_compile_features(pg_host_ip_resolve_test PRIVATE cxx_std_20)
 target_link_libraries(pg_host_ip_resolve_test PUBLIC gtest gtest_main)
 add_test(NAME pg_host_ip_resolve_test COMMAND pg_host_ip_resolve_test)
+
+# CPU-only control-plane regression: no CUDA or mooncake_pg data-plane link.
+add_executable(pg_rpc_runtime_test pg_rpc_runtime_test.cpp
+                                   ../src/control_plane/rpc_runtime.cpp)
+target_include_directories(pg_rpc_runtime_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_compile_features(pg_rpc_runtime_test PRIVATE cxx_std_20)
+target_link_libraries(pg_rpc_runtime_test PRIVATE gtest gtest_main glog::glog
+                                                  yalantinglibs)
+add_test(NAME pg_rpc_runtime_test COMMAND pg_rpc_runtime_test)
+set_tests_properties(pg_rpc_runtime_test PROPERTIES TIMEOUT 60)
+if(TARGET asio_shared)
+  target_link_libraries(pg_rpc_runtime_test PRIVATE asio_shared)
+endif()

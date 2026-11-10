@@ -16,7 +16,9 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <memory>
+#include <vector>
 #include <string>
 
 #include "cuda_alike.h"
@@ -124,6 +126,55 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
     (void)cudaSetDevice(kSourceDevice);
     (void)cudaFree(src);
     (void)cudaFree(dst);
+}
+
+// A later invalid remote request must reject the whole batch and leave
+// every task terminal/freeable without modifying the accepted prefix.
+TEST(HipTransportTest, InvalidRemoteRequestFailsWholeBatch) {
+    int devices = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&devices), cudaSuccess);
+    if (devices < 1) GTEST_SKIP() << "Needs a HIP GPU";
+    TransferEngine owner(false), peer(false);
+    ASSERT_EQ(owner.init(P2PHANDSHAKE, "127.0.0.1:17814", "127.0.0.1", 17814),
+              0);
+    ASSERT_NE(owner.installTransport("hip", nullptr), nullptr);
+    ASSERT_EQ(peer.init(P2PHANDSHAKE, "127.0.0.1:17815", "127.0.0.1", 17815),
+              0);
+    auto* transport = peer.installTransport("hip", nullptr);
+    ASSERT_NE(transport, nullptr);
+    void* src = allocOnDevice(kLen, 0);
+    void* dst = allocOnDevice(kLen, 0);
+    void* bad_dst = allocOnDevice(kLen, 0);
+    ASSERT_EQ(cudaMemset(src, 0x5A, kLen), cudaSuccess);
+    ASSERT_EQ(cudaMemset(dst, 0, kLen), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    ASSERT_EQ(owner.registerLocalMemory(dst, kLen, GPU_PREFIX + "0"), 0);
+    auto segment = peer.openSegment(owner.getLocalIpAndPort());
+    ASSERT_NE(segment, LOCAL_SEGMENT_ID);
+    ASSERT_GE(segment, 0);
+    TransferRequest good;
+    good.opcode = TransferRequest::WRITE;
+    good.source = src;
+    good.length = kLen;
+    good.target_id = segment;
+    good.target_offset = reinterpret_cast<uint64_t>(dst);
+    auto bad = good;
+    bad.target_offset = reinterpret_cast<uint64_t>(bad_dst);
+    auto batch = peer.allocateBatchID(3);
+    EXPECT_FALSE(transport->submitTransfer(batch, {good, bad, good}).ok());
+    for (size_t i = 0; i < 3; ++i) {
+        TransferStatus status;
+        ASSERT_TRUE(transport->getTransferStatus(batch, i, status).ok());
+        EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    }
+    EXPECT_TRUE(peer.freeBatchID(batch).ok());
+    std::vector<unsigned char> output(kLen);
+    ASSERT_EQ(cudaMemcpy(output.data(), dst, kLen, cudaMemcpyDefault),
+              cudaSuccess);
+    EXPECT_TRUE(std::all_of(output.begin(), output.end(),
+                            [](auto byte) { return byte == 0; }));
+    EXPECT_EQ(owner.unregisterLocalMemory(dst), 0);
+    for (auto* ptr : {src, dst, bad_dst}) EXPECT_EQ(cudaFree(ptr), cudaSuccess);
 }
 
 int main(int argc, char** argv) {

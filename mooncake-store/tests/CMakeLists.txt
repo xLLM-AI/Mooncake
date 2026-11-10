@@ -163,6 +163,7 @@ endif()
 add_store_test(nof_register_config_test nof_register_config_test.cpp)
 add_store_test(spdk_controller_config_test spdk_controller_config_test.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
+add_store_test(variadic_serialization_test variadic_serialization_test.cpp)
 add_test(NAME client_hca_affinity_test
          COMMAND client_integration_test
                  --gtest_filter=HcaAffinityTest.*:ReadAffinityTest.*)
@@ -196,6 +197,27 @@ endif()
 add_store_test(master_metrics_test master_metrics_test.cpp)
 add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
+if(TARGET Mooncake::liburing)
+  # Compile the same production implementation into this test so linker
+  # wrappers also work when mooncake_store itself is a shared library.
+  target_sources(posix_file_test PRIVATE ../src/uring_file.cpp)
+  target_link_options(
+    posix_file_test PRIVATE "LINKER:--wrap=io_uring_submit_and_wait"
+    "LINKER:--wrap=io_uring_unregister_buffers")
+endif()
+set_tests_properties(posix_file_test PROPERTIES TIMEOUT 180)
+if(TARGET Mooncake::liburing)
+  add_store_test(file_storage_uring_owner_test
+                 file_storage_uring_owner_test.cpp ../src/uring_file.cpp)
+  target_link_options(
+    file_storage_uring_owner_test
+    PRIVATE
+    "LINKER:--wrap=io_uring_register_buffers"
+    "LINKER:--wrap=io_uring_clone_buffers"
+    "LINKER:--wrap=io_uring_unregister_buffers"
+    "LINKER:--wrap=io_uring_submit_and_wait")
+  set_tests_properties(file_storage_uring_owner_test PROPERTIES TIMEOUT 60)
+endif()
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 add_store_test(nvmeof_initiator_test nvmeof_initiator_test.cpp)
@@ -238,8 +260,14 @@ if(USE_TENT)
       transfer_task_test
       --gtest_filter=TransferTaskTest.TransferScatterHandlesFragmentedCpuBuffers
   )
-  set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
-                                                           "MC_USE_TENT=1")
+  # Scatter transfers require a cancellable transport; without RDMA the default
+  # TENT config only installs TCP, so swap it for HP_TCP.
+  set_tests_properties(
+    transfer_scatter_tent_test
+    PROPERTIES
+      ENVIRONMENT
+      "MC_USE_TENT=1;MC_TENT_CONF={\"transports\":{\"tcp\":{\"enable\":false},\"hp_tcp\":{\"enable\":true}}}"
+  )
   add_test(
     NAME transfer_submitter_scatter_tent_test
     COMMAND

@@ -1,5 +1,9 @@
 add_executable(default_config_test default_config_test.cpp)
 target_link_libraries(default_config_test PUBLIC mooncake_common gtest pthread)
+# Fixture files are read from the source tree, wherever the build tree is.
+target_compile_definitions(
+  default_config_test
+  PRIVATE MOONCAKE_COMMON_TESTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME default_config_test COMMAND default_config_test)
 
 add_executable(environ_test environ_test.cpp)
@@ -38,3 +42,15 @@ add_executable(ib_link_speed_test ib_link_speed_test.cpp)
 target_link_libraries(ib_link_speed_test PUBLIC mooncake_common gtest
                                                 gtest_main pthread)
 add_test(NAME ib_link_speed_test COMMAND ib_link_speed_test)
+
+if(EXISTS "${yalantinglibs_SOURCE_DIR}/.git")
+  add_test(
+    NAME ylt_source_validation_test
+    COMMAND
+      ${CMAKE_COMMAND} "-DMOONCAKE_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+      "-DYLT_SOURCE_DIR=${yalantinglibs_SOURCE_DIR}"
+      "-DGIT_COMMAND=${GIT_EXECUTABLE}" "-DCXX_COMPILER=${CMAKE_CXX_COMPILER}"
+      "-DTEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/ylt-source-validation" -P
+      ${CMAKE_CURRENT_SOURCE_DIR}/ylt_source_validation_test.cmake)
+  set_tests_properties(ylt_source_validation_test PROPERTIES TIMEOUT 120)
+endif()
