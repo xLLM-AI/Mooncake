@@ -133,7 +133,10 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                         << ", source_addr: " << slice->source_addr
                         << ", dest_addr: " << slice->hccl.dest_addr
                         << ", ret: " << ret;
-                    slice->markFailed();
+                    // Keep the error private until the stream and all retries
+                    // have retired. Publishing FAILED here lets callers free
+                    // buffers that a sibling operation still accesses.
+                    slice->status = Slice::FAILED;
                 }
             }
 
@@ -146,7 +149,7 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                     << ", remote devicePhyId: " << remote_rank_info_.devicePhyId
                     << ", ret: " << ret;
                 for (auto slice : slice_list) {
-                    slice->markFailed();
+                    slice->status = Slice::FAILED;
                 }
             }
             auto addOpfence = std::chrono::high_resolution_clock::now();
@@ -159,9 +162,21 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                     << local_rank_info_.devicePhyId
                     << ", remote devicePhyId: " << remote_rank_info_.devicePhyId
                     << ", ret: " << ret;
-                aclrtStreamAbort(stream);
+                const int abort_ret = aclrtStreamAbort(stream);
+                if (abort_ret) {
+                    LOG(ERROR) << "aclrtStreamAbort failed, ret: " << abort_ret;
+                }
                 // Synchronize to drop ACL_ERROR_RT_STREAM_ABORT error
-                aclrtSynchronizeStream(stream);
+                int drain_ret = aclrtSynchronizeStream(stream);
+                while (drain_ret != ACL_SUCCESS) {
+                    // An error result alone cannot release borrowed buffers.
+                    // Keep the batch pending until the stream actually drains.
+                    LOG_EVERY_N_SEC(ERROR, 1)
+                        << "Waiting for failed HCCL stream retirement, ret: "
+                        << drain_ret;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    drain_ret = aclrtSynchronizeStream(stream);
+                }
 
                 if (loop < transfer_max_retry_cnt) {
                     LOG(INFO) << "Hccl transport failed. Retry ...";
@@ -180,7 +195,7 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                 LOG(ERROR) << "Hccl transport failed after "
                            << transfer_max_retry_cnt << " retries.";
                 for (auto slice : slice_list) {
-                    slice->markFailed();
+                    slice->status = Slice::FAILED;
                 }
             }
 
@@ -221,7 +236,9 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
         }
 
         for (auto slice : slice_list) {
-            if (slice->status != Slice::SliceStatus::FAILED) {
+            if (slice->status == Slice::SliceStatus::FAILED) {
+                slice->markFailed();
+            } else {
                 slice->markSuccess();
             }
         }
