@@ -33,7 +33,8 @@
 
 #define THREAD_NUM 1
 #define ASCEND_DEFAULT_HOST_PORT 10000
-#define ASCEND_DEFAULT_DEVICE_PORT 16666
+// Port 0 asks HCCL to atomically allocate an available listener port.
+#define ASCEND_DEFAULT_DEVICE_PORT 0
 
 namespace mooncake {
 class TransferMetadata;
