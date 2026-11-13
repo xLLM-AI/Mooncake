@@ -525,6 +525,9 @@ class Transport {
         // make the task non-movable).
         volatile bool export_metrics_recorded = false;
         volatile bool log_metrics_recorded = false;
+        // Task and aggregate/retirement observers share byte accounting.
+        // Keep latency publication independent from the first byte observer.
+        volatile bool log_bytes_recorded = false;
         // Set by the event-driven completion callback when it finishes the
         // task: steady_clock ticks (else 0) and COMPLETED or FAILED (else
         // WAITING). Atomic: a poll may read them while the callback writes.
