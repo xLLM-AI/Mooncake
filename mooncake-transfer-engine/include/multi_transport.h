@@ -15,6 +15,7 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <map>
@@ -135,7 +136,9 @@ class MultiTransport {
                            bool *allows_reuse = nullptr);
 
     Status tryFreeBatchID(BatchID batch_id,
-                          const std::function<void()> &before_delete);
+                          const std::function<void()> &before_delete,
+                          bool allow_completion_fallback = false,
+                          bool poll_transport = true);
 
     void deferredCleanupLoop();
 
@@ -154,8 +157,17 @@ class MultiTransport {
 
     std::mutex deferred_cleanup_mutex_;
     std::condition_variable deferred_cleanup_cv_;
-    std::unordered_map<BatchID, std::function<void()>>
-        deferred_cleanup_batches_;
+    struct DeferredCleanupEntry {
+        explicit DeferredCleanupEntry(const std::function<void()> &callback)
+            : before_delete(callback) {}
+
+        std::function<void()> before_delete;
+        Status last_error;
+        bool completion_only = false;
+        std::chrono::steady_clock::time_point next_poll{};
+        std::chrono::milliseconds retry_delay{100};
+    };
+    std::unordered_map<BatchID, DeferredCleanupEntry> deferred_cleanup_batches_;
     bool stop_deferred_cleanup_ = false;
     std::thread deferred_cleanup_thread_;
 };

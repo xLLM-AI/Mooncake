@@ -1,5 +1,12 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
+# Hardware-free ownership/error-path regression coverage for the batch reaper.
+add_executable(deferred_batch_cleanup_test
+               ${WORKSPACE}/deferred_batch_cleanup_test.cpp)
+target_link_libraries(deferred_batch_cleanup_test PRIVATE transfer_engine gtest
+                                                          gtest_main)
+add_test(NAME deferred_batch_cleanup_test COMMAND deferred_batch_cleanup_test)
+
 if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
   add_executable(adaptive_congestion_control_test
                  ${WORKSPACE}/adaptive_congestion_control_test.cpp)

@@ -155,7 +155,8 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
 }
 
 Status MultiTransport::tryFreeBatchID(
-    BatchID batch_id, const std::function<void()>& before_delete) {
+    BatchID batch_id, const std::function<void()>& before_delete,
+    bool allow_completion_fallback, bool poll_transport) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     bool busy = false;
@@ -170,6 +171,20 @@ Status MultiTransport::tryFreeBatchID(
         }
         if (task.slice_count == 0) {
             task.is_finished = true;
+            continue;
+        }
+        // A failed status query is not evidence that a task stopped using
+        // its buffers. After such an error, only the sealed last-slice
+        // publication can substitute for polling. CompletionCallbackPin still
+        // protects callback accesses until the batch-wide check below.
+        if (allow_completion_fallback &&
+            __atomic_load_n(&task.completion_published, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+            if (metricsEnabled()) recordFinishedTask(task);
+            continue;
+        }
+        if (!poll_transport) {
+            busy = true;
             continue;
         }
         TransferStatus status;
@@ -230,18 +245,38 @@ void MultiTransport::deferredCleanupLoop() {
 
         for (auto it = deferred_cleanup_batches_.begin();
              it != deferred_cleanup_batches_.end();) {
-            Status status = tryFreeBatchID(it->first, it->second);
+            auto& entry = it->second;
+            const auto now = std::chrono::steady_clock::now();
+            const bool poll_transport =
+                !entry.completion_only && now >= entry.next_poll;
+            Status status = tryFreeBatchID(
+                it->first, entry.before_delete,
+                /*allow_completion_fallback=*/!entry.last_error.ok(),
+                poll_transport);
             if (status.ok()) {
                 it = deferred_cleanup_batches_.erase(it);
-            } else if (!status.IsBatchBusy()) {
-                // A permanent error (e.g. a stale task reference) will never
-                // resolve on retry; drop the entry instead of polling forever.
-                LOG(ERROR) << "Dropping deferred cleanup for batch "
-                           << it->first << ": " << status.ToString();
-                it = deferred_cleanup_batches_.erase(it);
-            } else {
-                ++it;
+                continue;
             }
+            if (!status.IsBatchBusy()) {
+                // The caller already invalidated this handle. Retain both
+                // the descriptor and its delete hook on every query error.
+                // InvalidArgument/NotImplemented cannot be repaired by
+                // polling; wait for callback-published completion instead.
+                if (!(entry.last_error == status)) {
+                    LOG(ERROR) << "Retaining deferred cleanup for batch "
+                               << it->first << ": " << status.ToString();
+                }
+                entry.last_error = status;
+                entry.completion_only =
+                    status.IsInvalidArgument() || status.IsNotImplemented();
+                entry.next_poll = now + entry.retry_delay;
+                entry.retry_delay = std::min(entry.retry_delay * 2,
+                                             std::chrono::milliseconds(5000));
+            } else if (poll_transport && !entry.completion_only) {
+                entry.last_error = Status::OK();
+                entry.retry_delay = kCleanupInterval;
+            }
+            ++it;
         }
 
         if (stop_deferred_cleanup_) {
