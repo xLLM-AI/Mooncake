@@ -122,6 +122,27 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     return batch_desc->id;
 }
 
+Transport::DeferredCleanupStats MultiTransport::collectDeferredCleanupStats(
+    std::chrono::steady_clock::time_point now) const {
+    Transport::DeferredCleanupStats stats;
+    stats.pending_batches = deferred_cleanup_batches_.size();
+    for (const auto& [id, entry] : deferred_cleanup_batches_) {
+        if (!entry.last_error.ok()) ++stats.query_error_batches;
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             now - entry.enqueued_at)
+                             .count();
+        if (age > 0)
+            stats.oldest_age_ms =
+                std::max(stats.oldest_age_ms, static_cast<uint64_t>(age));
+    }
+    return stats;
+}
+
+Transport::DeferredCleanupStats MultiTransport::getDeferredCleanupStats() {
+    std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
+    return collectDeferredCleanupStats(std::chrono::steady_clock::now());
+}
+
 Status MultiTransport::freeBatchID(BatchID batch_id) {
     return freeBatchID(batch_id, std::function<void()>());
 }
@@ -277,6 +298,19 @@ void MultiTransport::deferredCleanupLoop() {
                 entry.retry_delay = kCleanupInterval;
             }
             ++it;
+        }
+
+        const auto warning_now = std::chrono::steady_clock::now();
+        if (warning_now >= next_deferred_cleanup_warning_) {
+            next_deferred_cleanup_warning_ =
+                warning_now + std::chrono::seconds(60);
+            const auto stats = collectDeferredCleanupStats(warning_now);
+            if (stats.oldest_age_ms >= 60000) {
+                LOG(WARNING) << "Deferred cleanup backlog: pending="
+                             << stats.pending_batches
+                             << ", query_errors=" << stats.query_error_batches
+                             << ", oldest_age_ms=" << stats.oldest_age_ms;
+            }
         }
 
         if (stop_deferred_cleanup_) {
@@ -779,16 +813,13 @@ Status MultiTransport::getBatchRetirementStatus(BatchID batch_id,
             } else {
                 done = status.s == TransferStatusEnum::COMPLETED ||
                        status.s == TransferStatusEnum::FAILED;
-                if (done) {
-                    __atomic_store_n(&task.transferred_bytes,
-                                     status.transferred_bytes,
-                                     __ATOMIC_RELEASE);
-                }
                 if (status.s == TransferStatusEnum::FAILED) {
                     batch.has_failure.store(true, std::memory_order_release);
                 }
-                if (result.ok() && (status.s == TransferStatusEnum::FAILED ||
-                                    status.s == TransferStatusEnum::TIMEOUT)) {
+                if (result.ok() && status.s == TransferStatusEnum::TIMEOUT) {
+                    result = Status::Context("Mooncake transfer task timeout");
+                } else if (result.ok() &&
+                           status.s == TransferStatusEnum::FAILED) {
                     result = Status::Context("Mooncake transfer task failed");
                 }
             }
@@ -813,7 +844,7 @@ Status MultiTransport::getBatchRetirementStatus(BatchID batch_id,
         // querying a transport again after its terminal completion.
         batch.finished_transfer_bytes.store(completed_bytes,
                                             std::memory_order_relaxed);
-        batch.is_finished.store(true, std::memory_order_relaxed);
+        batch.is_finished.store(true, std::memory_order_release);
         batch.status_cached.store(true, std::memory_order_release);
     }
     return result;

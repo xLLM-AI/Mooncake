@@ -354,9 +354,14 @@ class TransferEngineImpl {
             // the aggregate status polling path before the caller frees.
             TransferStatus status;
             Status completed = getBatchTransferStatus(batch_id, status);
-            if (result.ok() && !completed.ok()) return completed;
+            if (!completed.ok()) return completed;
         }
         return result;
+    }
+
+    Transport::DeferredCleanupStats getDeferredCleanupStats() {
+        if (!multi_transports_) return {};
+        return multi_transports_->getDeferredCleanupStats();
     }
 
     Transport* getTransport(const std::string& proto) {

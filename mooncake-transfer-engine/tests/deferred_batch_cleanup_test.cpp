@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include <glog/logging.h>
 
 #include <atomic>
 #include <chrono>
@@ -20,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -32,6 +34,15 @@ class MultiTransportBatchTestPeer {
     static Status free(MultiTransport& transport, Transport::BatchID id,
                        const std::function<void()>& hook) {
         return transport.freeBatchID(id, hook);
+    }
+
+    static void forceBacklogWarning(MultiTransport& transport) {
+        std::lock_guard<std::mutex> lock(transport.deferred_cleanup_mutex_);
+        for (auto& [id, entry] : transport.deferred_cleanup_batches_)
+            entry.enqueued_at =
+                std::chrono::steady_clock::now() - std::chrono::seconds(61);
+        transport.next_deferred_cleanup_warning_ = {};
+        transport.deferred_cleanup_cv_.notify_one();
     }
 
     static bool pending(MultiTransport& transport, Transport::BatchID id) {
@@ -50,7 +61,10 @@ class CounterTransport : public Transport {
    public:
     std::atomic<QueryError> error{QueryError::None};
     std::atomic<int> error_queries{0};
+    std::atomic<int> queries{0};
+    std::atomic<bool> timed_out{false};
     bool counter_completion = false;
+    bool publish_finished = true;
     bool supportsBatchCompletionCounter() const override {
         return counter_completion;
     }
@@ -62,6 +76,7 @@ class CounterTransport : public Transport {
 
     Status getTransferStatus(BatchID id, size_t index,
                              TransferStatus& status) override {
+        queries.fetch_add(1);
         const auto result = error.load();
         if (result != QueryError::None) {
             error_queries.fetch_add(1);
@@ -76,6 +91,11 @@ class CounterTransport : public Transport {
                     break;
             }
         }
+        if (timed_out.load()) {
+            status.s = TransferStatusEnum::TIMEOUT;
+            status.transferred_bytes = 0;
+            return Status::OK();
+        }
         auto& task = toBatchDesc(id).task_list[index];
         const auto success =
             __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
@@ -86,7 +106,8 @@ class CounterTransport : public Transport {
         if (success + failed == task.slice_count) {
             status.s = failed ? TransferStatusEnum::FAILED
                               : TransferStatusEnum::COMPLETED;
-            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+            if (publish_finished)
+                __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
         }
         return Status::OK();
     }
@@ -303,6 +324,114 @@ TEST(DeferredBatchCleanupTest, ShutdownReclaimsAlreadyPublishedErrorBatch) {
     EXPECT_EQ(counts.deleted.load(), 1);
     EXPECT_EQ(counts.slices.load(), 1);
     EXPECT_TRUE(counts.hook_before_slice.load());
+}
+
+class BacklogLogSink final : public google::LogSink {
+   public:
+    BacklogLogSink() { google::AddLogSink(this); }
+    ~BacklogLogSink() override { google::RemoveLogSink(this); }
+    void send(google::LogSeverity, const char*, const char*, int,
+              const std::tm*, const char* message, size_t length) override {
+        if (std::string_view(message, length)
+                .find("Deferred cleanup backlog:") != std::string_view::npos)
+            warnings.fetch_add(1);
+    }
+    std::atomic<int> warnings{0};
+};
+
+TEST(DeferredBatchCleanupTest, RetainedBacklogHasLiveStatsAndPeriodicWarnings) {
+    BacklogLogSink logs;
+    std::string name = "retained-observability";
+    CounterTransport backend;
+    CleanupCounts counts;
+    MultiTransport transport(nullptr, name);
+    auto batch = make_batch(transport, backend, counts);
+    ASSERT_TRUE(Peer::free(transport, batch.id, [&] {
+                    ++counts.deleted;
+                }).IsBatchCleanupDeferred());
+    backend.error = QueryError::Context;
+    ASSERT_TRUE(wait_until([&] { return backend.error_queries.load() > 0; }));
+    Peer::forceBacklogWarning(transport);
+    ASSERT_TRUE(wait_until([&] { return logs.warnings.load() >= 1; }));
+    auto stats = transport.getDeferredCleanupStats();
+    EXPECT_EQ(stats.pending_batches, 1);
+    EXPECT_EQ(stats.query_error_batches, 1);
+    EXPECT_GE(stats.oldest_age_ms, 60000);
+    EXPECT_EQ(counts.deleted.load(), 0);
+    Peer::forceBacklogWarning(transport);
+    ASSERT_TRUE(wait_until([&] { return logs.warnings.load() >= 2; }));
+    batch.slices.front()->markFailed();
+    expect_reclaimed(transport, batch, counts);
+    stats = transport.getDeferredCleanupStats();
+    EXPECT_EQ(stats.pending_batches, 0);
+    EXPECT_EQ(stats.query_error_batches, 0);
+    EXPECT_EQ(stats.oldest_age_ms, 0);
+}
+
+TEST(DeferredBatchCleanupTest, ObservedTerminalTaskSurvivesLaterQueryError) {
+    std::string name = "observed-terminal-proof";
+    CounterTransport backend;
+    backend.publish_finished = false;
+    CleanupCounts counts;
+    MultiTransport transport(nullptr, name);
+    auto batch = make_batch(transport, backend, counts);
+    auto& task = batch.desc->task_list.front();
+    // Model polling completion before the callback unwinds, with no sealed
+    // counter publication to substitute for the successful query proof.
+    task.success_slice_count = 1;
+    batch.desc->active_completion_callbacks = 1;
+    bool retired = true;
+    ASSERT_TRUE(transport.getBatchRetirementStatus(batch.id, retired).ok());
+    EXPECT_FALSE(retired);
+    EXPECT_TRUE(__atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE));
+    EXPECT_TRUE(__atomic_load_n(&task.retirement_observed, __ATOMIC_ACQUIRE));
+    EXPECT_FALSE(__atomic_load_n(&task.completion_published, __ATOMIC_ACQUIRE));
+    const int queries = backend.queries.load();
+    backend.error = QueryError::Context;
+    ASSERT_TRUE(transport.getBatchRetirementStatus(batch.id, retired).ok());
+    EXPECT_FALSE(retired);
+    batch.desc->active_completion_callbacks = 0;
+    ASSERT_TRUE(transport.getBatchRetirementStatus(batch.id, retired).ok());
+    EXPECT_TRUE(retired);
+    EXPECT_EQ(backend.queries.load(), queries);
+    EXPECT_EQ(backend.error_queries.load(), 0);
+    EXPECT_TRUE(__atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE));
+    const auto freed =
+        Peer::free(transport, batch.id, [&] { ++counts.deleted; });
+    EXPECT_TRUE(freed.ok());
+    EXPECT_EQ(backend.queries.load(), queries);
+    if (!freed.ok()) {
+        // Clean up the still-owned batch in the old-code negative control.
+        backend.error = QueryError::None;
+        EXPECT_TRUE(
+            Peer::free(transport, batch.id, [&] { ++counts.deleted; }).ok());
+    }
+}
+
+TEST(DeferredBatchCleanupTest, TimeoutIsNotRetirementButLaterFailureCanRetire) {
+    std::string name = "retirement-timeout";
+    CounterTransport backend;
+    CleanupCounts counts;
+    MultiTransport transport(nullptr, name);
+    auto batch = make_batch(transport, backend, counts);
+    backend.timed_out = true;
+    bool retired = true;
+    const auto timed_out =
+        transport.getBatchRetirementStatus(batch.id, retired);
+    EXPECT_TRUE(timed_out.IsContext());
+    EXPECT_NE(timed_out.ToString().find("timeout"), std::string::npos);
+    EXPECT_FALSE(retired);
+    EXPECT_FALSE(__atomic_load_n(
+        &batch.desc->task_list.front().retirement_observed, __ATOMIC_ACQUIRE));
+    EXPECT_EQ(counts.deleted.load(), 0);
+    backend.timed_out = false;
+    batch.slices.front()->markFailed();
+    const auto failed = transport.getBatchRetirementStatus(batch.id, retired);
+    EXPECT_TRUE(failed.IsContext());
+    EXPECT_NE(failed.ToString().find("failed"), std::string::npos);
+    EXPECT_TRUE(retired);
+    EXPECT_TRUE(
+        Peer::free(transport, batch.id, [&] { ++counts.deleted; }).ok());
 }
 
 TEST(DeferredBatchCleanupTest, RetirementKeepsHandleUntilAllTasksAndPinsDrain) {

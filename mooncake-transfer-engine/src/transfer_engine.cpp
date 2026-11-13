@@ -308,6 +308,10 @@ Status TransferEngine::getBatchRetirementStatus(BatchID batch_id,
     return impl_->getBatchRetirementStatus(batch_id, retired);
 }
 
+Transport::DeferredCleanupStats TransferEngine::getDeferredCleanupStats() {
+    return impl_->getDeferredCleanupStats();
+}
+
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
     stats.clear();
     return Status::OK();

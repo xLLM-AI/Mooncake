@@ -297,8 +297,16 @@ class TransferEngine {
     // of retirement. TIMEOUT/error alone never authorizes buffer reuse.
     // Do not submit more work, free, or query this batch concurrently. As with
     // transfer completion, transports must publish terminal state after I/O
-    // retirement (including failure paths).
+    // retirement (including failure paths). TIMEOUT is not terminal: tasks may
+    // subsequently complete/fail, but the timeout itself never permits reuse.
+    // Never query after free returns OK or BatchCleanupDeferred: the handle is
+    // invalid, possibly already deleted or reused. This API does not validate
+    // expired pointer-derived IDs.
     Status getBatchRetirementStatus(BatchID batch_id, bool& retired);
+
+    // Current reaper-owned backlog. This is not a count of all live batches,
+    // leaked allocations, historical IDs, or bytes in borrowed device buffers.
+    Transport::DeferredCleanupStats getDeferredCleanupStats();
 #endif
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
