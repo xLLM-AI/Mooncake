@@ -27,8 +27,8 @@
 #include <netdb.h>
 #include <random>
 #include <ifaddrs.h>
-#include "mpi.h"
 #include "transport/ascend_transport/hccl_transport/hccl_transport_mem_c.h"
+#include "transport/ascend_transport/hccl_transport/device_listener.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -137,16 +137,6 @@ static int initServerNetSocket(RankInfo *local_rank_info) {
                               local_rank_info->deviceLogicId, localIp),
                "HcclNetOpenDev DEVICE_NIC_TYPE failed");
 
-    nicServerSocket_ = std::make_shared<hccl::HcclSocket>(
-        nicNetDevCtx_, local_rank_info->devicePort);
-    if (nicServerSocket_ == NULL) {
-        LOG(ERROR) << "make nicNetDevCtx_ failed";
-        return -1;
-    }
-
-    RETRY_CALL(nicServerSocket_->Init(), "nicServerSocket_ Init failed");
-    RETRY_CALL(nicServerSocket_->Listen(), "nicServerSocket_ Listen failed");
-
     // Use virtual network card within HCCS
     hccl::HcclIpAddress localVnicIp(local_rank_info->devicePhyId);
     RETRY_CALL(
@@ -160,16 +150,18 @@ static int initServerNetSocket(RankInfo *local_rank_info) {
                               local_rank_info->deviceLogicId, localVnicIp),
                "HcclNetOpenDev vnicNetDevCtx_ failed");
 
-    // control plane connection, creat serversocket, listening client
-    vnicServerSocket_ = std::make_shared<hccl::HcclSocket>(
-        vnicNetDevCtx_, local_rank_info->devicePort);
-    if (vnicServerSocket_ == NULL) {
-        LOG(ERROR) << "vnicServerSocket_ make failed";
+    const auto listenResult =
+        mooncake::detail::listenOnAvailableDevicePort<hccl::HcclSocket>(
+            [](bool vnic, uint32_t port) {
+                return std::make_shared<hccl::HcclSocket>(
+                    vnic ? vnicNetDevCtx_ : nicNetDevCtx_, port);
+            },
+            nicServerSocket_, vnicServerSocket_, local_rank_info->devicePort);
+    if (listenResult != HCCL_SUCCESS) {
+        LOG(ERROR) << "NIC/VNIC listener initialization failed, HcclResult: "
+                   << listenResult;
         return -1;
     }
-
-    RETRY_CALL(vnicServerSocket_->Init(), "vnicServerSocket_ Init failed");
-    RETRY_CALL(vnicServerSocket_->Listen(), "vnicServerSocket_ Listen failed");
 
     RETRY_CALL(HcclDispatcherInit(DispatcherType::DISPATCHER_NORMAL,
                                   local_rank_info->devicePhyId, &dispatcher_),
