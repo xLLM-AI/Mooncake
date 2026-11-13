@@ -670,6 +670,17 @@ add_executable(common_test ${WORKSPACE}/common_test.cpp)
 target_link_libraries(common_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME common_test COMMAND common_test)
 
+# Uses the real listener selection helper with a controlled socket boundary;
+# requires HCCL headers but no accelerator or transport engine initialization.
+if(USE_ASCEND)
+  add_executable(hccl_device_listener_test
+                 ${WORKSPACE}/hccl_device_listener_test.cpp)
+  target_include_directories(hccl_device_listener_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_libraries(hccl_device_listener_test PRIVATE gtest gtest_main)
+  add_test(NAME hccl_device_listener_test COMMAND hccl_device_listener_test)
+endif()
+
 if(USE_ASCEND_DIRECT)
   # AscendDirectTransport unit test with mock implementations Mock
   # implementations are included in the test file via anonymous namespace
