@@ -171,7 +171,7 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                 while (drain_ret != ACL_SUCCESS) {
                     // An error result alone cannot release borrowed buffers.
                     // Keep the batch pending until the stream actually drains.
-                    LOG_EVERY_N_SEC(ERROR, 1)
+                    LOG_EVERY_T(ERROR, 1)
                         << "Waiting for failed HCCL stream retirement, ret: "
                         << drain_ret;
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
