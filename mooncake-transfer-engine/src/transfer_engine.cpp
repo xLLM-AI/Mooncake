@@ -247,6 +247,11 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
     return impl_->getBatchTransferStatus(batch_id, status);
 }
 
+Status TransferEngine::getBatchRetirementStatus(BatchID batch_id,
+                                                bool& retired) {
+    return impl_->getBatchRetirementStatus(batch_id, retired);
+}
+
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
     stats.clear();
     return Status::OK();
@@ -754,6 +759,25 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
             return Status::OK();
     } else
         return impl_->getBatchTransferStatus(batch_id, status);
+}
+
+Status TransferEngine::getBatchRetirementStatus(BatchID batch_id,
+                                                bool& retired) {
+    if (!use_tent_) return impl_->getBatchRetirementStatus(batch_id, retired);
+    retired = false;
+    TransferStatus status;
+    auto queried = getBatchTransferStatus(batch_id, status);
+    if (!queried.ok()) return queried;
+    // TENT caches failure/timeout states without exposing transport quiescence.
+    // Those states cannot authorize reuse of borrowed buffers.
+    retired = status.s == TransferStatusEnum::COMPLETED;
+    if (status.s == TransferStatusEnum::FAILED ||
+        status.s == TransferStatusEnum::TIMEOUT ||
+        status.s == TransferStatusEnum::CANCELED) {
+        return Status::Context("Transfer batch failed, state=" +
+                               std::to_string(static_cast<int>(status.s)));
+    }
+    return Status::OK();
 }
 
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {

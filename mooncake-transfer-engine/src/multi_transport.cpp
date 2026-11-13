@@ -96,6 +96,13 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
 }
 
 Status MultiTransport::freeBatchID(BatchID batch_id) {
+    bool retired = false;
+    auto status = getBatchRetirementStatus(batch_id, retired);
+    if (!retired) {
+        return Status::BatchBusy("Batch tasks or callbacks are pending: " +
+                                 status.ToString());
+    }
+    // A transfer/query error does not prevent cleanup after retirement.
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
@@ -254,7 +261,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         } else {
             status.s = Transport::TransferStatusEnum::COMPLETED;
         }
-        task.is_finished = true;
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
     } else {
         if (checkSliceTimeout(task)) {
             status.s = Transport::TransferStatusEnum::TIMEOUT;
@@ -263,6 +270,53 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         }
     }
     return Status::OK();
+}
+
+Status MultiTransport::getBatchRetirementStatus(BatchID batch_id,
+                                                bool& retired) {
+    auto& batch = toBatchDesc(batch_id);
+    retired = true;
+    Status result = Status::OK();
+    for (size_t index = 0; index < batch.task_list.size(); ++index) {
+        auto& task = batch.task_list[index];
+        const uint64_t count =
+            __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+        uint64_t succeeded =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        uint64_t failed =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        if (succeeded > count || failed != count - succeeded) {
+            TransferStatus status;
+            auto queried = getTransferStatus(batch_id, index, status);
+            if (result.ok() && !queried.ok()) {
+                result = queried;
+            } else if (result.ok() &&
+                       (status.s == Transport::TransferStatusEnum::FAILED ||
+                        status.s == Transport::TransferStatusEnum::TIMEOUT ||
+                        status.s == Transport::TransferStatusEnum::CANCELED)) {
+                result =
+                    Status::Context("Transfer task failed, state=" +
+                                    std::to_string(static_cast<int>(status.s)));
+            }
+            succeeded =
+                __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+            failed =
+                __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        }
+        if (succeeded > count || failed != count - succeeded) retired = false;
+        if (result.ok() && failed != 0) {
+            result = Status::Context("Transfer task failed: " +
+                                     std::to_string(index));
+        }
+    }
+    retired = retired && batch.active_completion_callbacks.load(
+                             std::memory_order_acquire) == 0;
+    if (retired) {
+        for (auto& task : batch.task_list) {
+            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+        }
+    }
+    return result;
 }
 
 Status MultiTransport::getBatchTransferStatus(BatchID batch_id,

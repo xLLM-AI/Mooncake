@@ -49,6 +49,10 @@ Status Transport::freeBatchID(BatchID batch_id) {
                 "BatchID cannot be freed until all tasks are done");
         }
     }
+    if (batch_desc.active_completion_callbacks.load(
+            std::memory_order_acquire) != 0) {
+        return Status::BatchBusy("Completion callbacks are pending");
+    }
     delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
     RWSpinlock::WriteGuard guard(batch_desc_lock_);

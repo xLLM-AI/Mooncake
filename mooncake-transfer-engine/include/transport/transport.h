@@ -186,17 +186,19 @@ class Transport {
 
        public:
         void markSuccess() {
+            CompletionCallbackPin pin(task);
             status = Slice::SUCCESS;
             __atomic_fetch_add(&task->transferred_bytes, length,
                                __ATOMIC_RELAXED);
-            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_ACQ_REL);
 
             check_batch_completion(false);
         }
 
         void markFailed() {
+            CompletionCallbackPin pin(task);
             status = Slice::FAILED;
-            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_ACQ_REL);
 
             check_batch_completion(true);
         }
@@ -204,6 +206,22 @@ class Transport {
         volatile int64_t ts;
 
        private:
+        class CompletionCallbackPin {
+           public:
+            explicit CompletionCallbackPin(TransferTask *task)
+                : batch_(toBatchDesc(task->batch_id)) {
+                batch_.active_completion_callbacks.fetch_add(
+                    1, std::memory_order_acq_rel);
+            }
+            ~CompletionCallbackPin() {
+                batch_.active_completion_callbacks.fetch_sub(
+                    1, std::memory_order_release);
+            }
+
+           private:
+            BatchDesc &batch_;
+        };
+
         inline void check_batch_completion(bool is_failed) {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
             auto &batch_desc = toBatchDesc(task->batch_id);
@@ -345,6 +363,9 @@ class Transport {
         std::vector<TransferTask> task_list;
         void *context;  // for transport implementers.
         int64_t start_timestamp;
+
+        // A terminal count does not mean its completion callback has returned.
+        std::atomic<uint64_t> active_completion_callbacks{0};
 
         // Track batch progress and notifies waiters
         std::atomic<bool> has_failure{false};
