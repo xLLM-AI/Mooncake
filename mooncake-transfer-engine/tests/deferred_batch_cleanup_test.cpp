@@ -50,6 +50,10 @@ class CounterTransport : public Transport {
    public:
     std::atomic<QueryError> error{QueryError::None};
     std::atomic<int> error_queries{0};
+    bool counter_completion = false;
+    bool supportsBatchCompletionCounter() const override {
+        return counter_completion;
+    }
 
     Status submitTransfer(BatchID,
                           const std::vector<TransferRequest>&) override {
@@ -299,6 +303,85 @@ TEST(DeferredBatchCleanupTest, ShutdownReclaimsAlreadyPublishedErrorBatch) {
     EXPECT_EQ(counts.deleted.load(), 1);
     EXPECT_EQ(counts.slices.load(), 1);
     EXPECT_TRUE(counts.hook_before_slice.load());
+}
+
+TEST(DeferredBatchCleanupTest, RetirementKeepsHandleUntilAllTasksAndPinsDrain) {
+    std::string name = "retirement-failed-sibling";
+    CounterTransport backend;
+    CleanupCounts counts;
+    MultiTransport transport(nullptr, name);
+    auto batch = make_batch(transport, backend, counts, 2);
+    bool retired = true;
+    batch.slices.front()->markFailed();
+    EXPECT_TRUE(
+        transport.getBatchRetirementStatus(batch.id, retired).IsContext());
+    EXPECT_FALSE(retired);
+    EXPECT_EQ(counts.deleted.load(), 0);
+    EXPECT_FALSE(Peer::pending(transport, batch.id));
+    batch.desc->active_completion_callbacks.fetch_add(1);
+    batch.slices.back()->markSuccess();
+    EXPECT_TRUE(
+        transport.getBatchRetirementStatus(batch.id, retired).IsContext());
+    EXPECT_FALSE(retired);
+    batch.desc->active_completion_callbacks.fetch_sub(1);
+    EXPECT_TRUE(
+        transport.getBatchRetirementStatus(batch.id, retired).IsContext());
+    EXPECT_TRUE(retired);
+    EXPECT_EQ(counts.deleted.load(), 0);
+    EXPECT_TRUE(
+        Peer::free(transport, batch.id, [&] { ++counts.deleted; }).ok());
+    EXPECT_EQ(counts.deleted.load(), 1);
+}
+
+TEST(DeferredBatchCleanupTest, RetirementRequiresSealedCounterPublication) {
+    std::string name = "retirement-submission-seal";
+    CounterTransport backend;
+    backend.counter_completion = true;
+    CleanupCounts counts;
+    MultiTransport transport(nullptr, name);
+    auto batch = make_batch(transport, backend, counts);
+    auto& task = batch.desc->task_list.front();
+    Transport::Slice::unsealTaskSubmission(&task);
+    batch.slices.front()->markSuccess();
+    Transport::TransferStatus terminal{};
+    EXPECT_TRUE(backend.getTransferStatus(batch.id, 0, terminal).ok());
+    bool retired = true;
+    EXPECT_TRUE(transport.getBatchRetirementStatus(batch.id, retired).ok());
+    EXPECT_FALSE(retired);
+    // A prior terminal getter cannot make is_finished bypass the seal.
+    EXPECT_TRUE(transport.getBatchRetirementStatus(batch.id, retired).ok());
+    EXPECT_FALSE(retired);
+    Transport::Slice::sealTaskSubmission(&task);
+    EXPECT_TRUE(transport.getBatchRetirementStatus(batch.id, retired).ok());
+    EXPECT_TRUE(retired);
+    EXPECT_TRUE(
+        Peer::free(transport, batch.id, [&] { ++counts.deleted; }).ok());
+}
+
+TEST(DeferredBatchCleanupTest, RetirementQueryFailureDoesNotInvalidateHandle) {
+    std::string name = "retirement-query-error";
+    CounterTransport backend;
+    CleanupCounts counts;
+    MultiTransport transport(nullptr, name);
+    auto batch = make_batch(transport, backend, counts);
+    backend.error = QueryError::Context;
+    // A legacy finished flag does not make a failed API query a retirement
+    // proof; only a successful terminal query or publication can do that.
+    __atomic_store_n(&batch.desc->task_list.front().is_finished, true,
+                     __ATOMIC_RELEASE);
+    bool retired = true;
+    EXPECT_TRUE(
+        transport.getBatchRetirementStatus(batch.id, retired).IsContext());
+    EXPECT_FALSE(retired);
+    EXPECT_FALSE(Peer::pending(transport, batch.id));
+    batch.slices.front()->markFailed();
+    EXPECT_TRUE(
+        transport.getBatchRetirementStatus(batch.id, retired).IsContext());
+    EXPECT_TRUE(retired);
+    EXPECT_EQ(counts.deleted.load(), 0);
+    EXPECT_TRUE(
+        Peer::free(transport, batch.id, [&] { ++counts.deleted; }).ok());
+    EXPECT_EQ(counts.deleted.load(), 1);
 }
 
 }  // namespace

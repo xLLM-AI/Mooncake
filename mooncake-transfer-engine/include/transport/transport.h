@@ -504,6 +504,9 @@ class Transport {
         volatile uint64_t completion_state = Slice::kCompletionSealBit;
         volatile uint64_t transferred_bytes = 0;
         volatile bool is_finished = false;
+        // Set by MultiTransport only after a successful terminal status query.
+        // Legacy is_finished alone is not proof after an API query error.
+        volatile bool retirement_observed = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
 

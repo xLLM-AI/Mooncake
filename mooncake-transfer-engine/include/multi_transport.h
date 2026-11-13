@@ -81,6 +81,11 @@ class MultiTransport {
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status);
 
+    // Observe retirement without releasing or transferring batch ownership.
+    // A non-OK result reports a query/transfer failure; only retired permits
+    // the caller to stop retaining borrowed requests and transfer buffers.
+    Status getBatchRetirementStatus(BatchID batch_id, bool &retired);
+
     Transport *installTransport(const std::string &proto,
                                 std::shared_ptr<Topology> topo);
 

@@ -342,6 +342,19 @@ class TransferEngineImpl {
         return result;
     }
 
+    Status getBatchRetirementStatus(BatchID batch_id, bool& retired) {
+        Status result =
+            multi_transports_->getBatchRetirementStatus(batch_id, retired);
+        if (retired && result.ok()) {
+            // Preserve completion metrics/notifications previously driven by
+            // the aggregate status polling path before the caller frees.
+            TransferStatus status;
+            Status completed = getBatchTransferStatus(batch_id, status);
+            if (result.ok() && !completed.ok()) return completed;
+        }
+        return result;
+    }
+
     Transport* getTransport(const std::string& proto) {
         if (!multi_transports_) return nullptr;
         return multi_transports_->getTransport(proto);

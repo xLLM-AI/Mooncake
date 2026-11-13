@@ -289,6 +289,18 @@ class TransferEngine {
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
+#ifndef USE_TENT
+    // After submission returns, poll a caller-owned, valid batch until retired
+    // is true. All tasks and completion callbacks must have stopped accessing
+    // borrowed requests/buffers. This does not free or invalidate batch_id.
+    // A non-OK result reports an observed query/transfer failure independently
+    // of retirement. TIMEOUT/error alone never authorizes buffer reuse.
+    // Do not submit more work, free, or query this batch concurrently. As with
+    // transfer completion, transports must publish terminal state after I/O
+    // retirement (including failure paths).
+    Status getBatchRetirementStatus(BatchID batch_id, bool& retired);
+#endif
+
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
     Transport* getTransport(const std::string& proto);

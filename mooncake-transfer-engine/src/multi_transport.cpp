@@ -589,6 +589,12 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             checkSliceTimeout(task)) {
             status.s = Transport::TransferStatusEnum::TIMEOUT;
         }
+        if (status.s == TransferStatusEnum::COMPLETED ||
+            status.s == TransferStatusEnum::FAILED) {
+            __atomic_store_n(&task.retirement_observed, true, __ATOMIC_RELEASE);
+            __atomic_store_n(&task.transferred_bytes, status.transferred_bytes,
+                             __ATOMIC_RELEASE);
+        }
         recordTaskEnd(task, status);
         return Status::OK();
     }
@@ -734,6 +740,83 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
         batch_desc.is_finished.store(true, std::memory_order_release);
     }
     return Status::OK();
+}
+
+Status MultiTransport::getBatchRetirementStatus(BatchID batch_id,
+                                                bool& retired) {
+    retired = false;
+    auto& batch = *((BatchDesc*)(batch_id));
+    Status result = batch.has_failure.load(std::memory_order_acquire)
+                        ? Status::Context("Mooncake transfer task failed")
+                        : Status::OK();
+    bool pending = false;
+    uint64_t completed_bytes = 0;
+    for (size_t task_id = 0; task_id < batch.task_list.size(); ++task_id) {
+        auto& task = batch.task_list[task_id];
+        const auto slice_count =
+            __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+        const bool counter_completion =
+            task.transport_ &&
+            task.transport_->supportsBatchCompletionCounter();
+        bool done =
+            slice_count == 0 ||
+            __atomic_load_n(&task.completion_published, __ATOMIC_ACQUIRE) ||
+            (!counter_completion &&
+             __atomic_load_n(&task.retirement_observed, __ATOMIC_ACQUIRE));
+        if (!done && !counter_completion) {
+            // Counter transports publish completion without polling. Other
+            // transports need polling to drive completion. Visit every
+            // task even after a sibling failed or its query returned an error.
+            TransferStatus status{};
+            const Status queried = getTransferStatus(batch_id, task_id, status);
+            if (!queried.ok()) {
+                if (result.ok()) result = queried;
+                // A sealed last-slice publication remains a retirement proof
+                // if a transport status query fails. Callback pins still gate
+                // the batch-wide result below.
+                done = __atomic_load_n(&task.completion_published,
+                                       __ATOMIC_ACQUIRE);
+            } else {
+                done = status.s == TransferStatusEnum::COMPLETED ||
+                       status.s == TransferStatusEnum::FAILED;
+                if (done) {
+                    __atomic_store_n(&task.transferred_bytes,
+                                     status.transferred_bytes,
+                                     __ATOMIC_RELEASE);
+                }
+                if (status.s == TransferStatusEnum::FAILED) {
+                    batch.has_failure.store(true, std::memory_order_release);
+                }
+                if (result.ok() && (status.s == TransferStatusEnum::FAILED ||
+                                    status.s == TransferStatusEnum::TIMEOUT)) {
+                    result = Status::Context("Mooncake transfer task failed");
+                }
+            }
+        }
+        if (__atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE) &&
+            result.ok()) {
+            result = Status::Context("Mooncake transfer task failed");
+        }
+        if (!done) {
+            pending = true;
+            continue;
+        }
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+        completed_bytes +=
+            __atomic_load_n(&task.transferred_bytes, __ATOMIC_ACQUIRE);
+        if (metricsEnabled()) recordFinishedTask(task);
+    }
+    retired = !pending && batch.active_completion_callbacks.load(
+                              std::memory_order_acquire) == 0;
+    if (retired && result.ok()) {
+        // Let the wrapper publish completion metrics/notifications without
+        // querying a transport again after its terminal completion.
+        batch.finished_transfer_bytes.store(completed_bytes,
+                                            std::memory_order_relaxed);
+        batch.is_finished.store(true, std::memory_order_relaxed);
+        batch.status_cached.store(true, std::memory_order_release);
+    }
+    return result;
 }
 
 Transport* MultiTransport::installTransport(const std::string& proto,

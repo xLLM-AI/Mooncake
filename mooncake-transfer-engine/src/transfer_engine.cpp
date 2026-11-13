@@ -303,6 +303,11 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
     return impl_->getBatchTransferStatus(batch_id, status);
 }
 
+Status TransferEngine::getBatchRetirementStatus(BatchID batch_id,
+                                                bool& retired) {
+    return impl_->getBatchRetirementStatus(batch_id, retired);
+}
+
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
     stats.clear();
     return Status::OK();
