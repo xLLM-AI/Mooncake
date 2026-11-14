@@ -408,6 +408,7 @@ TEST_F(MasterAdminServerTest, ReadinessFollowsRebuildGateWithoutHidingLeader) {
     WrappedMasterServiceConfig config;
     config.default_kv_lease_ttl = 5000;
     config.initially_serving = false;
+    config.enable_ha_rebuild = true;
     config.enable_metric_reporting = false;
     auto service = std::make_shared<WrappedMasterService>(config);
     const int port = getFreeTcpPort();
@@ -418,19 +419,19 @@ TEST_F(MasterAdminServerTest, ReadinessFollowsRebuildGateWithoutHidingLeader) {
     admin.SetRuntimeState(ha::MasterRuntimeState::kLeaderWarmup);
     auto health = HttpGet(port, "/health");
     EXPECT_EQ(health.http_status, 200);
+    EXPECT_NE(health.body.find("\"ha_state\":\"leader_warmup\""),
+              std::string::npos);
     EXPECT_NE(health.body.find("\"service_ready\":false"), std::string::npos);
     EXPECT_EQ(HttpGet(port, "/role").body, "leader");
     EXPECT_EQ(HttpGet(port, "/leader").http_status, 200);
     EXPECT_EQ(HttpGet(port, "/get_all_keys").http_status, 503);
     EXPECT_TRUE(service->ReMountSegment({}, generate_uuid()));
-    service->ForceServingAfterTimeout();
-    EXPECT_EQ(service->GetServingState(), StoreServingState::DEGRADED);
+    service->LockRebuildExpectedClients({});
+    EXPECT_EQ(service->GetServingState(), StoreServingState::SERVING);
     health = HttpGet(port, "/health");
+    EXPECT_NE(health.body.find("\"ha_state\":\"serving\""), std::string::npos);
     EXPECT_NE(health.body.find("\"service_ready\":true"), std::string::npos);
     EXPECT_EQ(HttpGet(port, "/get_all_keys").http_status, 200);
-    service->SetServing(true);
-    EXPECT_NE(HttpGet(port, "/health").body.find("\"service_ready\":true"),
-              std::string::npos);
     admin.SetServiceAvailable(false);
     EXPECT_NE(HttpGet(port, "/health").body.find("\"service_ready\":false"),
               std::string::npos);
