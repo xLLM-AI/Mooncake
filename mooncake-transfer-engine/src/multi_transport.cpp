@@ -122,6 +122,28 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     return batch_desc->id;
 }
 
+Transport::DeferredCleanupStats MultiTransport::collectDeferredCleanupStats(
+    std::chrono::steady_clock::time_point now) const {
+    Transport::DeferredCleanupStats stats;
+    stats.pending_batches = deferred_cleanup_batches_.size();
+    for (const auto& [id, entry] : deferred_cleanup_batches_) {
+        if (!entry.last_error.ok()) ++stats.query_error_batches;
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             now - entry.enqueued_at)
+                             .count();
+        if (age > 0) {
+            stats.oldest_age_ms =
+                std::max(stats.oldest_age_ms, static_cast<uint64_t>(age));
+        }
+    }
+    return stats;
+}
+
+Transport::DeferredCleanupStats MultiTransport::getDeferredCleanupStats() {
+    std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
+    return collectDeferredCleanupStats(std::chrono::steady_clock::now());
+}
+
 Status MultiTransport::freeBatchID(BatchID batch_id) {
     return freeBatchID(batch_id, std::function<void()>());
 }
@@ -155,7 +177,8 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
 }
 
 Status MultiTransport::tryFreeBatchID(
-    BatchID batch_id, const std::function<void()>& before_delete) {
+    BatchID batch_id, const std::function<void()>& before_delete,
+    bool allow_completion_fallback, bool poll_transport) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     bool busy = false;
@@ -170,6 +193,20 @@ Status MultiTransport::tryFreeBatchID(
         }
         if (task.slice_count == 0) {
             task.is_finished = true;
+            continue;
+        }
+        // A failed status query is not evidence that a task stopped using
+        // its buffers. After such an error, only the sealed last-slice
+        // publication can substitute for polling. CompletionCallbackPin still
+        // protects callback accesses until the batch-wide check below.
+        if (allow_completion_fallback &&
+            __atomic_load_n(&task.completion_published, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+            if (metricsEnabled()) recordFinishedTask(task);
+            continue;
+        }
+        if (!poll_transport) {
+            busy = true;
             continue;
         }
         TransferStatus status;
@@ -215,6 +252,7 @@ Status MultiTransport::tryFreeBatchID(
 
 void MultiTransport::deferredCleanupLoop() {
     constexpr auto kCleanupInterval = std::chrono::milliseconds(100);
+    constexpr auto kDeferredCleanupWarningInterval = std::chrono::seconds(60);
     std::unique_lock<std::mutex> lock(deferred_cleanup_mutex_);
     while (true) {
         if (deferred_cleanup_batches_.empty()) {
@@ -230,17 +268,52 @@ void MultiTransport::deferredCleanupLoop() {
 
         for (auto it = deferred_cleanup_batches_.begin();
              it != deferred_cleanup_batches_.end();) {
-            Status status = tryFreeBatchID(it->first, it->second);
+            auto& entry = it->second;
+            const auto now = std::chrono::steady_clock::now();
+            const bool poll_transport =
+                !entry.completion_only && now >= entry.next_poll;
+            Status status = tryFreeBatchID(
+                it->first, entry.before_delete,
+                /*allow_completion_fallback=*/!entry.last_error.ok(),
+                poll_transport);
             if (status.ok()) {
                 it = deferred_cleanup_batches_.erase(it);
-            } else if (!status.IsBatchBusy()) {
-                // A permanent error (e.g. a stale task reference) will never
-                // resolve on retry; drop the entry instead of polling forever.
-                LOG(ERROR) << "Dropping deferred cleanup for batch "
-                           << it->first << ": " << status.ToString();
-                it = deferred_cleanup_batches_.erase(it);
-            } else {
-                ++it;
+                continue;
+            }
+            if (!status.IsBatchBusy()) {
+                // The caller already invalidated this handle. Retain both
+                // the descriptor and its delete hook on every query error.
+                // InvalidArgument/NotImplemented cannot be repaired by
+                // polling; wait for callback-published completion instead.
+                if (!(entry.last_error == status)) {
+                    LOG(ERROR) << "Retaining deferred cleanup for batch "
+                               << it->first << ": " << status.ToString();
+                }
+                entry.last_error = status;
+                entry.completion_only =
+                    status.IsInvalidArgument() || status.IsNotImplemented();
+                entry.next_poll = now + entry.retry_delay;
+                entry.retry_delay = std::min(entry.retry_delay * 2,
+                                             std::chrono::milliseconds(5000));
+            } else if (poll_transport && !entry.completion_only) {
+                entry.last_error = Status::OK();
+                entry.retry_delay = kCleanupInterval;
+            }
+            ++it;
+        }
+
+        const auto warning_now = std::chrono::steady_clock::now();
+        if (warning_now >= next_deferred_cleanup_warning_) {
+            next_deferred_cleanup_warning_ =
+                warning_now + kDeferredCleanupWarningInterval;
+            const auto stats = collectDeferredCleanupStats(warning_now);
+            const auto oldest_age =
+                std::chrono::milliseconds(stats.oldest_age_ms);
+            if (oldest_age >= kDeferredCleanupWarningInterval) {
+                LOG(WARNING) << "Deferred cleanup backlog: pending="
+                             << stats.pending_batches
+                             << ", query_errors=" << stats.query_error_batches
+                             << ", oldest_age_ms=" << stats.oldest_age_ms;
             }
         }
 
@@ -554,6 +627,12 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             checkSliceTimeout(task)) {
             status.s = Transport::TransferStatusEnum::TIMEOUT;
         }
+        if (status.s == TransferStatusEnum::COMPLETED ||
+            status.s == TransferStatusEnum::FAILED) {
+            __atomic_store_n(&task.retirement_observed, true, __ATOMIC_RELEASE);
+            __atomic_store_n(&task.transferred_bytes, status.transferred_bytes,
+                             __ATOMIC_RELEASE);
+        }
         recordTaskEnd(task, status);
         return Status::OK();
     }
@@ -699,6 +778,93 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
         batch_desc.is_finished.store(true, std::memory_order_release);
     }
     return Status::OK();
+}
+
+Status MultiTransport::getBatchRetirementStatus(BatchID batch_id,
+                                                bool& retired) {
+    retired = false;
+    auto& batch = *((BatchDesc*)(batch_id));
+    Status result = batch.has_failure.load(std::memory_order_acquire)
+                        ? Status::Context("Mooncake transfer task failed")
+                        : Status::OK();
+    bool pending = false;
+    uint64_t completed_bytes = 0;
+    for (size_t task_id = 0; task_id < batch.task_list.size(); ++task_id) {
+        auto& task = batch.task_list[task_id];
+        const auto slice_count =
+            __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+        const bool counter_completion =
+            task.transport_ &&
+            task.transport_->supportsBatchCompletionCounter();
+        bool done =
+            slice_count == 0 ||
+            __atomic_load_n(&task.completion_published, __ATOMIC_ACQUIRE) ||
+            (!counter_completion &&
+             __atomic_load_n(&task.retirement_observed, __ATOMIC_ACQUIRE));
+        if (!done && !counter_completion) {
+            // Counter transports publish completion without polling. Other
+            // transports need polling to drive completion. Visit every
+            // task even after a sibling failed or its query returned an error.
+            TransferStatus status{};
+            const Status queried = getTransferStatus(batch_id, task_id, status);
+            if (!queried.ok()) {
+                if (result.ok()) result = queried;
+                // A sealed last-slice publication remains a retirement proof
+                // if a transport status query fails. Callback pins still gate
+                // the batch-wide result below.
+                done = __atomic_load_n(&task.completion_published,
+                                       __ATOMIC_ACQUIRE);
+            } else {
+                done = status.s == TransferStatusEnum::COMPLETED ||
+                       status.s == TransferStatusEnum::FAILED;
+                if (status.s == TransferStatusEnum::FAILED ||
+                    status.s == TransferStatusEnum::CANCELED ||
+                    status.s == TransferStatusEnum::INVALID) {
+                    batch.has_failure.store(true, std::memory_order_release);
+                }
+                if (result.ok()) {
+                    if (status.s == TransferStatusEnum::TIMEOUT) {
+                        result =
+                            Status::Context("Mooncake transfer task timeout");
+                    } else if (status.s == TransferStatusEnum::FAILED) {
+                        result =
+                            Status::Context("Mooncake transfer task failed");
+                    } else if (status.s == TransferStatusEnum::CANCELED) {
+                        result =
+                            Status::Context("Mooncake transfer task canceled");
+                    } else if (status.s == TransferStatusEnum::INVALID) {
+                        result =
+                            Status::Context("Mooncake transfer task invalid");
+                    }
+                }
+                // INVALID/CANCELED expose failure without proving physical
+                // I/O retirement. Keep the batch pending for later proof.
+            }
+        }
+        if (__atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE) &&
+            result.ok()) {
+            result = Status::Context("Mooncake transfer task failed");
+        }
+        if (!done) {
+            pending = true;
+            continue;
+        }
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+        completed_bytes +=
+            __atomic_load_n(&task.transferred_bytes, __ATOMIC_ACQUIRE);
+        if (metricsEnabled()) recordFinishedTask(task);
+    }
+    retired = !pending && batch.active_completion_callbacks.load(
+                              std::memory_order_acquire) == 0;
+    if (retired && result.ok()) {
+        // Let the wrapper publish completion metrics/notifications without
+        // querying a transport again after its terminal completion.
+        batch.finished_transfer_bytes.store(completed_bytes,
+                                            std::memory_order_relaxed);
+        batch.is_finished.store(true, std::memory_order_release);
+        batch.status_cached.store(true, std::memory_order_release);
+    }
+    return result;
 }
 
 Transport* MultiTransport::installTransport(const std::string& proto,

@@ -99,6 +99,42 @@ class TransferEngineImplTestPeer {
         return *engine.impl_;
     }
 
+#ifdef WITH_METRICS
+    static void enableLogMetrics(TransferEngineImpl& engine) {
+        engine.metrics_enabled_ = true;
+        engine.multi_transports_ = std::make_shared<MultiTransport>(
+            nullptr, engine.local_server_name_);
+    }
+
+    static uint64_t transferredBytes(TransferEngineImpl& engine) {
+        return engine.transferred_bytes_counter_.value();
+    }
+
+    static BatchID prepareCompletedBatch(TransferEngineImpl& engine,
+                                         size_t task_count,
+                                         uint64_t bytes_per_task) {
+        const BatchID id = engine.allocateBatchID(task_count);
+        auto& batch = Transport::toBatchDesc(id);
+        for (size_t i = 0; i < task_count; ++i) {
+            auto& task = batch.task_list.emplace_back();
+            task.batch_id = id;
+            task.slice_count = 1;
+            task.success_slice_count = 1;
+            task.is_finished = true;
+            task.retirement_observed = true;
+            task.completion_published = true;
+            task.total_bytes = bytes_per_task;
+            task.transferred_bytes = bytes_per_task;
+            task.start_time = std::chrono::steady_clock::now();
+        }
+        batch.finished_task_count = task_count;
+        batch.finished_transfer_bytes = task_count * bytes_per_task;
+        batch.is_finished = true;
+        batch.status_cached = true;
+        return id;
+    }
+#endif
+
     static AutoDiscoverConfig autoDiscoverConfig(
         const TransferEngineImpl& engine) {
         return engine.auto_discover_config_;
@@ -608,6 +644,65 @@ TEST(TransferEngineTentCompatibilityTest, ForceTcpEnvForcesTcpTransport) {
     std::array<char, 4096> buffer{};
     ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size()), 0);
     EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+}
+#endif
+
+#if defined(WITH_METRICS) && !defined(USE_TENT)
+TEST(TransferEngineRetirementMetricsTest, RepeatedObservationsCountBytesOnce) {
+    ScopedEnvVar disable_reporter("MC_TE_METRIC", "0");
+    TransferEngineImpl engine;
+    TransferEngineImplTestPeer::enableLogMetrics(engine);
+    const BatchID id =
+        TransferEngineImplTestPeer::prepareCompletedBatch(engine, 1, 64);
+    for (int i = 0; i < 2; ++i) {
+        bool retired = false;
+        EXPECT_TRUE(engine.getBatchRetirementStatus(id, retired).ok());
+        EXPECT_TRUE(retired);
+    }
+    EXPECT_EQ(TransferEngineImplTestPeer::transferredBytes(engine), 64);
+
+    // Concurrent read-only observations retain the caller-owned handle until
+    // every observer exits; the accounting claim itself must be atomic.
+    std::array<std::thread, 8> observers;
+    for (auto& observer : observers) {
+        observer = std::thread([&] {
+            for (int i = 0; i < 10; ++i) {
+                bool retired = false;
+                EXPECT_TRUE(engine.getBatchRetirementStatus(id, retired).ok());
+                EXPECT_TRUE(retired);
+            }
+        });
+    }
+    for (auto& observer : observers) observer.join();
+    EXPECT_EQ(TransferEngineImplTestPeer::transferredBytes(engine), 64);
+    EXPECT_TRUE(engine.freeBatchID(id).ok());
+}
+
+TEST(TransferEngineRetirementMetricsTest, TaskAndBatchObserversShareByteClaim) {
+    ScopedEnvVar disable_reporter("MC_TE_METRIC", "0");
+    TransferEngineImpl engine;
+    TransferEngineImplTestPeer::enableLogMetrics(engine);
+    const BatchID id =
+        TransferEngineImplTestPeer::prepareCompletedBatch(engine, 2, 32);
+    TransferStatus status{};
+    EXPECT_TRUE(engine.getTransferStatus(id, 0, status).ok());
+    EXPECT_EQ(TransferEngineImplTestPeer::transferredBytes(engine), 32);
+    EXPECT_TRUE(engine.getBatchTransferStatus(id, status).ok());
+    EXPECT_EQ(TransferEngineImplTestPeer::transferredBytes(engine), 64);
+    bool retired = false;
+    EXPECT_TRUE(engine.getBatchRetirementStatus(id, retired).ok());
+    EXPECT_TRUE(retired);
+    EXPECT_TRUE(engine.getTransferStatus(id, 1, status).ok());
+    EXPECT_EQ(TransferEngineImplTestPeer::transferredBytes(engine), 64);
+    EXPECT_TRUE(engine.freeBatchID(id).ok());
+
+    // Accounting belongs to tasks, not a pointer-derived historical BatchID.
+    const BatchID next =
+        TransferEngineImplTestPeer::prepareCompletedBatch(engine, 1, 64);
+    EXPECT_TRUE(engine.getBatchRetirementStatus(next, retired).ok());
+    EXPECT_TRUE(retired);
+    EXPECT_EQ(TransferEngineImplTestPeer::transferredBytes(engine), 128);
+    EXPECT_TRUE(engine.freeBatchID(next).ok());
 }
 #endif
 

@@ -268,8 +268,12 @@ class TransferEngine {
 
     BatchID allocateBatchID(size_t batch_size);
 
-    // An OK or BatchCleanupDeferred return invalidates batch_id. A deferred
-    // cleanup means in-flight transport work may still own transfer buffers.
+    // An OK or BatchCleanupDeferred return invalidates batch_id. Deferred
+    // transfers batch cleanup responsibility, not ownership of user buffers.
+    // Cleanup status is independent of transfer success: do not turn an
+    // otherwise successful transfer into a failure solely due to deferral.
+    // In-flight work may still access borrowed buffers; keep them alive until
+    // retirement is independently established, even after handle handoff.
     Status freeBatchID(BatchID batch_id);
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
@@ -288,6 +292,27 @@ class TransferEngine {
                              TransferStatus& status);
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
+
+#ifndef USE_TENT
+    // After submission returns, poll a caller-owned, valid batch until retired
+    // is true. All tasks and completion callbacks must have stopped accessing
+    // borrowed requests/buffers. This does not free or invalidate batch_id.
+    // A non-OK result reports an observed query/transfer failure independently
+    // of retirement. TIMEOUT, CANCELED, INVALID, or another error alone never
+    // authorizes buffer reuse; rely on retired for the independent proof.
+    // Do not submit more work, free, or query this batch concurrently. As with
+    // transfer completion, transports must publish terminal state after I/O
+    // retirement (including failure paths). TIMEOUT is not terminal: tasks may
+    // subsequently complete/fail, but the timeout itself never permits reuse.
+    // Never query after free returns OK or BatchCleanupDeferred: the handle is
+    // invalid, possibly already deleted or reused. This API does not validate
+    // expired pointer-derived IDs.
+    Status getBatchRetirementStatus(BatchID batch_id, bool& retired);
+
+    // Current reaper-owned backlog. This is not a count of all live batches,
+    // leaked allocations, historical IDs, or bytes in borrowed device buffers.
+    Transport::DeferredCleanupStats getDeferredCleanupStats();
+#endif
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 

@@ -504,6 +504,9 @@ class Transport {
         volatile uint64_t completion_state = Slice::kCompletionSealBit;
         volatile uint64_t transferred_bytes = 0;
         volatile bool is_finished = false;
+        // Set by MultiTransport only after a successful terminal status query.
+        // Legacy is_finished alone is not proof after an API query error.
+        volatile bool retirement_observed = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
 
@@ -522,6 +525,9 @@ class Transport {
         // make the task non-movable).
         volatile bool export_metrics_recorded = false;
         volatile bool log_metrics_recorded = false;
+        // Task and aggregate/retirement observers share byte accounting.
+        // Keep latency publication independent from the first byte observer.
+        volatile bool log_bytes_recorded = false;
         // Set by the event-driven completion callback when it finishes the
         // task: steady_clock ticks (else 0) and COMPLETED or FAILED (else
         // WAITING). Atomic: a poll may read them while the callback writes.
@@ -544,6 +550,13 @@ class Transport {
             for (auto &slice : slice_list)
                 Transport::getSliceCache().deallocate(slice);
         }
+    };
+
+    // A live snapshot of reaper-owned descriptors, not historical BatchIDs.
+    struct DeferredCleanupStats {
+        uint64_t pending_batches = 0;
+        uint64_t query_error_batches = 0;
+        uint64_t oldest_age_ms = 0;
     };
 
     struct BatchDesc {

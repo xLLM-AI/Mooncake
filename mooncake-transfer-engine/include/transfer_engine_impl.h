@@ -276,9 +276,7 @@ class TransferEngineImpl {
 
             // Only record metrics for successful completions
             if (status.s == TransferStatusEnum::COMPLETED) {
-                if (status.transferred_bytes > 0) {
-                    transferred_bytes_counter_.inc(status.transferred_bytes);
-                }
+                recordTransferredBytes(task, status.transferred_bytes);
                 auto now = std::chrono::steady_clock::now();
                 auto duration =
                     std::chrono::duration_cast<std::chrono::microseconds>(
@@ -319,8 +317,14 @@ class TransferEngineImpl {
 #ifdef WITH_METRICS
         if (metrics_enabled_ && !skip_metrics && result.ok() &&
             status.s == TransferStatusEnum::COMPLETED) {
-            if (status.transferred_bytes > 0) {
-                transferred_bytes_counter_.inc(status.transferred_bytes);
+            // The cached aggregate is built from these task byte counts.
+            // Share the per-task claim with getTransferStatus so mixed and
+            // repeated observers cannot count the same successful bytes twice.
+            auto& batch = Transport::toBatchDesc(batch_id);
+            for (auto& task : batch.task_list) {
+                recordTransferredBytes(
+                    task,
+                    __atomic_load_n(&task.transferred_bytes, __ATOMIC_ACQUIRE));
             }
         }
 #endif
@@ -340,6 +344,24 @@ class TransferEngineImpl {
             }
         }
         return result;
+    }
+
+    Status getBatchRetirementStatus(BatchID batch_id, bool& retired) {
+        Status result =
+            multi_transports_->getBatchRetirementStatus(batch_id, retired);
+        if (retired && result.ok()) {
+            // Preserve completion metrics/notifications previously driven by
+            // the aggregate status polling path before the caller frees.
+            TransferStatus status;
+            Status completed = getBatchTransferStatus(batch_id, status);
+            if (!completed.ok()) return completed;
+        }
+        return result;
+    }
+
+    Transport::DeferredCleanupStats getDeferredCleanupStats() {
+        if (!multi_transports_) return {};
+        return multi_transports_->getDeferredCleanupStats();
     }
 
     Transport* getTransport(const std::string& proto) {
@@ -526,6 +548,15 @@ class TransferEngineImpl {
     std::atomic<bool> should_stop_metrics_thread_{false};
     bool metrics_enabled_{false};
     uint64_t metrics_interval_seconds_{5};
+
+    void recordTransferredBytes(Transport::TransferTask& task,
+                                uint64_t transferred_bytes) {
+        if (transferred_bytes > 0 &&
+            !__atomic_exchange_n(&task.log_bytes_recorded, true,
+                                 __ATOMIC_ACQ_REL)) {
+            transferred_bytes_counter_.inc(transferred_bytes);
+        }
+    }
 
     // Helper methods for metrics reporting thread management
     void InitializeMetricsConfig();

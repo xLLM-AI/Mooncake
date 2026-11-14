@@ -15,6 +15,7 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <map>
@@ -55,9 +56,17 @@ class MultiTransport {
 
     BatchID allocateBatchID(size_t batch_size);
 
-    // An OK or BatchCleanupDeferred return invalidates batch_id. A deferred
-    // cleanup means in-flight transport work may still own transfer buffers.
+    // An OK or BatchCleanupDeferred return invalidates batch_id. Deferred
+    // transfers batch cleanup responsibility, not ownership of user buffers.
+    // Cleanup status is independent of transfer success: do not turn an
+    // otherwise successful transfer into a failure solely due to deferral.
+    // In-flight work may still access borrowed buffers; keep them alive until
+    // retirement is independently established, even after handle handoff.
+    // A pre-delete hook (when installed by TransferEngineImpl) releases
+    // descriptor side state; its invocation is not a buffer-retirement signal.
     Status freeBatchID(BatchID batch_id);
+
+    Transport::DeferredCleanupStats getDeferredCleanupStats();
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries);
@@ -79,6 +88,11 @@ class MultiTransport {
         std::vector<TransferStatusEnum> &request_statuses);
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status);
+
+    // Observe retirement without releasing or transferring batch ownership.
+    // A non-OK result reports a query/transfer failure; only retired permits
+    // the caller to stop retaining borrowed requests and transfer buffers.
+    Status getBatchRetirementStatus(BatchID batch_id, bool &retired);
 
     Transport *installTransport(const std::string &proto,
                                 std::shared_ptr<Topology> topo);
@@ -134,8 +148,16 @@ class MultiTransport {
     Status selectTransport(const TransferRequest &entry, Transport *&transport,
                            bool *allows_reuse = nullptr);
 
+    // The hook cleans descriptor-scoped state before deletion. It is not a
+    // user-buffer retirement callback; observe retirement before free when
+    // borrowed requests/buffers must be reused.
+    Transport::DeferredCleanupStats collectDeferredCleanupStats(
+        std::chrono::steady_clock::time_point now) const;
+
     Status tryFreeBatchID(BatchID batch_id,
-                          const std::function<void()> &before_delete);
+                          const std::function<void()> &before_delete,
+                          bool allow_completion_fallback = false,
+                          bool poll_transport = true);
 
     void deferredCleanupLoop();
 
@@ -154,8 +176,20 @@ class MultiTransport {
 
     std::mutex deferred_cleanup_mutex_;
     std::condition_variable deferred_cleanup_cv_;
-    std::unordered_map<BatchID, std::function<void()>>
-        deferred_cleanup_batches_;
+    struct DeferredCleanupEntry {
+        explicit DeferredCleanupEntry(const std::function<void()> &callback)
+            : before_delete(callback) {}
+
+        std::function<void()> before_delete;
+        std::chrono::steady_clock::time_point enqueued_at =
+            std::chrono::steady_clock::now();
+        Status last_error;
+        bool completion_only = false;
+        std::chrono::steady_clock::time_point next_poll{};
+        std::chrono::milliseconds retry_delay{100};
+    };
+    std::unordered_map<BatchID, DeferredCleanupEntry> deferred_cleanup_batches_;
+    std::chrono::steady_clock::time_point next_deferred_cleanup_warning_{};
     bool stop_deferred_cleanup_ = false;
     std::thread deferred_cleanup_thread_;
 };
