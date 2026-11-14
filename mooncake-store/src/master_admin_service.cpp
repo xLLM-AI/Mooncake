@@ -351,7 +351,10 @@ void MasterAdminServer::SetServiceAvailable(bool available) {
 MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
     std::lock_guard<std::mutex> lock(state_mutex_);
     return RuntimeSnapshot{
-        .state = state_,
+        .state = state_ == ha::MasterRuntimeState::kLeaderWarmup && service_ &&
+                         service_->IsServing()
+                     ? ha::MasterRuntimeState::kServing
+                     : state_,
         .leader_view = leader_view_,
         .service = service_,
         .service_available =
