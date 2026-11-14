@@ -133,8 +133,10 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                         << ", source_addr: " << slice->source_addr
                         << ", dest_addr: " << slice->hccl.dest_addr
                         << ", ret: " << ret;
-                    slice->markFailed();
-                    slice->status = Slice::SliceStatus::FAILED;
+                    // Keep the error private until the stream and all retries
+                    // have retired. Publishing FAILED here lets callers free
+                    // buffers that a sibling operation still accesses.
+                    slice->status = Slice::FAILED;
                 }
             }
 
@@ -147,7 +149,7 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                     << ", remote devicePhyId: " << remote_rank_info_.devicePhyId
                     << ", ret: " << ret;
                 for (auto slice : slice_list) {
-                    slice->markFailed();
+                    slice->status = Slice::FAILED;
                 }
             }
             auto addOpfence = std::chrono::high_resolution_clock::now();
@@ -160,9 +162,21 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                     << local_rank_info_.devicePhyId
                     << ", remote devicePhyId: " << remote_rank_info_.devicePhyId
                     << ", ret: " << ret;
-                aclrtStreamAbort(stream);
+                const int abort_ret = aclrtStreamAbort(stream);
+                if (abort_ret) {
+                    LOG(ERROR) << "aclrtStreamAbort failed, ret: " << abort_ret;
+                }
                 // Synchronize to drop ACL_ERROR_RT_STREAM_ABORT error
-                aclrtSynchronizeStream(stream);
+                int drain_ret = aclrtSynchronizeStream(stream);
+                while (drain_ret != ACL_SUCCESS) {
+                    // An error result alone cannot release borrowed buffers.
+                    // Keep the batch pending until the stream actually drains.
+                    LOG_EVERY_T(ERROR, 1)
+                        << "Waiting for failed HCCL stream retirement, ret: "
+                        << drain_ret;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    drain_ret = aclrtSynchronizeStream(stream);
+                }
 
                 if (loop < transfer_max_retry_cnt) {
                     LOG(INFO) << "Hccl transport failed. Retry ...";
@@ -181,7 +195,7 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                 LOG(ERROR) << "Hccl transport failed after "
                            << transfer_max_retry_cnt << " retries.";
                 for (auto slice : slice_list) {
-                    slice->markFailed();
+                    slice->status = Slice::FAILED;
                 }
             }
 
@@ -222,9 +236,10 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
         }
 
         for (auto slice : slice_list) {
-            if (slice->status != Slice::SliceStatus::FAILED) {
+            if (slice->status == Slice::SliceStatus::FAILED) {
+                slice->markFailed();
+            } else {
                 slice->markSuccess();
-                slice->task->transferred_bytes = slice->length;
             }
         }
         (void)start;
@@ -538,16 +553,20 @@ Status HcclTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             std::to_string(batch_id));
     }
     auto &task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the preceding byte updates.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = TransferStatusEnum::FAILED;
         } else {
             status.s = TransferStatusEnum::COMPLETED;
         }
-        task.is_finished = true;
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
     } else {
         status.s = TransferStatusEnum::WAITING;
     }
