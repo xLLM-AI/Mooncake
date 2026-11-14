@@ -285,6 +285,32 @@ TEST(DeferredBatchCleanupTest, WaitsForEveryTaskAfterQueryError) {
     expect_reclaimed(transport, batch, counts);
 }
 
+TEST(DeferredBatchCleanupTest, CompletedTransferCanDeferCleanupWithoutFailure) {
+    std::string name = "completed-cleanup-deferred";
+    CounterTransport backend;
+    CleanupCounts counts;
+    MultiTransport transport(nullptr, name);
+    auto batch = make_batch(transport, backend, counts);
+    // Model a callback that published success but is still accessing state.
+    batch.desc->active_completion_callbacks.fetch_add(1);
+    batch.slices.front()->markSuccess();
+    Transport::TransferStatus status{};
+    ASSERT_TRUE(transport.getBatchTransferStatus(batch.id, status).ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::COMPLETED);
+    EXPECT_FALSE(batch.desc->has_failure.load());
+    bool retired = true;
+    EXPECT_TRUE(transport.getBatchRetirementStatus(batch.id, retired).ok());
+    EXPECT_FALSE(retired);
+    EXPECT_TRUE(Peer::free(transport, batch.id, [&] {
+                    ++counts.deleted;
+                }).IsBatchCleanupDeferred());
+    EXPECT_TRUE(Peer::pending(transport, batch.id));
+    EXPECT_EQ(counts.deleted.load(), 0);
+    // Use only the callback's pinned descriptor after the public ID expires.
+    batch.desc->active_completion_callbacks.fetch_sub(1);
+    expect_reclaimed(transport, batch, counts);
+}
+
 TEST(DeferredBatchCleanupTest, PublishedCompletionDoesNotBypassCallbackPin) {
     std::string name = "completion-pin";
     CounterTransport backend;

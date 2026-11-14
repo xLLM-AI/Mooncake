@@ -56,8 +56,12 @@ class MultiTransport {
 
     BatchID allocateBatchID(size_t batch_size);
 
-    // An OK or BatchCleanupDeferred return invalidates batch_id. A deferred
-    // cleanup means in-flight transport work may still own transfer buffers.
+    // An OK or BatchCleanupDeferred return invalidates batch_id. Deferred
+    // transfers batch cleanup responsibility, not ownership of user buffers.
+    // Cleanup status is independent of transfer success: do not turn an
+    // otherwise successful transfer into a failure solely due to deferral.
+    // In-flight work may still access borrowed buffers; keep them alive until
+    // retirement is independently established, even after handle handoff.
     Status freeBatchID(BatchID batch_id);
 
     Transport::DeferredCleanupStats getDeferredCleanupStats();
