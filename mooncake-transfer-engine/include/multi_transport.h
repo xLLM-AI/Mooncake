@@ -62,6 +62,8 @@ class MultiTransport {
     // otherwise successful transfer into a failure solely due to deferral.
     // In-flight work may still access borrowed buffers; keep them alive until
     // retirement is independently established, even after handle handoff.
+    // A pre-delete hook (when installed by TransferEngineImpl) releases
+    // descriptor side state; its invocation is not a buffer-retirement signal.
     Status freeBatchID(BatchID batch_id);
 
     Transport::DeferredCleanupStats getDeferredCleanupStats();

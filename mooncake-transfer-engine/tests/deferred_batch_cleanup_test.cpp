@@ -63,6 +63,8 @@ class CounterTransport : public Transport {
     std::atomic<int> error_queries{0};
     std::atomic<int> queries{0};
     std::atomic<bool> timed_out{false};
+    std::atomic<bool> override_terminal_status{false};
+    std::atomic<TransferStatusEnum> terminal_status{TransferStatusEnum::FAILED};
     bool counter_completion = false;
     bool publish_finished = true;
     bool supportsBatchCompletionCounter() const override {
@@ -93,6 +95,11 @@ class CounterTransport : public Transport {
         }
         if (timed_out.load()) {
             status.s = TransferStatusEnum::TIMEOUT;
+            status.transferred_bytes = 0;
+            return Status::OK();
+        }
+        if (override_terminal_status.load()) {
+            status.s = terminal_status.load();
             status.transferred_bytes = 0;
             return Status::OK();
         }
@@ -458,6 +465,43 @@ TEST(DeferredBatchCleanupTest, TimeoutIsNotRetirementButLaterFailureCanRetire) {
     EXPECT_TRUE(retired);
     EXPECT_TRUE(
         Peer::free(transport, batch.id, [&] { ++counts.deleted; }).ok());
+}
+
+TEST(DeferredBatchCleanupTest, InvalidAndCanceledAreErrorsUntilRetired) {
+    for (const auto terminal_status :
+         {Transport::TransferStatusEnum::INVALID,
+          Transport::TransferStatusEnum::CANCELED}) {
+        std::string name =
+            terminal_status == Transport::TransferStatusEnum::INVALID
+                ? "retirement-invalid"
+                : "retirement-canceled";
+        CounterTransport backend;
+        backend.override_terminal_status = true;
+        backend.terminal_status = terminal_status;
+        CleanupCounts counts;
+        MultiTransport transport(nullptr, name);
+        auto batch = make_batch(transport, backend, counts);
+
+        bool retired = true;
+        const Status failure =
+            transport.getBatchRetirementStatus(batch.id, retired);
+        EXPECT_TRUE(failure.IsContext());
+        EXPECT_FALSE(retired);
+        EXPECT_EQ(counts.deleted.load(), 0);
+
+        // A later completion publication supplies the retirement proof; retain
+        // the original transport failure for the caller.
+        backend.override_terminal_status = false;
+        batch.slices.front()->markFailed();
+        const Status completed =
+            transport.getBatchRetirementStatus(batch.id, retired);
+        EXPECT_TRUE(completed.IsContext());
+        EXPECT_NE(completed.ToString().find("failed"), std::string::npos);
+        EXPECT_TRUE(retired);
+        EXPECT_TRUE(
+            Peer::free(transport, batch.id, [&] { ++counts.deleted; }).ok());
+        EXPECT_EQ(counts.deleted.load(), 1);
+    }
 }
 
 TEST(DeferredBatchCleanupTest, RetirementKeepsHandleUntilAllTasksAndPinsDrain) {

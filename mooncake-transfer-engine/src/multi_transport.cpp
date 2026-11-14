@@ -131,9 +131,10 @@ Transport::DeferredCleanupStats MultiTransport::collectDeferredCleanupStats(
         const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
                              now - entry.enqueued_at)
                              .count();
-        if (age > 0)
+        if (age > 0) {
             stats.oldest_age_ms =
                 std::max(stats.oldest_age_ms, static_cast<uint64_t>(age));
+        }
     }
     return stats;
 }
@@ -251,6 +252,7 @@ Status MultiTransport::tryFreeBatchID(
 
 void MultiTransport::deferredCleanupLoop() {
     constexpr auto kCleanupInterval = std::chrono::milliseconds(100);
+    constexpr auto kDeferredCleanupWarningInterval = std::chrono::seconds(60);
     std::unique_lock<std::mutex> lock(deferred_cleanup_mutex_);
     while (true) {
         if (deferred_cleanup_batches_.empty()) {
@@ -303,9 +305,11 @@ void MultiTransport::deferredCleanupLoop() {
         const auto warning_now = std::chrono::steady_clock::now();
         if (warning_now >= next_deferred_cleanup_warning_) {
             next_deferred_cleanup_warning_ =
-                warning_now + std::chrono::seconds(60);
+                warning_now + kDeferredCleanupWarningInterval;
             const auto stats = collectDeferredCleanupStats(warning_now);
-            if (stats.oldest_age_ms >= 60000) {
+            const auto oldest_age =
+                std::chrono::milliseconds(stats.oldest_age_ms);
+            if (oldest_age >= kDeferredCleanupWarningInterval) {
                 LOG(WARNING) << "Deferred cleanup backlog: pending="
                              << stats.pending_batches
                              << ", query_errors=" << stats.query_error_batches
@@ -813,15 +817,28 @@ Status MultiTransport::getBatchRetirementStatus(BatchID batch_id,
             } else {
                 done = status.s == TransferStatusEnum::COMPLETED ||
                        status.s == TransferStatusEnum::FAILED;
-                if (status.s == TransferStatusEnum::FAILED) {
+                if (status.s == TransferStatusEnum::FAILED ||
+                    status.s == TransferStatusEnum::CANCELED ||
+                    status.s == TransferStatusEnum::INVALID) {
                     batch.has_failure.store(true, std::memory_order_release);
                 }
-                if (result.ok() && status.s == TransferStatusEnum::TIMEOUT) {
-                    result = Status::Context("Mooncake transfer task timeout");
-                } else if (result.ok() &&
-                           status.s == TransferStatusEnum::FAILED) {
-                    result = Status::Context("Mooncake transfer task failed");
+                if (result.ok()) {
+                    if (status.s == TransferStatusEnum::TIMEOUT) {
+                        result =
+                            Status::Context("Mooncake transfer task timeout");
+                    } else if (status.s == TransferStatusEnum::FAILED) {
+                        result =
+                            Status::Context("Mooncake transfer task failed");
+                    } else if (status.s == TransferStatusEnum::CANCELED) {
+                        result =
+                            Status::Context("Mooncake transfer task canceled");
+                    } else if (status.s == TransferStatusEnum::INVALID) {
+                        result =
+                            Status::Context("Mooncake transfer task invalid");
+                    }
                 }
+                // INVALID/CANCELED expose failure without proving physical
+                // I/O retirement. Keep the batch pending for later proof.
             }
         }
         if (__atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE) &&

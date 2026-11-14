@@ -298,7 +298,8 @@ class TransferEngine {
     // is true. All tasks and completion callbacks must have stopped accessing
     // borrowed requests/buffers. This does not free or invalidate batch_id.
     // A non-OK result reports an observed query/transfer failure independently
-    // of retirement. TIMEOUT/error alone never authorizes buffer reuse.
+    // of retirement. TIMEOUT, CANCELED, INVALID, or another error alone never
+    // authorizes buffer reuse; rely on retired for the independent proof.
     // Do not submit more work, free, or query this batch concurrently. As with
     // transfer completion, transports must publish terminal state after I/O
     // retirement (including failure paths). TIMEOUT is not terminal: tasks may
