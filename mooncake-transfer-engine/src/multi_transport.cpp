@@ -122,6 +122,35 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     return batch_desc->id;
 }
 
+Transport::DeferredCleanupStats MultiTransport::collectDeferredCleanupStats(
+    std::chrono::steady_clock::time_point now) const {
+    Transport::DeferredCleanupStats stats;
+    stats.pending_batches = deferred_cleanup_batches_.size();
+    for (const auto& [id, entry] : deferred_cleanup_batches_) {
+        const bool has_query_error = std::any_of(
+            entry.task_query_states.begin(), entry.task_query_states.end(),
+            [](const auto& task_state) {
+                return !task_state.second.last_error.ok();
+            });
+        if (has_query_error) {
+            ++stats.query_error_batches;
+        }
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             now - entry.enqueued_at)
+                             .count();
+        if (age > 0) {
+            stats.oldest_age_ms =
+                std::max(stats.oldest_age_ms, static_cast<uint64_t>(age));
+        }
+    }
+    return stats;
+}
+
+Transport::DeferredCleanupStats MultiTransport::getDeferredCleanupStats() {
+    std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
+    return collectDeferredCleanupStats(std::chrono::steady_clock::now());
+}
+
 Status MultiTransport::freeBatchID(BatchID batch_id) {
     return freeBatchID(batch_id, std::function<void()>());
 }
@@ -155,48 +184,109 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
 }
 
 Status MultiTransport::tryFreeBatchID(
-    BatchID batch_id, const std::function<void()>& before_delete) {
-    auto& batch_desc = *((BatchDesc*)(batch_id));
-    const size_t task_count = batch_desc.task_list.size();
+    BatchID batch_id, const std::function<void()>& before_delete,
+    DeferredCleanupEntry* cleanup_entry) {
+    auto& batch_desc = Transport::toBatchDesc(batch_id);
     bool busy = false;
-    for (size_t task_id = 0; task_id < task_count; task_id++) {
+    for (size_t task_id = 0; task_id < batch_desc.task_list.size(); ++task_id) {
         auto& task = batch_desc.task_list[task_id];
-        if (__atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE)) {
-            // Event-driven completion can finish a task without a poll
-            // (e.g. mooncake-store waits on completion_cv, then frees the
-            // batch).
-            if (metricsEnabled()) recordFinishedTask(task);
+        bool has_query_state = false;
+        if (cleanup_entry) {
+            auto state = cleanup_entry->task_query_states.find(task_id);
+            has_query_state = state != cleanup_entry->task_query_states.end();
+            if (has_query_state) {
+                // Query errors invalidate legacy is_finished as evidence.
+                // Only an explicitly counter-capable transport can replace
+                // a failed query with its sealed completion publication.
+                // Other transports keep retrying their own status query;
+                // do not assume their failure publication ends I/O access.
+                if (__atomic_load_n(&task.completion_published,
+                                    __ATOMIC_ACQUIRE) &&
+                    task.transport_ &&
+                    task.transport_->supportsBatchCompletionCounter()) {
+                    __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+                    cleanup_entry->task_query_states.erase(state);
+                    if (metricsEnabled()) {
+                        recordFinishedTask(task);
+                    }
+                    continue;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (state->second.completion_only ||
+                    now < state->second.next_poll) {
+                    busy = true;
+                    continue;
+                }
+            }
+        }
+        if (!has_query_state &&
+            (__atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE) ||
+             __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE) == 0)) {
+            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+            if (metricsEnabled()) {
+                recordFinishedTask(task);
+            }
             continue;
         }
-        if (task.slice_count == 0) {
-            task.is_finished = true;
-            continue;
-        }
-        TransferStatus status;
-        Status query_status = getTransferStatus(batch_id, task_id, status);
-        if (!query_status.ok()) {
-            return query_status;
-        }
-        // A terminal transfer status only means the task published completion;
-        // the completion callback may still be unwinding while holding raw
-        // BatchDesc access. Keep the batch alive until the explicit quiescence
-        // counter reaches zero below.
-        if (status.s != Transport::TransferStatusEnum::COMPLETED &&
-            status.s != Transport::TransferStatusEnum::FAILED) {
+
+        TransferStatus status{};
+        const Status queried = getTransferStatus(batch_id, task_id, status);
+        if (!queried.ok()) {
+            if (!cleanup_entry) {
+                // An initial ordinary error does not hand off the handle.
+                return queried;
+            }
+            auto& state = cleanup_entry->task_query_states[task_id];
+            if (!(state.last_error == queried)) {
+                LOG(ERROR) << "Retaining deferred cleanup for batch "
+                           << batch_id << ", task " << task_id << ": "
+                           << queried.ToString();
+            }
+            state.last_error = queried;
+            state.completion_only =
+                (queried.IsInvalidArgument() || queried.IsNotImplemented()) &&
+                task.transport_ &&
+                task.transport_->supportsBatchCompletionCounter();
+            state.next_poll =
+                std::chrono::steady_clock::now() + state.retry_delay;
+            state.retry_delay = std::min(state.retry_delay * 2,
+                                         std::chrono::milliseconds(5000));
             busy = true;
-            // With metrics, keep going so finished tasks behind a busy one
-            // are still recorded.
-            if (!metricsEnabled()) break;
+            // Visit healthy siblings even when this task cannot be polled.
+            continue;
+        }
+        if (status.s == TransferStatusEnum::COMPLETED ||
+            status.s == TransferStatusEnum::FAILED) {
+            if (cleanup_entry) {
+                cleanup_entry->task_query_states.erase(task_id);
+            }
+            // Remember the terminal query so a pending callback pin does not
+            // force another query after the transport reported a terminal
+            // state. This preserves the existing cleanup contract.
+            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+            continue;
+        }
+        if (has_query_state) {
+            // Query recovery clears the error/backoff, not its history. A
+            // stale legacy finished flag must not bypass a WAITING/TIMEOUT
+            // result on the next sweep.
+            auto& state = cleanup_entry->task_query_states.at(task_id);
+            state.last_error = Status::OK();
+            state.completion_only = false;
+            state.next_poll = {};
+            state.retry_delay = std::chrono::milliseconds(100);
+        }
+        busy = true;
+        if (!cleanup_entry && !metricsEnabled()) {
+            break;
         }
     }
     if (busy) {
         return Status::BatchBusy(
             "BatchID cannot be freed until all tasks are done");
     }
-    // A terminal status only means the task published completion; the
-    // completion callback may still be unwinding while holding a pin on
-    // this BatchDesc and its TransferTask objects. Keep the batch alive
-    // until the pin count reaches zero.
+    // A terminal publication can precede callback exit. Keep the descriptor
+    // and its task/slice metadata alive until every completion pin drains.
     if (batch_desc.active_completion_callbacks.load(
             std::memory_order_acquire) != 0) {
         return Status::BatchBusy(
@@ -215,6 +305,7 @@ Status MultiTransport::tryFreeBatchID(
 
 void MultiTransport::deferredCleanupLoop() {
     constexpr auto kCleanupInterval = std::chrono::milliseconds(100);
+    constexpr auto kWarningInterval = std::chrono::seconds(60);
     std::unique_lock<std::mutex> lock(deferred_cleanup_mutex_);
     while (true) {
         if (deferred_cleanup_batches_.empty()) {
@@ -227,23 +318,30 @@ void MultiTransport::deferredCleanupLoop() {
             });
             continue;
         }
-
         for (auto it = deferred_cleanup_batches_.begin();
              it != deferred_cleanup_batches_.end();) {
-            Status status = tryFreeBatchID(it->first, it->second);
+            const Status status = tryFreeBatchID(
+                it->first, it->second.before_delete, &it->second);
             if (status.ok()) {
                 it = deferred_cleanup_batches_.erase(it);
-            } else if (!status.IsBatchBusy()) {
-                // A permanent error (e.g. a stale task reference) will never
-                // resolve on retry; drop the entry instead of polling forever.
-                LOG(ERROR) << "Dropping deferred cleanup for batch "
-                           << it->first << ": " << status.ToString();
-                it = deferred_cleanup_batches_.erase(it);
-            } else {
-                ++it;
+                continue;
+            }
+            // Query errors are retained per task by tryFreeBatchID. Never
+            // discard the descriptor's only cleanup owner on an error.
+            ++it;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_deferred_cleanup_warning_) {
+            next_deferred_cleanup_warning_ = now + kWarningInterval;
+            const auto stats = collectDeferredCleanupStats(now);
+            if (std::chrono::milliseconds(stats.oldest_age_ms) >=
+                kWarningInterval) {
+                LOG(WARNING) << "Deferred cleanup backlog: pending="
+                             << stats.pending_batches
+                             << ", query_errors=" << stats.query_error_batches
+                             << ", oldest_age_ms=" << stats.oldest_age_ms;
             }
         }
-
         if (stop_deferred_cleanup_) {
             if (!deferred_cleanup_batches_.empty()) {
                 LOG(WARNING)

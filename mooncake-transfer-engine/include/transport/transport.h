@@ -546,6 +546,13 @@ class Transport {
         }
     };
 
+    // Live reaper-owned descriptor backlog; not a buffer-retirement signal.
+    struct DeferredCleanupStats {
+        uint64_t pending_batches = 0;
+        uint64_t query_error_batches = 0;
+        uint64_t oldest_age_ms = 0;
+    };
+
     struct BatchDesc {
         BatchID id;
         size_t batch_size;

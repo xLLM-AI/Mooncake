@@ -289,6 +289,11 @@ class TransferEngine {
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
+#ifndef USE_TENT
+    // Live classic-engine descriptor backlog, independent of user buffers.
+    Transport::DeferredCleanupStats getDeferredCleanupStats();
+#endif
+
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
     Transport* getTransport(const std::string& proto);
