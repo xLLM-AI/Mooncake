@@ -303,6 +303,10 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
     return impl_->getBatchTransferStatus(batch_id, status);
 }
 
+Transport::DeferredCleanupStats TransferEngine::getDeferredCleanupStats() {
+    return impl_->getDeferredCleanupStats();
+}
+
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
     stats.clear();
     return Status::OK();

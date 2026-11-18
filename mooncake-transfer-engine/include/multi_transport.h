@@ -15,11 +15,13 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <map>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <unordered_map>
 
 #include "transport/transport.h"
@@ -58,6 +60,10 @@ class MultiTransport {
     // An OK or BatchCleanupDeferred return invalidates batch_id. A deferred
     // cleanup means in-flight transport work may still own transfer buffers.
     Status freeBatchID(BatchID batch_id);
+
+    // Snapshot of descriptors whose cleanup has been handed to the reaper.
+    // This does not describe user-buffer ownership or physical I/O retirement.
+    Transport::DeferredCleanupStats getDeferredCleanupStats();
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries);
@@ -134,8 +140,33 @@ class MultiTransport {
     Status selectTransport(const TransferRequest &entry, Transport *&transport,
                            bool *allows_reuse = nullptr);
 
+    struct DeferredTaskQueryState {
+        Status last_error;
+        bool completion_only = false;
+        std::chrono::steady_clock::time_point next_poll{};
+        std::chrono::milliseconds retry_delay{100};
+    };
+
+    class DeferredCleanupEntry final {
+       public:
+        explicit DeferredCleanupEntry(std::function<void()> callback)
+            : before_delete(std::move(callback)) {}
+
+        std::function<void()> before_delete;
+        std::chrono::steady_clock::time_point enqueued_at =
+            std::chrono::steady_clock::now();
+        // Retain query-error history until a valid terminal query or a
+        // counter-capable transport's completion publication. A recovered
+        // nonterminal query must not revive an untrusted legacy finished flag.
+        std::unordered_map<size_t, DeferredTaskQueryState> task_query_states;
+    };
+
+    Transport::DeferredCleanupStats collectDeferredCleanupStats(
+        std::chrono::steady_clock::time_point now) const;
+
     Status tryFreeBatchID(BatchID batch_id,
-                          const std::function<void()> &before_delete);
+                          const std::function<void()> &before_delete,
+                          DeferredCleanupEntry *cleanup_entry = nullptr);
 
     void deferredCleanupLoop();
 
@@ -154,8 +185,8 @@ class MultiTransport {
 
     std::mutex deferred_cleanup_mutex_;
     std::condition_variable deferred_cleanup_cv_;
-    std::unordered_map<BatchID, std::function<void()>>
-        deferred_cleanup_batches_;
+    std::unordered_map<BatchID, DeferredCleanupEntry> deferred_cleanup_batches_;
+    std::chrono::steady_clock::time_point next_deferred_cleanup_warning_{};
     bool stop_deferred_cleanup_ = false;
     std::thread deferred_cleanup_thread_;
 };
