@@ -342,6 +342,13 @@ class TransferEngineImpl {
         return result;
     }
 
+    Transport::DeferredCleanupStats getDeferredCleanupStats() {
+        if (!multi_transports_) {
+            return {};
+        }
+        return multi_transports_->getDeferredCleanupStats();
+    }
+
     Transport* getTransport(const std::string& proto) {
         if (!multi_transports_) return nullptr;
         return multi_transports_->getTransport(proto);
