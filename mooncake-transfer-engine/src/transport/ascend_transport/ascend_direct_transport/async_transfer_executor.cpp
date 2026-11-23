@@ -88,10 +88,14 @@ TransferExecutorBase::ExecuteResult AsyncTransferExecutor::execute(
 
     {
         std::unique_lock<std::mutex> lock(async_task_mutex_);
-        async_task_cv_.wait(lock, [this] {
-            return !running_ || active_async_tasks_ < kAsyncTaskLimit;
-        });
-        if (!running_) {
+        // Closing a batch does not own this executor's slot CV. Periodically
+        // recheck the admission flag so a full/stalled queue cannot pin an
+        // expired batch's jobs forever without any slot becoming available.
+        while (running_ && active_async_tasks_ >= kAsyncTaskLimit &&
+               !isIoAdmissionClosed(slice_list)) {
+            async_task_cv_.wait_for(lock, std::chrono::milliseconds(100));
+        }
+        if (!running_ || isIoAdmissionClosed(slice_list)) {
             return {.ret = -1, .status = adxl::FAILED, .retryable = false};
         }
         active_async_tasks_++;
@@ -108,10 +112,17 @@ TransferExecutorBase::ExecuteResult AsyncTransferExecutor::execute(
         op_descs.emplace_back(op_desc);
     }
 
+    // Slot acquisition and connection setup must finish before admission.
+    auto admission = acquireIoAdmission(slice_list);
+    if (!admission.admitted) {
+        handleTaskFinished();  // Return the slot acquired above.
+        return {.ret = -1, .status = adxl::FAILED, .retryable = false};
+    }
     adxl::TransferReq req_handle;
     auto status = adxl_engines_[local_engine_idx]->TransferAsync(
         target_adxl_engine_name.c_str(), operation, op_descs,
         adxl::TransferArgs(), req_handle);
+    admission.locks.clear();
 
     if (status == adxl::SUCCESS) {
         recordConnectedSegment(local_engine_idx, target_adxl_engine_name);

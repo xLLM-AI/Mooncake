@@ -717,6 +717,56 @@ void TransferExecutorBase::processSliceList(
     }
 }
 
+bool TransferExecutorBase::isIoAdmissionClosed(
+    const std::vector<Transport::Slice*>& slices) {
+    return std::any_of(slices.begin(), slices.end(), [](auto* slice) {
+        if (!slice->work_references) return false;
+        auto owner = slice->callback_batch_owner.lock();
+        return !owner ||
+               owner->io_admission_closed.load(std::memory_order_acquire) ||
+               owner->cleanup_expired.load(std::memory_order_acquire);
+    });
+}
+
+TransferExecutorBase::IoAdmission TransferExecutorBase::acquireIoAdmission(
+    const std::vector<Transport::Slice*>& slices) {
+    IoAdmission admission;
+    admission.owners.reserve(slices.size());
+    for (auto* slice : slices) {
+        if (!slice->work_references) continue;
+        auto owner = slice->callback_batch_owner.lock();
+        if (!owner) return admission;
+        admission.owners.emplace_back(std::move(owner));
+    }
+    // A homogeneous route can contain more than one batch. Use a total lock
+    // order, and lock each batch once, to preserve concurrent route admission.
+    std::sort(admission.owners.begin(), admission.owners.end(),
+              [](const auto& left, const auto& right) {
+                  return std::less<Transport::BatchDesc*>{}(left.get(),
+                                                            right.get());
+              });
+    admission.owners.erase(
+        std::unique(admission.owners.begin(), admission.owners.end()),
+        admission.owners.end());
+    admission.locks.reserve(admission.owners.size());
+    for (const auto& owner : admission.owners) {
+        admission.locks.emplace_back(owner->io_admission_mutex);
+        if (owner->io_admission_closed.load(std::memory_order_acquire) ||
+            owner->cleanup_expired.load(std::memory_order_acquire)) {
+            return admission;
+        }
+    }
+    // Another batch's lock acquisition may have waited past handoff.
+    for (const auto& owner : admission.owners) {
+        if (owner->io_admission_closed.load(std::memory_order_acquire) ||
+            owner->cleanup_expired.load(std::memory_order_acquire)) {
+            return admission;
+        }
+    }
+    admission.admitted = true;
+    return admission;
+}
+
 void TransferExecutorBase::processHomogeneousSliceList(
     const std::vector<Transport::Slice*>& slice_list) {
     if (slice_list.empty()) {
@@ -750,16 +800,13 @@ void TransferExecutorBase::processHomogeneousSliceList(
     std::string target_adxl_engine_name;
     bool force_update = false;
     const auto cleanup_expired = [&] {
-        return std::any_of(
-            slice_list.begin(), slice_list.end(), [](auto* slice) {
-                if (!slice->work_references) return false;
-                auto owner = slice->callback_batch_owner.lock();
-                return !owner ||
-                       owner->cleanup_expired.load(std::memory_order_acquire);
-            });
+        return isIoAdmissionClosed(slice_list);
     };
     for (int32_t retry = 0; retry < kTransferRetryTimes; ++retry) {
-        if (cleanup_expired()) return;
+        if (cleanup_expired()) {
+            markSlicesFailed(slice_list);
+            return;
+        }
         auto target_segment_desc = metadata_->getSegmentDescByID(
             slice_list[0]->target_id, force_update);
         if (!target_segment_desc) {
@@ -790,8 +837,16 @@ void TransferExecutorBase::processHomogeneousSliceList(
             (target_adxl_engine_name == local_engine_name ||
              resolveLocalCopyDestinations(target_segment_desc, slice_list,
                                           local_dest_addrs));
-        if (cleanup_expired()) return;
+        if (cleanup_expired()) {
+            markSlicesFailed(slice_list);
+            return;
+        }
         if (need_local_copy && local_copy_engine_) {
+            auto admission = acquireIoAdmission(slice_list);
+            if (!admission.admitted) {
+                markSlicesFailed(slice_list);
+                return;
+            }
             auto start = std::chrono::steady_clock::now();
             local_copy_engine_->Copy(slice_list[0]->opcode, slice_list,
                                      local_dest_addrs);

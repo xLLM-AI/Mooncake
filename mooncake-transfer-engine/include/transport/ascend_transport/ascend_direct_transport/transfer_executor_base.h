@@ -97,6 +97,16 @@ class TransferExecutorBase {
     static void ParseExecutorEnvIntoInitParams(InitParams& params);
 
    protected:
+    struct IoAdmission {
+        std::vector<std::shared_ptr<Transport::BatchDesc>> owners;
+        std::vector<std::shared_lock<std::shared_mutex>> locks;
+        bool admitted = false;
+    };
+    static bool isIoAdmissionClosed(
+        const std::vector<Transport::Slice*>& slices);
+    static IoAdmission acquireIoAdmission(
+        const std::vector<Transport::Slice*>& slices);
+
     int initEngines();
     void cleanupConnections();
     void finalizeEngines();

@@ -71,9 +71,16 @@ TransferExecutorBase::ExecuteResult SyncTransferExecutor::execute(
         op_descs.emplace_back(op_desc);
     }
 
+    // Connecting can block past cleanup's deadline. The shared fence covers
+    // the actual ADXL invocation, not just the earlier executor dispatch.
+    auto admission = acquireIoAdmission(slice_list);
+    if (!admission.admitted) {
+        return {.ret = -1, .status = adxl::FAILED, .retryable = false};
+    }
     auto status =
         engine->TransferSync(target_adxl_engine_name.c_str(), operation,
                              op_descs, params_.transfer_timeout);
+    admission.locks.clear();
 
     if (status != adxl::SUCCESS) {
         if (!params_.auto_connect) {

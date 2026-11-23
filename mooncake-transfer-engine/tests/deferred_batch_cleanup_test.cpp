@@ -47,6 +47,11 @@ class MultiTransportBatchTestPeer final {
         transport.deferred_cleanup_cv_.notify_one();
     }
 
+    static bool tryRevoke(MultiTransport& transport, Transport::BatchID id) {
+        std::lock_guard<std::mutex> lock(transport.deferred_cleanup_mutex_);
+        return transport.forceFreeBatchID(id, {});
+    }
+
     static void expire(MultiTransport& transport) {
         std::lock_guard<std::mutex> lock(transport.deferred_cleanup_mutex_);
         for (auto& [id, entry] : transport.deferred_cleanup_batches_) {
@@ -236,6 +241,15 @@ TEST(DeferredBatchCleanupTest, ExpiryRevokesBatchBeforeLateCallback) {
                 }).IsBatchCleanupDeferred());
     EXPECT_TRUE(Peer::pending(transport, batch.id));
     EXPECT_EQ(counts.deleted.load(), 0);
+    // Model an SDK invocation that already passed its admission point.
+    auto admitted_owner = batch.desc->cleanup_owner.lock();
+    std::shared_lock<std::shared_mutex> invocation(
+        admitted_owner->io_admission_mutex);
+    EXPECT_FALSE(Peer::tryRevoke(transport, batch.id));
+    EXPECT_EQ(counts.deleted.load(), 0);
+    EXPECT_EQ(transport.getDeferredCleanupStats().forced_cleanup_batches, 0);
+    invocation.unlock();
+    admitted_owner.reset();
     Peer::expire(transport);
     ASSERT_TRUE(
         wait_until([&] { return !Peer::pending(transport, batch.id); }));

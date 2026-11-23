@@ -188,6 +188,10 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
             "BatchID is invalid because cleanup has already been deferred");
     }
 
+    // Handing back an unconfirmed batch closes queued I/O admission now,
+    // rather than allowing new vendor calls throughout its cleanup lease.
+    Transport::toBatchDesc(batch_id).io_admission_closed.store(
+        true, std::memory_order_release);
     Status status = tryFreeBatchID(batch_id, before_delete);
     if (status.ok()) return status;
     // Cleanup-query failures do not abandon the batch. The reaper owns
@@ -316,6 +320,16 @@ Status MultiTransport::tryFreeBatchID(
         return Status::BatchBusy(
             "BatchID cannot be freed until completion callbacks are quiescent");
     }
+    // Keep the descriptor (and its mutex) alive until after unlock.
+    auto io_owner = batch_desc.cleanup_owner.lock();
+    std::unique_lock<std::shared_mutex> io_lock;
+    if (io_owner) {
+        io_lock = std::unique_lock<std::shared_mutex>(
+            batch_desc.io_admission_mutex, std::try_to_lock);
+        if (!io_lock.owns_lock()) {
+            return Status::BatchBusy("BatchID has an admitted I/O invocation");
+        }
+    }
     if (before_delete) {
         before_delete();
     }
@@ -349,6 +363,14 @@ bool MultiTransport::forceFreeBatchID(
                 return false;
         }
     }
+    desc.io_admission_closed.store(true, std::memory_order_release);
+    auto io_owner = desc.cleanup_owner.lock();
+    if (!io_owner) return false;
+    std::unique_lock<std::shared_mutex> io_lock(desc.io_admission_mutex,
+                                                std::try_to_lock);
+    // Do not block the global reaper behind an active vendor invocation.
+    // Closed admission prevents queued work from extending this wait.
+    if (!io_lock.owns_lock()) return false;
     LOG(ERROR) << "Deferred batch cleanup deadline expired; revoking batch="
                << batch_id
                << ", timeout_s=" << deferred_cleanup_timeout_.count()

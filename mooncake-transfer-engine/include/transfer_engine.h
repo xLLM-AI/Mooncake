@@ -89,8 +89,9 @@ struct AutoDiscoverConfig {
 class TransferEngine {
    public:
     // Classic TE owns request records after submission, including deferred
-    // cleanup. Clients must pair these headers with the matching built library.
-    static constexpr uint32_t kDeferredBatchOwnershipVersion = 1;
+    // cleanup. Version 2 also fences Ascend I/O admission against revocation.
+    // Clients must pair these headers with the matching built library.
+    static constexpr uint32_t kDeferredBatchOwnershipVersion = 2;
 #ifdef ENABLE_MULTI_PROTOCOL
     struct RegisteredBuffer {
         void* addr;

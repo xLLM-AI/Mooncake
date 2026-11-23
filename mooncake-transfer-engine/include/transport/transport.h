@@ -29,6 +29,7 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <shared_mutex>
 #include <condition_variable>
 
 #include "mooncake_te_build_config.h"
@@ -591,6 +592,10 @@ class Transport {
         int64_t start_timestamp;
         std::weak_ptr<BatchDesc> cleanup_owner;
         std::atomic<bool> cleanup_expired{false};
+        // Close new admission on cleanup handoff. Actual I/O invocations hold
+        // shared access; revocation must acquire exclusive access first.
+        std::atomic<bool> io_admission_closed{false};
+        std::shared_mutex io_admission_mutex;
         // Submission must not leave deferred tasks pointing into a caller's
         // temporary request vector. Keep each submission contiguous/stable.
         std::vector<std::shared_ptr<std::vector<TransferRequest>>> requests;
