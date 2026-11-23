@@ -1893,6 +1893,27 @@ TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
     EXPECT_EQ(run(), (std::vector<bool>{false, false}));
 }
 
+TEST_F(TransportTest, RejectedPreflightBatchHasExplicitEmptyCompletion) {
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    std::string server_name = "localhost";
+    MultiTransport transport(metadata, server_name);
+    const Transport::BatchID batch = transport.allocateBatchID(1);
+    std::array<char, 1> source{};
+    Transport::TransferRequest request{};
+    request.opcode = Transport::TransferRequest::WRITE;
+    request.source = source.data();
+    request.target_id =
+        1;  // No such segment: rejection precedes task admission.
+    request.target_offset = 0;
+    request.length = source.size();
+    EXPECT_FALSE(transport.submitTransfer(batch, {request}).ok());
+    Transport::TransferStatus status{};
+    EXPECT_TRUE(transport.getBatchTransferStatus(batch, status).ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, 0u);
+    EXPECT_TRUE(transport.freeBatchID(batch).ok());
+}
+
 // Model the state left by completion events explicitly so these regressions
 // also run in default builds without USE_EVENT_DRIVEN_COMPLETION.
 TEST_F(TransportTest, FailedCompletionEventDoesNotReportSuccess) {
