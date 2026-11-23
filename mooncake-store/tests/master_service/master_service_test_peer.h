@@ -431,6 +431,13 @@ class MasterServiceTestPeer {
         service_.ClearLocalDiskHandlesOwnedBy(owner);
     }
 
+    std::vector<Replica::Descriptor> RemainingAfterTargetedStaleCleanup(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& is_stale) {
+        return service_.BuildStaleHandleCleanupPlan(metadata, is_stale)
+            .remaining;
+    }
+
     void ClearInvalidHandles() { service_.ClearInvalidHandles(); }
 
     void ClearInvalidHandles(

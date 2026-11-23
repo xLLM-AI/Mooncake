@@ -2502,7 +2502,11 @@ MasterService::BuildStaleHandleCleanupPlan(
             plan.removed_ids.push_back(replica.id());
             continue;
         }
-        if (replica.status() == ReplicaStatus::COMPLETE) {
+        // A targeted sweep may leave another dead memory replica for the
+        // default sweep. Never publish its empty endpoint in the HA payload.
+        if (replica.status() == ReplicaStatus::COMPLETE &&
+            (!replica.is_memory_replica() ||
+             !replica.has_invalid_mem_handle())) {
             plan.remaining.push_back(replica.get_descriptor());
         }
         if (!replica.is_memory_replica() || !replica.has_invalid_mem_handle()) {
