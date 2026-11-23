@@ -1474,6 +1474,20 @@ TEST_F(AscendDirectTransportTest, Memory_RegisterAndUnregister) {
     EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
 }
 
+TEST_F(AscendDirectTransportTest, AsyncEnvironmentZeroDisablesTransfer) {
+    TransferExecutorBase::InitParams params;
+    unsetenv("ASCEND_USE_ASYNC_TRANSFER");
+    TransferExecutorBase::ParseExecutorEnvIntoInitParams(params);
+    EXPECT_FALSE(params.use_async_transfer);
+    setenv("ASCEND_USE_ASYNC_TRANSFER", "1", 1);
+    TransferExecutorBase::ParseExecutorEnvIntoInitParams(params);
+    EXPECT_TRUE(params.use_async_transfer);
+    setenv("ASCEND_USE_ASYNC_TRANSFER", "0", 1);
+    TransferExecutorBase::ParseExecutorEnvIntoInitParams(params);
+    EXPECT_FALSE(params.use_async_transfer);
+    unsetenv("ASCEND_USE_ASYNC_TRANSFER");
+}
+
 TEST_F(AscendDirectTransportTest, Memory_UnregisterWithoutCallerContext) {
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);

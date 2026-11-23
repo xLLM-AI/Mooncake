@@ -182,7 +182,11 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
     }
     char* use_async = std::getenv("ASCEND_USE_ASYNC_TRANSFER");
     if (use_async) {
-        params.use_async_transfer = true;
+        std::string text(use_async);
+        std::transform(text.begin(), text.end(), text.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        params.use_async_transfer =
+            text != "0" && text != "false" && text != "off" && text != "no";
     }
     char* auto_connect = std::getenv("ASCEND_AUTO_CONNECT");
     if (auto_connect) {
