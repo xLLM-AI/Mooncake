@@ -270,6 +270,10 @@ class Transport {
                 void *handle;
                 int64_t start_time;
                 int32_t engine_id;
+                // Software-terminal timeout without a hardware cancellation
+                // proof. Published before the release completion counter;
+                // pollers acquire that counter before reading this flag.
+                bool unsafe_terminal;
             } ascend_direct;
             struct {
                 uint64_t dest_addr;

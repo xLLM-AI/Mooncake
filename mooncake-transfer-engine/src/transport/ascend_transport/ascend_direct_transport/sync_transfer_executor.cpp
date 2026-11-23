@@ -80,7 +80,10 @@ TransferExecutorBase::ExecuteResult SyncTransferExecutor::execute(
             disconnect(local_engine_idx, target_adxl_engine_name,
                        kDefaultDisconnectTime);
         }
-        return {.ret = -1, .status = status, .retryable = true};
+        // TIMEOUT does not establish that the old operation stopped touching
+        // either buffer. A retry could overlap it and mask it with SUCCESS.
+        return {
+            .ret = -1, .status = status, .retryable = status != adxl::TIMEOUT};
     }
 
     recordConnectedSegment(local_engine_idx, target_adxl_engine_name);

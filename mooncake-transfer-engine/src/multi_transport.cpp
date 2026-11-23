@@ -753,37 +753,28 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
 
     size_t success_count = 0;
     bool any_failed = false;
+    bool any_timeout = false;
     for (size_t task_id = 0; task_id < task_count; task_id++) {
-        // Once a failure is seen, the walk continues only to record metrics
-        // for tasks that finished later. Tasks already recorded have nothing
-        // left to report, so skip the transport query for them.
-#ifdef WITH_METRICS
-        if (any_failed &&
-            __atomic_load_n(
-                &batch_desc.task_list[task_id].export_metrics_recorded,
-                __ATOMIC_ACQUIRE))
-            continue;
-#endif
-        TransferStatus task_status;
+        // Visit every task on failure too: a clean FAILED task must not mask
+        // a sibling's unconfirmed TIMEOUT, even if its metrics were recorded.
+        TransferStatus task_status{};
         auto ret = getTransferStatus(batch_id, task_id, task_status);
-
         if (!ret.ok()) {
-            status.s = Transport::TransferStatusEnum::FAILED;
-            return Status::OK();
+            any_failed = true;
+            continue;
         }
-
         if (task_status.s == Transport::TransferStatusEnum::COMPLETED) {
             status.transferred_bytes += task_status.transferred_bytes;
             success_count++;
-        } else if (task_status.s == Transport::TransferStatusEnum::FAILED ||
-                   task_status.s == Transport::TransferStatusEnum::TIMEOUT) {
+        } else if (task_status.s == Transport::TransferStatusEnum::TIMEOUT) {
+            any_timeout = true;
+        } else if (task_status.s == Transport::TransferStatusEnum::FAILED) {
             any_failed = true;
-            // With metrics, keep going so every finished task is recorded.
-            if (!metricsEnabled()) break;
         }
     }
-    if (any_failed) {
-        status.s = Transport::TransferStatusEnum::FAILED;
+    if (any_timeout || any_failed) {
+        status.s = any_timeout ? Transport::TransferStatusEnum::TIMEOUT
+                               : Transport::TransferStatusEnum::FAILED;
         return Status::OK();
     }
 

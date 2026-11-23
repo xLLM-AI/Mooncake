@@ -1917,6 +1917,43 @@ TEST_F(TransportTest, FailedCompletionEventDoesNotReportSuccess) {
     EXPECT_FALSE(batch.status_cached.load());
 }
 
+TEST_F(TransportTest, TimeoutSiblingIsNotMaskedByRecordedFailureMetrics) {
+    class TimeoutResultTransport final : public BatchResultTransport {
+       public:
+        Status getTransferStatus(BatchID, size_t task_id,
+                                 TransferStatus& status) override {
+            ++queries;
+            status.s = task_id == 0 ? TransferStatusEnum::FAILED
+                                    : TransferStatusEnum::TIMEOUT;
+            return Status::OK();
+        }
+        size_t queries = 0;
+    } result_transport;
+    std::string server_name = "localhost";
+    MultiTransport transport(nullptr, server_name);
+    Transport::BatchDesc batch{};
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.batch_size = 2;
+    batch.task_list.resize(2);
+    for (auto& task : batch.task_list) {
+        task.batch_id = batch.id;
+        task.transport_ = &result_transport;
+        task.slice_count = 1;
+#ifdef WITH_METRICS
+        task.export_metrics_recorded = true;
+#endif
+    }
+    // Event completion is not a successful-result cache. A failed sibling
+    // must not prevent querying the TIMEOUT task, even after metrics export.
+    batch.has_failure.store(true);
+    batch.is_finished.store(true);
+    Transport::TransferStatus status{};
+    ASSERT_TRUE(transport.getBatchTransferStatus(batch.id, status).ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::TIMEOUT);
+    EXPECT_EQ(result_transport.queries, 2u);
+    EXPECT_FALSE(batch.status_cached.load());
+}
+
 TEST_F(TransportTest, SuccessfulCompletionEventPreservesTransferredBytes) {
     std::string server_name = "localhost";
     MultiTransport transport(nullptr, server_name);

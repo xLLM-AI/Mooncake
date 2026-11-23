@@ -927,7 +927,8 @@ class AscendDirectTransportTest : public ::testing::Test {
                         << "getTransferStatus failed for task " << task_id;
                     return {false, false, status};
                 }
-                if (status.s == Transport::FAILED) {
+                if (status.s == Transport::FAILED ||
+                    status.s == Transport::TIMEOUT) {
                     return {true, true, status};
                 }
                 if (status.s == Transport::COMPLETED) {
@@ -1939,6 +1940,35 @@ TEST_F(AscendDirectTransportTest,
     EXPECT_EQ(adxl_mock::get_transfer_count(), 2);
     EXPECT_EQ(adxl_mock::get_connect_count(), 2);
     EXPECT_EQ(adxl_mock::get_disconnect_count(), 1);
+}
+
+TEST_F(AscendDirectTransportTest,
+       RemoteTransfer_Sync_TimeoutDoesNotRetryOrPoisonNextSlice) {
+    const RemoteSegmentSetup remote_setup = {1, "127.0.0.1:43002", "127.0.0.1",
+                                             43002};
+    auto remote_metadata = startRemoteMetadataServer(remote_setup);
+    ASSERT_NE(remote_metadata, nullptr);
+    adxl_mock::set_transfer_sequence({adxl::TIMEOUT, adxl::SUCCESS});
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(), remote_setup);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    0x10000, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_TRUE(result.failed);
+    EXPECT_EQ(result.status.s, Transport::TIMEOUT);
+    EXPECT_EQ(adxl_mock::get_transfer_count(), 1);
+
+    // Cached slices must clear the old uncertainty before a fresh submission.
+    adxl_mock::set_transfer_result(adxl::SUCCESS);
+    auto next = runRemoteTransfer(transport.get(), test_buffer_src_, 1, 0x10000,
+                                  kTransferBufSize);
+    ASSERT_TRUE(next.finished);
+    EXPECT_FALSE(next.failed);
+    EXPECT_EQ(next.status.s, Transport::COMPLETED);
 }
 
 TEST_F(AscendDirectTransportTest, RemoteTransfer_Async_Success) {

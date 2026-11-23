@@ -268,8 +268,10 @@ class TransferEngine {
 
     BatchID allocateBatchID(size_t batch_size);
 
-    // An OK or BatchCleanupDeferred return invalidates batch_id. A deferred
-    // cleanup means in-flight transport work may still own transfer buffers.
+    // An OK or BatchCleanupDeferred return invalidates batch_id. This is a
+    // descriptor-cleanup ownership boundary, not proof of buffer retirement.
+    // In particular an unconfirmed TIMEOUT may outlive software completion;
+    // callers must retain borrowed buffers until a separate safe boundary.
     Status freeBatchID(BatchID batch_id);
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);

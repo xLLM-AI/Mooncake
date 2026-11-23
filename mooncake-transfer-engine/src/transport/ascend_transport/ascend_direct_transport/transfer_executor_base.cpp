@@ -806,6 +806,11 @@ void TransferExecutorBase::processHomogeneousSliceList(
         return;
     }
     if (result.status == adxl::TIMEOUT) {
+        // markSlicesFailed publishes this flag through its ACQ_REL completion
+        // counters. This records uncertainty, not a hardware-retirement proof.
+        for (auto* slice : slice_list) {
+            slice->ascend_direct.unsafe_terminal = true;
+        }
         LOG(ERROR) << "Transfer timeout to: " << target_adxl_engine_name
                    << ", errmsg: " << aclGetRecentErrMsg();
     } else {

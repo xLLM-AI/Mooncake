@@ -19,6 +19,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <cassert>
 #include <memory>
 #include <numeric>
@@ -93,6 +94,7 @@ void InitializeSlice(const Transport::TransferRequest& request,
     slice->target_id = request.target_id;
     slice->ascend_direct.dest_addr = request.target_offset;
     slice->ascend_direct.engine_id = current_engine_id;
+    slice->ascend_direct.unsafe_terminal = false;
     slice->task = task;
     slice->status = Transport::Slice::PENDING;
     slice->ts = 0;
@@ -355,7 +357,16 @@ Status AscendDirectTransport::getTransferStatus(BatchID batch_id,
     status.transferred_bytes =
         __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
-        if (failed_slice_count) {
+        // The acquire counter loads above publish all preceding flag writes.
+        // TIMEOUT is software-terminal; it never authorizes buffer reuse.
+        const bool unsafe =
+            std::any_of(task.slice_list.begin(), task.slice_list.end(),
+                        [](const Slice* slice) {
+                            return slice->ascend_direct.unsafe_terminal;
+                        });
+        if (unsafe) {
+            status.s = TransferStatusEnum::TIMEOUT;
+        } else if (failed_slice_count) {
             status.s = TransferStatusEnum::FAILED;
         } else {
             status.s = TransferStatusEnum::COMPLETED;
