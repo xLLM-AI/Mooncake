@@ -48,6 +48,7 @@ class AsyncTransferExecutor : public TransferExecutorBase {
    private:
     struct QueryBatch {
         std::vector<Transport::Slice*> slices;
+        std::shared_ptr<void> work_owner;
         size_t engine_idx;
         std::string target_adxl_engine_name;
     };

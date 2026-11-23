@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cerrno>
 #include <sstream>
 #include <string>
 
@@ -94,7 +95,19 @@
 namespace mooncake {
 MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                                std::string& local_server_name)
-    : metadata_(metadata), local_server_name_(local_server_name) {}
+    : metadata_(metadata), local_server_name_(local_server_name) {
+    if (const char* value = std::getenv("MC_DEFER_CLEANUP_TIMEOUT")) {
+        char* end = nullptr;
+        errno = 0;
+        const long seconds = std::strtol(value, &end, 10);
+        if (errno == 0 && end != value && *end == '\0' && seconds > 0 &&
+            seconds <= 86400) {
+            deferred_cleanup_timeout_ = std::chrono::seconds(seconds);
+        } else {
+            LOG(WARNING) << "Invalid MC_DEFER_CLEANUP_TIMEOUT; using 120s";
+        }
+    }
+}
 
 MultiTransport::~MultiTransport() {
     {
@@ -108,15 +121,26 @@ MultiTransport::~MultiTransport() {
 }
 
 MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
-    auto batch_desc = new BatchDesc();
-    if (!batch_desc) return ERR_MEMORY;
+    // Keep the original teardown policy for batches never handed back by
+    // their caller; only explicit cleanup is allowed to delete their metadata.
+    auto owner =
+        std::shared_ptr<BatchDesc>(new BatchDesc(), [](BatchDesc* desc) {
+            if (desc->cleanup_expired.load(std::memory_order_acquire))
+                delete desc;
+        });
+    auto* batch_desc = owner.get();
+    batch_desc->cleanup_owner = owner;
+    {
+        std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
+        batch_owners_.emplace(BatchID(batch_desc), owner);
+    }
     batch_desc->id = BatchID(batch_desc);
     batch_desc->batch_size = batch_size;
     batch_desc->task_list.reserve(batch_size);
     batch_desc->context = NULL;
 #ifdef CONFIG_USE_BATCH_DESC_SET
     batch_desc_lock_.lock();
-    batch_desc_set_[batch_desc->id] = batch_desc;
+    batch_desc_set_[batch_desc->id] = owner;
     batch_desc_lock_.unlock();
 #endif
     return batch_desc->id;
@@ -126,6 +150,7 @@ Transport::DeferredCleanupStats MultiTransport::collectDeferredCleanupStats(
     std::chrono::steady_clock::time_point now) const {
     Transport::DeferredCleanupStats stats;
     stats.pending_batches = deferred_cleanup_batches_.size();
+    stats.forced_cleanup_batches = forced_cleanup_batches_;
     for (const auto& [id, entry] : deferred_cleanup_batches_) {
         const bool has_query_error = std::any_of(
             entry.task_query_states.begin(), entry.task_query_states.end(),
@@ -164,10 +189,9 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
     }
 
     Status status = tryFreeBatchID(batch_id, before_delete);
-    if (!status.IsBatchBusy()) {
-        return status;
-    }
-
+    if (status.ok()) return status;
+    // Cleanup-query failures do not abandon the batch. The reaper owns
+    // retries and the configured expiry just as it does for BatchBusy.
     deferred_cleanup_batches_.emplace(batch_id, before_delete);
     if (!deferred_cleanup_thread_.joinable()) {
         // Start the cleanup worker lazily after taking ownership of a busy
@@ -295,12 +319,45 @@ Status MultiTransport::tryFreeBatchID(
     if (before_delete) {
         before_delete();
     }
-    delete &batch_desc;
-#ifdef CONFIG_USE_BATCH_DESC_SET
-    RWSpinlock::WriteGuard guard(batch_desc_lock_);
-    batch_desc_set_.erase(batch_id);
-#endif
+    deleteBatchID(batch_id);
     return Status::OK();
+}
+
+void MultiTransport::deleteBatchID(BatchID batch_id) {
+    auto& desc = Transport::toBatchDesc(batch_id);
+    desc.cleanup_expired.store(true, std::memory_order_release);
+#ifdef CONFIG_USE_BATCH_DESC_SET
+    {
+        RWSpinlock::WriteGuard guard(batch_desc_lock_);
+        batch_desc_set_.erase(batch_id);
+    }
+#endif
+    if (batch_owners_.erase(batch_id) == 0) delete &desc;
+}
+
+bool MultiTransport::forceFreeBatchID(
+    BatchID batch_id, const std::function<void()>& before_delete) {
+    auto& desc = Transport::toBatchDesc(batch_id);
+    for (const auto& task : desc.task_list) {
+        if (task.slice_list.empty()) continue;
+        for (const auto* slice : task.slice_list) {
+            // Only dispatchers with independent slice work ownership may
+            // revoke a batch. Currently initialized by AscendDirect; do not
+            // extend this policy to unprotected backend callbacks.
+            if (!slice->work_references ||
+                slice->callback_batch_owner.lock().get() != &desc)
+                return false;
+        }
+    }
+    LOG(ERROR) << "Deferred batch cleanup deadline expired; revoking batch="
+               << batch_id
+               << ", timeout_s=" << deferred_cleanup_timeout_.count()
+               << "; late callbacks retain their own slices; expiry is not "
+                  "hardware cancellation";
+    if (before_delete) before_delete();
+    deleteBatchID(batch_id);
+    ++forced_cleanup_batches_;
+    return true;
 }
 
 void MultiTransport::deferredCleanupLoop() {
@@ -320,6 +377,12 @@ void MultiTransport::deferredCleanupLoop() {
         }
         for (auto it = deferred_cleanup_batches_.begin();
              it != deferred_cleanup_batches_.end();) {
+            if (std::chrono::steady_clock::now() - it->second.enqueued_at >=
+                    deferred_cleanup_timeout_ &&
+                forceFreeBatchID(it->first, it->second.before_delete)) {
+                it = deferred_cleanup_batches_.erase(it);
+                continue;
+            }
             const Status status = tryFreeBatchID(
                 it->first, it->second.before_delete, &it->second);
             if (status.ok()) {
@@ -485,8 +548,11 @@ Status MultiTransport::submitTransfer(
     batch_desc.is_finished.store(false, std::memory_order_relaxed);
     batch_desc.finished_transfer_bytes.store(0, std::memory_order_relaxed);
 
+    auto owned_entries =
+        std::make_shared<std::vector<TransferRequest>>(entries);
+    batch_desc.requests.push_back(owned_entries);
     task_list.reserve(task_list.size() + entries.size());
-    std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
+    std::unordered_map<Transport*, std::vector<Transport::TransferTask*>>
         submit_tasks;
     if (task_sizes) task_sizes->reserve(entries.size());
     for (size_t i = 0; i < entries.size();) {
@@ -504,9 +570,9 @@ Status MultiTransport::submitTransfer(
         task.batch_id = batch_id;
         task.transport_ = transports[i];
 #ifdef USE_ASCEND_HETEROGENEOUS
-        task.request = const_cast<Transport::TransferRequest*>(&entries[i]);
+        task.request = &owned_entries->at(i);
 #else
-        task.request = &entries[i];
+        task.request = &owned_entries->at(i);
 #endif
         task.request_count = count;
         if (transports[i]->supportsBatchCompletionCounter())
@@ -568,9 +634,13 @@ Status MultiTransport::mp_submitTransfer(
     batch_desc.is_finished.store(false, std::memory_order_relaxed);
     batch_desc.finished_transfer_bytes.store(0, std::memory_order_relaxed);
     size_t task_id = batch_desc.task_list.size();
+    const size_t first_task_id = task_id;
+    auto owned_entries =
+        std::make_shared<std::vector<TransferRequest>>(entries);
+    batch_desc.requests.push_back(owned_entries);
     batch_desc.task_list.resize(task_id + entries.size());
 
-    std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
+    std::unordered_map<Transport*, std::vector<Transport::TransferTask*>>
         submit_tasks;
     for (auto& request : entries) {
         Transport* transport = nullptr;
@@ -581,9 +651,9 @@ Status MultiTransport::mp_submitTransfer(
         task.batch_id = batch_id;
         task.transport_ = transport;
 #ifdef USE_ASCEND_HETEROGENEOUS
-        task.request = const_cast<Transport::TransferRequest*>(&request);
+        task.request = &owned_entries->at(task_id - first_task_id);
 #else
-        task.request = &request;
+        task.request = &owned_entries->at(task_id - first_task_id);
 #endif
         if (transport->supportsBatchCompletionCounter())
             Transport::Slice::unsealTaskSubmission(&task);
@@ -754,13 +824,14 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     size_t success_count = 0;
     bool any_failed = false;
     bool any_timeout = false;
+    Status first_query_error = Status::OK();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         // Visit every task on failure too: a clean FAILED task must not mask
         // a sibling's unconfirmed TIMEOUT, even if its metrics were recorded.
         TransferStatus task_status{};
         auto ret = getTransferStatus(batch_id, task_id, task_status);
         if (!ret.ok()) {
-            any_failed = true;
+            if (first_query_error.ok()) first_query_error = ret;
             continue;
         }
         if (task_status.s == Transport::TransferStatusEnum::COMPLETED) {
@@ -776,6 +847,13 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
         status.s = any_timeout ? Transport::TransferStatusEnum::TIMEOUT
                                : Transport::TransferStatusEnum::FAILED;
         return Status::OK();
+    }
+
+    if (!first_query_error.ok()) {
+        // An observation failure is not a hardware FAILED result. Keep the
+        // batch uncached and return the error so callers can retry safely.
+        status.s = Transport::TransferStatusEnum::WAITING;
+        return first_query_error;
     }
 
     status.s = (success_count == task_count)

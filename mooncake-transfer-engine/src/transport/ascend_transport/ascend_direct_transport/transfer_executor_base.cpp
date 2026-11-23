@@ -749,7 +749,17 @@ void TransferExecutorBase::processHomogeneousSliceList(
     ExecuteResult result;
     std::string target_adxl_engine_name;
     bool force_update = false;
+    const auto cleanup_expired = [&] {
+        return std::any_of(
+            slice_list.begin(), slice_list.end(), [](auto* slice) {
+                if (!slice->work_references) return false;
+                auto owner = slice->callback_batch_owner.lock();
+                return !owner ||
+                       owner->cleanup_expired.load(std::memory_order_acquire);
+            });
+    };
     for (int32_t retry = 0; retry < kTransferRetryTimes; ++retry) {
+        if (cleanup_expired()) return;
         auto target_segment_desc = metadata_->getSegmentDescByID(
             slice_list[0]->target_id, force_update);
         if (!target_segment_desc) {
@@ -780,6 +790,7 @@ void TransferExecutorBase::processHomogeneousSliceList(
             (target_adxl_engine_name == local_engine_name ||
              resolveLocalCopyDestinations(target_segment_desc, slice_list,
                                           local_dest_addrs));
+        if (cleanup_expired()) return;
         if (need_local_copy && local_copy_engine_) {
             auto start = std::chrono::steady_clock::now();
             local_copy_engine_->Copy(slice_list[0]->opcode, slice_list,

@@ -3090,6 +3090,21 @@ TEST_F(ClientServerModeTest, AcceptZeroBufferPoolInClientServerMode) {
 // Bind the real transport without a remote server; only device resolution
 // fails.
 namespace mooncake {
+class MultiTransportTestPeer {
+   public:
+    static void bind(MultiTransport& multi,
+                     std::shared_ptr<Transport> transport) {
+        multi.transport_map_.emplace("ascend", std::move(transport));
+    }
+    static void expire(MultiTransport& multi) {
+        std::lock_guard<std::mutex> lock(multi.deferred_cleanup_mutex_);
+        for (auto& [id, entry] : multi.deferred_cleanup_batches_) {
+            entry.enqueued_at = std::chrono::steady_clock::now() -
+                                multi.deferred_cleanup_timeout_;
+        }
+        multi.deferred_cleanup_cv_.notify_one();
+    }
+};
 class TransferEngineImplTestPeer {
    public:
     static void bindAscend(TransferEngine& engine,
@@ -3117,6 +3132,54 @@ struct RestoreAgentMode {
     ~RestoreAgentMode() { globalConfig().ascend_agent_mode = original; }
 };
 }  // namespace
+
+TEST_F(AscendDirectTransportTest, DeferredExpirySurvivesLateAsyncCompletion) {
+    setenv("ASCEND_TRANSFER_TIMEOUT", "10000", 1);
+    adxl_mock::set_transfer_async_result(adxl::SUCCESS);
+    adxl_mock::set_get_transfer_status_result(adxl::SUCCESS);
+    adxl_mock::set_transfer_status_enum(adxl::TransferStatus::WAITING);
+    std::shared_ptr<AscendDirectTransport> transport(createTransport(true));
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(),
+                     {1, "remote_server", "192.168.1.100", 30000});
+    std::string name = "deferred-async-expiry";
+    MultiTransport multi(transport->meta(), name);
+    MultiTransportTestPeer::bind(multi, transport);
+    auto id = multi.allocateBatchID(1);
+    std::weak_ptr<Transport::BatchDesc> owner =
+        Transport::toBatchDesc(id).cleanup_owner;
+    {
+        std::vector<Transport::TransferRequest> entries(1);
+        entries[0].opcode = Transport::TransferRequest::WRITE;
+        entries[0].source = test_buffer_src_;
+        entries[0].target_id = 1;
+        entries[0].target_offset = reinterpret_cast<uint64_t>(test_buffer_dst_);
+        entries[0].length = kTransferBufSize;
+        ASSERT_TRUE(multi.submitTransfer(id, entries).ok());
+    }  // SDK owns the submitted request records after this scope.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (adxl_mock::get_transfer_async_count() == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_GT(adxl_mock::get_transfer_async_count(), 0);
+    ASSERT_TRUE(multi.freeBatchID(id).IsBatchCleanupDeferred());
+    MultiTransportTestPeer::expire(multi);
+    while (multi.getDeferredCleanupStats().pending_batches != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(multi.getDeferredCleanupStats().pending_batches, 0);
+    EXPECT_EQ(multi.getDeferredCleanupStats().forced_cleanup_batches, 1);
+    EXPECT_TRUE(owner.expired());
+    adxl_mock::set_transfer_status_enum(adxl::TransferStatus::COMPLETED);
+    // Transport teardown drains the late query callback. Its slice work owner
+    // survives descriptor deletion, and it must not dereference the dead task.
+}
 
 class AscendScatterResolveFailureTest
     : public AscendDirectTransportTest,

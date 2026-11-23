@@ -168,6 +168,9 @@ class MultiTransport {
                           const std::function<void()> &before_delete,
                           DeferredCleanupEntry *cleanup_entry = nullptr);
 
+    bool forceFreeBatchID(BatchID batch_id,
+                          const std::function<void()> &before_delete);
+    void deleteBatchID(BatchID batch_id);
     void deferredCleanupLoop();
 
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -183,6 +186,11 @@ class MultiTransport {
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
 
+    // Unreleased batches are intentionally not deleted at engine teardown:
+    // transport shutdown, rather than elapsed time, owns that old contract.
+    std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_owners_;
+    std::chrono::seconds deferred_cleanup_timeout_{120};
+    uint64_t forced_cleanup_batches_ = 0;
     std::mutex deferred_cleanup_mutex_;
     std::condition_variable deferred_cleanup_cv_;
     std::unordered_map<BatchID, DeferredCleanupEntry> deferred_cleanup_batches_;

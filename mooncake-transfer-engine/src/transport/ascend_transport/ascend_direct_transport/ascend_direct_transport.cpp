@@ -96,6 +96,14 @@ void InitializeSlice(const Transport::TransferRequest& request,
     slice->ascend_direct.engine_id = current_engine_id;
     slice->ascend_direct.unsafe_terminal = false;
     slice->task = task;
+    auto owner =
+        task->batch_id
+            ? Transport::toBatchDesc(task->batch_id).cleanup_owner.lock()
+            : nullptr;
+    if (owner) {
+        slice->callback_batch_owner = owner;
+        slice->work_references = std::make_shared<std::atomic<uint32_t>>(1);
+    }
     slice->status = Transport::Slice::PENDING;
     slice->ts = 0;
 }
@@ -371,7 +379,7 @@ Status AscendDirectTransport::getTransferStatus(BatchID batch_id,
         } else {
             status.s = TransferStatusEnum::COMPLETED;
         }
-        task.is_finished = true;
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
     } else {
         status.s = TransferStatusEnum::WAITING;
     }

@@ -117,6 +117,7 @@ TransferExecutorBase::ExecuteResult AsyncTransferExecutor::execute(
         recordConnectedSegment(local_engine_idx, target_adxl_engine_name);
         QueryBatch batch;
         batch.slices = slice_list;
+        batch.work_owner = Transport::retainSlices(slice_list);
         batch.engine_idx = local_engine_idx;
         batch.target_adxl_engine_name = target_adxl_engine_name;
 
