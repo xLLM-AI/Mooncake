@@ -292,7 +292,10 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
         if (task_status.s == Transport::TransferStatusEnum::COMPLETED) {
             status.transferred_bytes += task_status.transferred_bytes;
             success_count++;
-        } else if (task_status.s == Transport::TransferStatusEnum::FAILED) {
+        } else if (task_status.s == Transport::TransferStatusEnum::FAILED ||
+                   task_status.s == Transport::TransferStatusEnum::TIMEOUT) {
+            // TIMEOUT is a terminal failure for the batch. Individual callers
+            // that need the unsafe distinction query the task directly.
             status.s = Transport::TransferStatusEnum::FAILED;
             return Status::OK();
         }

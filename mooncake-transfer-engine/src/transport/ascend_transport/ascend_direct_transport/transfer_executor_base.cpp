@@ -700,6 +700,16 @@ void TransferExecutorBase::processSliceList(
     if (result.status == adxl::TIMEOUT) {
         LOG(ERROR) << "Transfer timeout to: " << target_adxl_engine_name
                    << ", errmsg: " << aclGetRecentErrMsg();
+        // The transport cannot prove the timed-out operation stopped touching
+        // the buffers. Publish that uncertainty so the owner can lease the
+        // ranges instead of returning them to the free pool.
+        for (auto* slice : slice_list) {
+            // Release: markSlicesFailed() below publishes the terminal
+            // counter with release, so a status query that acquire-loads it
+            // also observes this flag.
+            __atomic_store_n(&slice->ascend_direct.unsafe_terminal, true,
+                             __ATOMIC_RELEASE);
+        }
     } else {
         LOG(ERROR) << "Transfer failed to: " << target_adxl_engine_name
                    << ", errmsg: " << aclGetRecentErrMsg();

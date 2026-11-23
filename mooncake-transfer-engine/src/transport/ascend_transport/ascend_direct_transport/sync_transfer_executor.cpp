@@ -80,7 +80,11 @@ TransferExecutorBase::ExecuteResult SyncTransferExecutor::execute(
             disconnect(local_engine_idx, target_adxl_engine_name,
                        kDefaultDisconnectTime);
         }
-        return {.ret = -1, .status = status, .retryable = true};
+        // A timed-out synchronous transfer has no cancellation proof. Retrying
+        // would overlap the new attempt with an operation that may still access
+        // the same buffers, so timeouts are terminal for this slice list.
+        const bool retryable = status != adxl::TIMEOUT;
+        return {.ret = -1, .status = status, .retryable = retryable};
     }
 
     recordConnectedSegment(local_engine_idx, target_adxl_engine_name);

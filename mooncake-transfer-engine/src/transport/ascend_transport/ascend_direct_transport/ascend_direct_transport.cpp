@@ -56,6 +56,8 @@ void InitializeSlice(const Transport::TransferRequest &request,
     slice->target_id = request.target_id;
     slice->ascend_direct.dest_addr = request.target_offset;
     slice->ascend_direct.engine_id = current_engine_id;
+    __atomic_store_n(&slice->ascend_direct.unsafe_terminal, false,
+                     __ATOMIC_RELAXED);
     slice->task = task;
     slice->status = Transport::Slice::PENDING;
     slice->ts = 0;
@@ -295,11 +297,28 @@ Status AscendDirectTransport::getTransferStatus(BatchID batch_id,
             std::to_string(batch_id));
     }
     auto &task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
+    // Acquire: a terminal count published by markSuccess()/markFailed()
+    // (release) makes slice state, including unsafe_terminal, visible.
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
     if (success_slice_count + failed_slice_count == task.slice_count) {
-        if (failed_slice_count) {
+        bool unsafe = false;
+        for (auto *slice : task.slice_list) {
+            if (__atomic_load_n(&slice->ascend_direct.unsafe_terminal,
+                                __ATOMIC_ACQUIRE)) {
+                unsafe = true;
+                break;
+            }
+        }
+        if (unsafe) {
+            // Counters are terminal, but a timed-out operation may still be
+            // accessing the buffers. Report TIMEOUT so the owner leases them.
+            status.s = TransferStatusEnum::TIMEOUT;
+        } else if (failed_slice_count) {
             status.s = TransferStatusEnum::FAILED;
         } else {
             status.s = TransferStatusEnum::COMPLETED;

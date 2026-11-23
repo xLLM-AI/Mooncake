@@ -178,6 +178,13 @@ class Transport {
                 void *handle;
                 int64_t start_time;
                 int32_t engine_id;
+                // A synchronous transfer timed out without a cancellation
+                // proof. The batch may be software-terminal while the device
+                // still accesses the buffers; callers must not reuse them.
+                // Accessed with __atomic_* builtins: the producer stores it
+                // (release) before publishing the terminal slice counter, and
+                // status queries acquire-load the counter before reading it.
+                bool unsafe_terminal;
             } ascend_direct;
             struct {
                 uint64_t dest_addr;
@@ -189,14 +196,18 @@ class Transport {
             status = Slice::SUCCESS;
             __atomic_fetch_add(&task->transferred_bytes, length,
                                __ATOMIC_RELAXED);
-            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
+            // Release: publishes the slice state a status query observes
+            // after it acquire-loads a terminal counter.
+            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELEASE);
 
             check_batch_completion(false);
         }
 
         void markFailed() {
             status = Slice::FAILED;
-            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
+            // Release: also publishes ascend_direct.unsafe_terminal, which
+            // the executor stores before this counter update.
+            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELEASE);
 
             check_batch_completion(true);
         }

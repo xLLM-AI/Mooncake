@@ -769,7 +769,8 @@ class AscendDirectTransportTest : public ::testing::Test {
                 ADD_FAILURE() << "getTransferStatus failed";
                 return {false, false, status};
             }
-            if (status.s == Transport::FAILED) {
+            if (status.s == Transport::FAILED ||
+                status.s == Transport::TIMEOUT) {
                 return {true, true, status};
             }
             if (status.s == Transport::COMPLETED) {
@@ -1544,6 +1545,42 @@ TEST_F(AscendDirectTransportTest, RemoteTransfer_Sync_TransferFailure) {
         << "ADXL transfer should have been called";
     EXPECT_EQ(test_buffer_dst_[0], static_cast<char>(0))
         << "Destination buffer should not be modified on transfer failure";
+}
+
+TEST_F(AscendDirectTransportTest, RemoteTransfer_Sync_TimeoutDoesNotRetry) {
+    // First attempt times out; a retry would consume the SUCCESS entry and
+    // mask the fact that the timed-out operation never proved retirement.
+    adxl_mock::set_transfer_sequence({adxl::TIMEOUT, adxl::SUCCESS});
+
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+
+    addRemoteSegment(transport->meta(),
+                     {1, "remote_server", "192.168.1.100", 30000});
+
+    initTestData(kTransferBufSize);
+    memset(test_buffer_dst_, 0, kTransferBufSize);
+
+    auto result = runRemoteTransfer(
+        transport.get(), test_buffer_src_, 1,
+        reinterpret_cast<uint64_t>(test_buffer_dst_), kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_TRUE(result.failed);
+    EXPECT_EQ(result.status.s, Transport::TIMEOUT);
+    EXPECT_EQ(adxl_mock::get_transfer_count(), 1)
+        << "a timed-out synchronous transfer must not be retried";
+
+    // A fresh submission must clear the previous uncertainty.
+    auto next = runRemoteTransfer(
+        transport.get(), test_buffer_src_, 1,
+        reinterpret_cast<uint64_t>(test_buffer_dst_), kTransferBufSize);
+    ASSERT_TRUE(next.finished);
+    EXPECT_FALSE(next.failed);
+    EXPECT_EQ(next.status.s, Transport::COMPLETED);
+    EXPECT_EQ(adxl_mock::get_transfer_count(), 2);
 }
 
 TEST_F(AscendDirectTransportTest, RemoteTransfer_Sync_ConnectTimeout) {
