@@ -466,14 +466,17 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
 
 int AscendDirectTransport::unregisterLocalMemory(void* addr,
                                                  bool update_metadata) {
+    // The executor binds each registration's context. Do not reject cleanup
+    // here before that fallback can run on a context-less teardown thread.
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtGetCurrentContext failed, errmsg: "
-                   << aclGetRecentErrMsg();
-        return -1;
+        saved_ctx = nullptr;
     }
-    MAKE_GUARD(ctx_restore,
-               [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
+    MAKE_GUARD(ctx_restore, [saved_ctx]() {
+        if (saved_ctx != nullptr) {
+            (void)aclrtSetCurrentContext(saved_ctx);
+        }
+    });
 
     int ret = transfer_executor_->deregisterMem(addr);
     if (ret != 0) {

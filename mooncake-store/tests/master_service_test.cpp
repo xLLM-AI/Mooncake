@@ -4684,7 +4684,7 @@ TEST_F(MasterServiceTest, StopHttpMetadataCleanupIsNoOpWhenNeverStarted) {
 TEST(MasterServiceCleanupPlanTest,
      TargetedCleanupOmitsOtherDeadMemoryDescriptors) {
     MasterServiceConfig config;
-    config.enable_metric_reporting = false;
+    config.metrics.enabled = false;
     MasterService service(config);
     auto dead_allocator = std::make_shared<OffsetBufferAllocator>(
         "dead", 0x1000, 4096, "dead-endpoint");

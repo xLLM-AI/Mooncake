@@ -3330,8 +3330,11 @@ struct RestoreAgentMode {
 }  // namespace
 
 TEST_F(AscendDirectTransportTest, SyncAdmissionRejectsRevocationDuringConnect) {
+    auto bootstrap = createTransport();
+    ASSERT_NE(bootstrap, nullptr);
     TransferExecutorBase::InitParams params;
-    params.metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    params.metadata = bootstrap->meta();
+    params.local_engine_device_ids = {0};
     params.local_adxl_engine_names = {"sync-admission-local"};
     params.local_engine_contexts = {ContextForDevice(0)};
     SyncTransferExecutor executor(params);
@@ -3371,8 +3374,11 @@ TEST_F(AscendDirectTransportTest, SyncAdmissionRejectsRevocationDuringConnect) {
 
 TEST_F(AscendDirectTransportTest,
        AsyncSlotWaitRejectsRevocationWithoutLeakingCapacity) {
+    auto bootstrap = createTransport();
+    ASSERT_NE(bootstrap, nullptr);
     TransferExecutorBase::InitParams params;
-    params.metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    params.metadata = bootstrap->meta();
+    params.local_engine_device_ids = {0};
     params.local_adxl_engine_names = {"async-admission-local"};
     params.local_engine_contexts = {ContextForDevice(0)};
     AsyncTransferExecutor executor(params);
