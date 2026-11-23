@@ -61,6 +61,7 @@ constexpr int kTransferStatusMaxRetries = 1000;
 // threads do not clobber the test thread's current device.
 static thread_local int g_device_id = 0;
 static int g_device_count = 1;
+static thread_local bool g_thread_context_bound = true;
 static thread_local aclrtContext g_context =
     reinterpret_cast<aclrtContext>(0x10000);
 static thread_local aclError g_get_device_result = ACL_ERROR_NONE;
@@ -95,6 +96,7 @@ int DeviceForContext(aclrtContext context) {
 }
 
 namespace mock_acl {
+void set_thread_context_bound(bool bound) { g_thread_context_bound = bound; }
 void reset() {
     std::lock_guard<std::mutex> lock(g_acl_mutex);
     g_null_recent_error = false;
@@ -102,6 +104,7 @@ void reset() {
     g_get_device_result = ACL_ERROR_NONE;
     g_device_count = 1;
     g_context = ContextForDevice(0);
+    g_thread_context_bound = true;
     g_memcpy_result = ACL_ERROR_NONE;
     g_memcpy_async_result = ACL_ERROR_NONE;
     g_memcpy_async_call_count = 0;
@@ -210,11 +213,16 @@ aclError aclrtSetDevice(int deviceId) {
 }
 
 aclError aclrtGetCurrentContext(aclrtContext* context) {
+    if (!g_thread_context_bound) {
+        *context = nullptr;
+        return ACL_ERROR_FAILURE;
+    }
     *context = g_context;
     return ACL_ERROR_NONE;
 }
 
 aclError aclrtSetCurrentContext(aclrtContext context) {
+    g_thread_context_bound = context != nullptr;
     g_context = context;
     const int device_id = DeviceForContext(context);
     if (device_id >= 0) {
@@ -1464,6 +1472,17 @@ TEST_F(AscendDirectTransportTest, Memory_RegisterAndUnregister) {
                                              "cpu:0", true, true),
               0);
     EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest, Memory_UnregisterWithoutCallerContext) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    mock_acl::set_thread_context_bound(false);
+    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 1);
 }
 
 TEST_F(AscendDirectTransportTest, Memory_RegisterPassesLocalOnly) {

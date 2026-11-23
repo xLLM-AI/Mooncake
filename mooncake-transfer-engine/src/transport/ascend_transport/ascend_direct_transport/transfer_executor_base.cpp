@@ -642,14 +642,20 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
 }
 
 int TransferExecutorBase::deregisterMem(void* addr) {
+    // Cleanup threads may have no context. The registration's engine context
+    // is used for each handle; a missing caller context only skips restoration.
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtGetCurrentContext failed, errmsg: "
-                   << aclGetRecentErrMsg();
-        return -1;
+        LOG_FIRST_N(WARNING, 1)
+            << "No caller ACL context while deregistering memory, errmsg: "
+            << aclGetRecentErrMsg();
+        saved_ctx = nullptr;
     }
-    MAKE_GUARD(ctx_restore,
-               [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
+    MAKE_GUARD(ctx_restore, [saved_ctx]() {
+        if (saved_ctx != nullptr) {
+            (void)aclrtSetCurrentContext(saved_ctx);
+        }
+    });
 
     std::lock_guard<std::mutex> lock(mem_handle_mutex_);
     auto it = addr_to_mem_handles_.find(addr);
