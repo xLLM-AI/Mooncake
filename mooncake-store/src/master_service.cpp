@@ -1280,7 +1280,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             if (!prepared) return tl::make_unexpected(prepared.error());
             entries.push_back(std::move(*prepared));
         }
-        auto reserved = ordered_oplog_writer_->ReserveBatch(segments.size());
+        auto reserved = ordered_oplog_writer_->ReserveBatch(
+            segments.size(), /*allow_oversized_group=*/true);
         if (!reserved) return tl::make_unexpected(reserved.error());
         reservation.emplace(std::move(reserved.value()));
     }

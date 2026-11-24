@@ -270,7 +270,8 @@ OrderedOpLogWriter::Reserve() {
 }
 
 tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
-OrderedOpLogWriter::ReserveBatch(size_t entry_count) {
+OrderedOpLogWriter::ReserveBatch(size_t entry_count,
+                                 bool allow_oversized_group) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->terminal_state.has_value()) {
         return tl::make_unexpected(impl_->terminal_state->error);
@@ -281,9 +282,14 @@ OrderedOpLogWriter::ReserveBatch(size_t entry_count) {
     if (entry_count == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (entry_count > impl_->config.max_entries_per_batch ||
-        impl_->open_waiting_slots >
-            impl_->config.max_entries_per_batch - entry_count) {
+    const bool oversized = entry_count > impl_->config.max_entries_per_batch;
+    // Remount recovery is an atomic event group, not a per-client segment
+    // limit. Admit at most one oversized waiting group and let the existing
+    // group-aware seal write it as one record. Check before subtraction to
+    // avoid unsigned underflow, and preserve normal queue backpressure.
+    if (oversized ? (!allow_oversized_group || impl_->open_waiting_slots != 0)
+                  : (impl_->open_waiting_slots >
+                     impl_->config.max_entries_per_batch - entry_count)) {
         return tl::make_unexpected(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
     }
     const uint64_t id = impl_->next_reservation_id++;

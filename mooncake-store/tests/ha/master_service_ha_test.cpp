@@ -6360,6 +6360,56 @@ TEST_F(MasterServiceHATest, MountAndRemountRejectBeforeChangingStateWhenFull) {
     ReadBatchEventually(storage, 5, batch);
 }
 
+TEST_F(MasterServiceHATest, RemountOverBatchCapRecoversAndReplaysWholeClient) {
+    const std::string cluster_id = "remount_two_segments_cap_one";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    const UUID client = generate_uuid();
+    const Segment first = MakeSegment("cap-one-first");
+    const Segment second = MakeSegment(
+        "cap-one-second", kDefaultSegmentBase + kDefaultSegmentSize);
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    MasterService original(config);
+    ASSERT_EQ(ErrorCode::OK,
+              MasterServiceTestPeer(original).SetBatchOpLogBackendForTesting(
+                  backend));
+    // Two individually legal mounts must remain recoverable with the same cap.
+    ASSERT_TRUE(original.MountSegment(first, client));
+    ReadBatchEventually(storage, 1, batch);
+    ASSERT_TRUE(original.MountSegment(second, client));
+    ReadBatchEventually(storage, 2, batch);
+    original.StopBatchOpLogWriter();
+
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+    ASSERT_EQ(ErrorCode::OK, reader.PollOnce(10).error);
+    MasterService recovered(config);
+    ASSERT_TRUE(recovered.RestoreFromStandbySnapshot(
+        {}, batch.last_seq, applier.GetSegmentRegistry().GetAllSegments()));
+    ASSERT_EQ(ErrorCode::OK,
+              MasterServiceTestPeer(recovered).SetBatchOpLogBackendForTesting(
+                  backend));
+    ASSERT_TRUE(recovered.ReMountSegment({first, second}, client));
+    ReadBatchEventually(storage, 3, batch);
+    ASSERT_EQ(2u, batch.entries.size());
+    EXPECT_EQ(3u, batch.first_seq);
+    EXPECT_EQ(4u, batch.last_seq);
+    EXPECT_TRUE(recovered.getAliveClientsSnapshot().contains(client));
+    recovered.StopBatchOpLogWriter();
+    const auto replayed = reader.PollOnce(10);
+    ASSERT_EQ(ErrorCode::OK, replayed.error);
+    EXPECT_EQ(2u, replayed.applied_entries);
+    EXPECT_TRUE(applier.GetSegmentRegistry().HasSegment(first.te_endpoint));
+    EXPECT_TRUE(applier.GetSegmentRegistry().HasSegment(second.te_endpoint));
+}
+
 TEST_F(MasterServiceHATest, InvalidMountLogEntryLeavesNoSegmentOrClient) {
     const std::string cluster_id = "invalid_mount_log_entry";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();

@@ -81,10 +81,11 @@ class OrderedOpLogWriter {
 
     tl::expected<Reservation, ErrorCode> Reserve();
     // Reserve slots for one indivisible group of entries, to be committed
-    // together via CommitBatch. The same admission cap applies, so a group
-    // larger than max_entries_per_batch is rejected up front instead of
-    // producing an oversized record the backend might refuse.
-    tl::expected<Reservation, ErrorCode> ReserveBatch(size_t entry_count);
+    // together via CommitBatch. Ordinary groups obey max_entries_per_batch.
+    // Recovery may admit one indivisible oversized group when the waiting
+    // queue is empty. Normal operations continue to obey the batching cap.
+    tl::expected<Reservation, ErrorCode> ReserveBatch(
+        size_t entry_count, bool allow_oversized_group = false);
     virtual tl::expected<PendingHandle, ErrorCode> Commit(
         Reservation&& reservation, OpLogEntry entry, DurableCallback callback);
     // Commit all entries as one indivisible group: they are sealed into a
