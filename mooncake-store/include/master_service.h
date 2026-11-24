@@ -84,6 +84,8 @@ class PrefetchTaskMasterTest;
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
+ * 0. segment_lifecycle_mutex_ (segment transitions through OpLog enqueue;
+ *    never held while waiting for durability)
  * 1. client_mutex_
  * 2. the namespace policy's admission token (NamespacePolicy::AdmitWrite;
  *    the tenant quota policy's policy lock)
@@ -1943,6 +1945,10 @@ class MasterService {
     const int64_t allocation_epoch_;
 
     // Client related members
+    // Keep local segment transitions and their ordered event enqueue atomic
+    // with respect to mount, remount, explicit unmount and client offboarding.
+    std::mutex segment_lifecycle_mutex_;
+
     mutable std::shared_mutex client_mutex_;
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
                        boost::hash<UUID>>

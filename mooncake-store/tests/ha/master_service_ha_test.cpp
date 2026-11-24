@@ -174,6 +174,58 @@ class FailingBatchHaKvBackend : public FakeBatchHaKvBackend {
     size_t txn_calls_{0};
 };
 
+// Pause after local mutation but before the writer assigns a sequence number.
+// Reuse the production writer; only this deterministic scheduling boundary is
+// controlled by the test.
+class PausedSegmentMountWriter final : public OrderedOpLogWriter {
+   public:
+    PausedSegmentMountWriter(OrderedOpLogWriterConfig config,
+                             WriteBatchFn write_batch)
+        : OrderedOpLogWriter(std::move(config), std::move(write_batch)) {}
+
+    tl::expected<PendingHandle, ErrorCode> Commit(
+        Reservation&& reservation, OpLogEntry entry,
+        DurableCallback callback) override {
+        PauseMount(entry.op_type);
+        return OrderedOpLogWriter::Commit(
+            std::move(reservation), std::move(entry), std::move(callback));
+    }
+
+    tl::expected<std::vector<PendingHandle>, ErrorCode> CommitBatch(
+        Reservation&& reservation, std::vector<OpLogEntry> entries,
+        DurableCallback callback) override {
+        if (!entries.empty()) PauseMount(entries.front().op_type);
+        return OrderedOpLogWriter::CommitBatch(
+            std::move(reservation), std::move(entries), std::move(callback));
+    }
+
+    bool WaitForMount() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(2),
+                            [this] { return paused_; });
+    }
+
+    void ResumeMount() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+   private:
+    void PauseMount(OpType type) {
+        if (type != OpType::SEGMENT_MOUNT) return;
+        std::unique_lock<std::mutex> lock(mutex_);
+        paused_ = true;
+        cv_.notify_all();
+        cv_.wait(lock, [this] { return released_; });
+    }
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool paused_{false};
+    bool released_{false};
+};
+
 class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
    public:
     GatedOrderedOpLogWriter(OrderedOpLogWriterConfig config,
@@ -6083,6 +6135,81 @@ TEST_F(MasterServiceHATest,
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
+}
+
+TEST_F(MasterServiceHATest, ConcurrentMountRetirementPreservesReplayOrder) {
+    // Both first mount and remount must finish enqueueing their MOUNT before
+    // the same endpoint can locally retire and enqueue its UNMOUNT.
+    for (bool remount : {false, true}) {
+        SCOPED_TRACE(remount ? "remount" : "mount");
+        const std::string cluster_id = remount ? "concurrent_remount_retirement"
+                                               : "concurrent_mount_retirement";
+        auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+        auto config = MasterServiceConfig::builder()
+                          .set_enable_ha(true)
+                          .set_enable_oplog(true)
+                          .set_cluster_id(cluster_id)
+                          .build();
+        MasterService service(config);
+        MasterServiceTestPeer(service).SetBatchOpLogWriterFactoryForTesting(
+            [](OrderedOpLogWriterConfig writer_config,
+               OrderedOpLogWriter::WriteBatchFn write_batch) {
+                return std::make_unique<PausedSegmentMountWriter>(
+                    std::move(writer_config), std::move(write_batch));
+            });
+        ASSERT_EQ(ErrorCode::OK,
+                  MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+                      backend));
+        auto* writer = static_cast<PausedSegmentMountWriter*>(
+            MasterServiceTestPeer::OrderedOplogWriter(service).get());
+        const UUID client = generate_uuid();
+        Segment owner = MakeSegment("concurrent-owner");
+        // ReMountSegment uses the name as its replay endpoint in this branch.
+        owner.te_endpoint = owner.name;
+        auto mounting = std::async(std::launch::async, [&] {
+            return remount ? service.ReMountSegment({owner}, client)
+                           : service.MountSegment(owner, client);
+        });
+        const bool paused = writer->WaitForMount();
+        if (!paused) {
+            writer->ResumeMount();
+            EXPECT_TRUE(mounting.get());
+            FAIL() << "mount did not reach the pre-enqueue scheduling boundary";
+        }
+        std::promise<void> unmount_started;
+        auto unmounting = std::async(std::launch::async, [&] {
+            unmount_started.set_value();
+            return service.UnmountSegment(owner.id, client);
+        });
+        unmount_started.get_future().wait();
+        const auto before_mount_enqueue =
+            unmounting.wait_for(std::chrono::milliseconds(200));
+        // Always unblock the test producer before inspecting either future.
+        writer->ResumeMount();
+        EXPECT_EQ(std::future_status::timeout, before_mount_enqueue);
+        EXPECT_TRUE(mounting.get());
+        ASSERT_TRUE(unmounting.get());
+        std::string name, endpoint;
+        EXPECT_FALSE(
+            MasterServiceTestPeer::SegmentManager(service).GetSegmentBasicInfo(
+                owner.id, name, endpoint));
+
+        OpLogBatchStorage storage(cluster_id, *backend);
+        DurablePrefix prefix;
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            if (storage.ReadDurablePrefix(prefix) == ErrorCode::OK &&
+                prefix.last_seq >= 2)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        ASSERT_EQ(2u, prefix.last_seq);
+        StandbyMetadataStore standby;
+        OpLogApplier applier(&standby, cluster_id);
+        OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+        ASSERT_EQ(ErrorCode::OK, reader.PollOnce(10).error);
+        EXPECT_FALSE(applier.GetSegmentRegistry().HasSegment(owner.te_endpoint))
+            << "a retired endpoint must not be resurrected on standby";
+    }
 }
 
 TEST_F(MasterServiceHATest, FullWriterMustNotLeaveRetiredOwnerInStandby) {

@@ -1136,6 +1136,9 @@ TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    // Reserve capacity separately; assign log order before another lifecycle
+    // transition can retire or replace the state installed by this operation.
+    std::unique_lock<std::mutex> lifecycle_lock(segment_lifecycle_mutex_);
     // Reject writer backpressure before installing a segment. Otherwise the
     // primary can report success for a mount that standby replay never sees.
     std::optional<OrderedOpLogWriter::Reservation> reservation;
@@ -1202,6 +1205,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
                                                std::move(*reservation), *entry);
         if (!persisted) return persisted;
     }
+    lifecycle_lock.unlock();
     if (mount_result == ErrorCode::OK) {
         UpdateClientHostId(client_id, segment.host_id);
         NotifyPolicyCapacityChanged();
@@ -1261,6 +1265,9 @@ ErrorCode MasterService::ValidateStandbyRemountSegment(
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    // Reserve capacity separately; assign log order before another lifecycle
+    // transition can retire or replace the state installed by this operation.
+    std::unique_lock<std::mutex> lifecycle_lock(segment_lifecycle_mutex_);
     // A remount can contain several segments. Admit the complete event group
     // before rebinding any of them, rather than silently logging only a prefix.
     std::optional<OrderedOpLogWriter::Reservation> reservation;
@@ -1609,6 +1616,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             std::move(*reservation), std::move(entries), nullptr);
         if (!persisted) return tl::make_unexpected(persisted.error());
     }
+    lifecycle_lock.unlock();
     NotifyPolicyCapacityChanged();
 
     return {};
@@ -3003,6 +3011,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
 }
 
 bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
+    std::unique_lock<std::mutex> lifecycle_lock(segment_lifecycle_mutex_);
     bool quota_recompute_needed = false;
     {
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
@@ -3154,6 +3163,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         }
     }
 
+    lifecycle_lock.unlock();
     if (quota_recompute_needed) {
         NotifyPolicyCapacityChanged();
     }
@@ -3230,6 +3240,9 @@ void MasterService::WeightReconciliationThreadFunc() {
 auto MasterService::UnmountSegment(const UUID& segment_id,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    // Reserve capacity separately; assign log order before another lifecycle
+    // transition can retire or replace the state installed by this operation.
+    std::unique_lock<std::mutex> lifecycle_lock(segment_lifecycle_mutex_);
     // Capacity must be available before PrepareUnmountSegment releases the
     // allocator. Returning an error afterwards would make retries unable to
     // recover the missing retirement event from an already-deleted segment.
@@ -3307,6 +3320,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
             [this](const OpLogEntry&) { replica_cleanup_worker_.Schedule(); });
         if (!persisted) return persisted;
     }
+    lifecycle_lock.unlock();
     NotifyPolicyCapacityChanged();
     return {};
 }
