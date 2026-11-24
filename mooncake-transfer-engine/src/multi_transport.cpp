@@ -592,7 +592,7 @@ Status MultiTransport::submitTransfer(
         std::make_shared<std::vector<TransferRequest>>(entries);
     batch_desc.requests.push_back(owned_entries);
     task_list.reserve(task_list.size() + entries.size());
-    std::unordered_map<Transport*, std::vector<Transport::TransferTask*>>
+    std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
         submit_tasks;
     if (task_sizes) task_sizes->reserve(entries.size());
     for (size_t i = 0; i < entries.size();) {
@@ -609,11 +609,7 @@ Status MultiTransport::submitTransfer(
         auto& task = task_list.emplace_back();
         task.batch_id = batch_id;
         task.transport_ = transports[i];
-#ifdef USE_ASCEND_HETEROGENEOUS
         task.request = &owned_entries->at(i);
-#else
-        task.request = &owned_entries->at(i);
-#endif
         task.request_count = count;
         if (transports[i]->supportsBatchCompletionCounter())
             Transport::Slice::unsealTaskSubmission(&task);
@@ -680,7 +676,7 @@ Status MultiTransport::mp_submitTransfer(
     batch_desc.requests.push_back(owned_entries);
     batch_desc.task_list.resize(task_id + entries.size());
 
-    std::unordered_map<Transport*, std::vector<Transport::TransferTask*>>
+    std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
         submit_tasks;
     for (auto& request : entries) {
         Transport* transport = nullptr;
@@ -690,11 +686,7 @@ Status MultiTransport::mp_submitTransfer(
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
         task.transport_ = transport;
-#ifdef USE_ASCEND_HETEROGENEOUS
         task.request = &owned_entries->at(task_id - first_task_id);
-#else
-        task.request = &owned_entries->at(task_id - first_task_id);
-#endif
         if (transport->supportsBatchCompletionCounter())
             Transport::Slice::unsealTaskSubmission(&task);
         recordTaskStart(task, request);

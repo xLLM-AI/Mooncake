@@ -198,29 +198,29 @@ void DefaultSliceDispatcher::enqueueShared(
     auto* pool = thread_pool_.get();
     for (auto& [key, slices] : seg_to_slices) {
         auto work_owner = Transport::retainSlices(slices);
-        pool->enqueue(
-            [executor, contexts, work_owner, moved_slices = std::move(slices)] {
-                size_t engine_idx = 0;
-                if (!moved_slices.empty() &&
-                    moved_slices[0]->ascend_direct.engine_id >= 0) {
-                    engine_idx = static_cast<size_t>(
-                        moved_slices[0]->ascend_direct.engine_id);
-                }
-                if (engine_idx < contexts.size()) {
-                    auto ret = aclrtSetCurrentContext(contexts[engine_idx]);
-                    if (ret != ACL_ERROR_NONE) {
-                        LOG(ERROR) << "DefaultSliceDispatcher: "
-                                      "aclrtSetCurrentContext failed, "
-                                   << "engine_idx: " << engine_idx
-                                   << ", errmsg: " << aclGetRecentErrMsg();
-                        for (auto* s : moved_slices) {
-                            s->markFailed();
-                        }
-                        return;
+        pool->enqueue([executor, contexts, work_owner,
+                       moved_slices = std::move(slices)] {
+            size_t engine_idx = 0;
+            if (!moved_slices.empty() &&
+                moved_slices[0]->ascend_direct.engine_id >= 0) {
+                engine_idx = static_cast<size_t>(
+                    moved_slices[0]->ascend_direct.engine_id);
+            }
+            if (engine_idx < contexts.size()) {
+                auto ret = aclrtSetCurrentContext(contexts[engine_idx]);
+                if (ret != ACL_ERROR_NONE) {
+                    LOG(ERROR) << "DefaultSliceDispatcher: "
+                                  "aclrtSetCurrentContext failed, "
+                               << "engine_idx: " << engine_idx
+                               << ", errmsg: " << aclGetRecentErrMsg();
+                    for (auto* s : moved_slices) {
+                        s->markFailed();
                     }
+                    return;
                 }
-                executor->processSliceList(moved_slices);
-            });
+            }
+            executor->processSliceList(moved_slices);
+        });
     }
 }
 

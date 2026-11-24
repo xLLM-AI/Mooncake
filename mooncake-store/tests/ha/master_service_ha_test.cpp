@@ -616,6 +616,27 @@ class MasterServiceHATest : public ::testing::Test {
             .build();
     }
 
+    static MasterServiceConfig BatchOpLogConfig(
+        const std::string& cluster_id,
+        std::optional<uint32_t> max_entries = std::nullopt) {
+        auto builder = MasterServiceConfig::builder();
+        builder.set_enable_ha(true).set_enable_oplog(true).set_cluster_id(
+            cluster_id);
+        if (max_entries) builder.set_oplog_batch_max_entries(*max_entries);
+        return builder.build();
+    }
+
+    static ErrorCode SetBatchOpLogBackend(
+        MasterService& service, const std::shared_ptr<HaKvBackend>& backend) {
+        return MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+            backend);
+    }
+
+    struct ReleaseBlockedBackend {
+        std::shared_ptr<BlockingBatchHaKvBackend> backend;
+        ~ReleaseBlockedBackend() { backend->AllowTxn(); }
+    };
+
     static bool HasOpLogWriter(const MasterService& service) {
         return MasterServiceTestPeer::OrderedOplogWriter(service) != nullptr;
     }
@@ -6145,11 +6166,7 @@ TEST_F(MasterServiceHATest, ConcurrentMountRetirementPreservesReplayOrder) {
         const std::string cluster_id = remount ? "concurrent_remount_retirement"
                                                : "concurrent_mount_retirement";
         auto backend = std::make_shared<BlockingBatchHaKvBackend>();
-        auto config = MasterServiceConfig::builder()
-                          .set_enable_ha(true)
-                          .set_enable_oplog(true)
-                          .set_cluster_id(cluster_id)
-                          .build();
+        auto config = BatchOpLogConfig(cluster_id);
         MasterService service(config);
         MasterServiceTestPeer(service).SetBatchOpLogWriterFactoryForTesting(
             [](OrderedOpLogWriterConfig writer_config,
@@ -6157,9 +6174,7 @@ TEST_F(MasterServiceHATest, ConcurrentMountRetirementPreservesReplayOrder) {
                 return std::make_unique<PausedSegmentMountWriter>(
                     std::move(writer_config), std::move(write_batch));
             });
-        ASSERT_EQ(ErrorCode::OK,
-                  MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
-                      backend));
+        ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(service, backend));
         auto* writer = static_cast<PausedSegmentMountWriter*>(
             MasterServiceTestPeer::OrderedOplogWriter(service).get());
         const UUID client = generate_uuid();
@@ -6219,23 +6234,13 @@ TEST_F(MasterServiceHATest, FullWriterMustNotLeaveRetiredOwnerInStandby) {
     // with that name in standby replay, making promotion fail INVALID_PARAMS.
     const std::string cluster_id = "retired_owner_full_writer";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
-    auto config = MasterServiceConfig::builder()
-                      .set_enable_ha(true)
-                      .set_enable_oplog(true)
-                      .set_cluster_id(cluster_id)
-                      .set_oplog_batch_max_entries(1)
-                      .build();
+    auto config = BatchOpLogConfig(cluster_id, 1);
     MasterService service(config);
-    ASSERT_EQ(
-        ErrorCode::OK,
-        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(service, backend));
     // ASSERT failures must not strand the writer in the fake transaction and
     // hang service destruction. Declare this after service so it releases
     // first.
-    struct ReleaseBlockedBackend {
-        std::shared_ptr<BlockingBatchHaKvBackend> backend;
-        ~ReleaseBlockedBackend() { backend->AllowTxn(); }
-    } release{backend};
+    ReleaseBlockedBackend release{backend};
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
     const UUID old_client = generate_uuid();
@@ -6299,20 +6304,10 @@ TEST_F(MasterServiceHATest, FullWriterMustNotLeaveRetiredOwnerInStandby) {
 TEST_F(MasterServiceHATest, MountAndRemountRejectBeforeChangingStateWhenFull) {
     const std::string cluster_id = "mount_admission_before_mutation";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
-    auto config = MasterServiceConfig::builder()
-                      .set_enable_ha(true)
-                      .set_enable_oplog(true)
-                      .set_cluster_id(cluster_id)
-                      .set_oplog_batch_max_entries(2)
-                      .build();
+    auto config = BatchOpLogConfig(cluster_id, 2);
     MasterService service(config);
-    ASSERT_EQ(
-        ErrorCode::OK,
-        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
-    struct ReleaseBlockedBackend {
-        std::shared_ptr<BlockingBatchHaKvBackend> backend;
-        ~ReleaseBlockedBackend() { backend->AllowTxn(); }
-    } release{backend};
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(service, backend));
+    ReleaseBlockedBackend release{backend};
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
     ASSERT_TRUE(service.MountSegment(MakeSegment("initial"), generate_uuid()));
@@ -6363,12 +6358,7 @@ TEST_F(MasterServiceHATest, MountAndRemountRejectBeforeChangingStateWhenFull) {
 TEST_F(MasterServiceHATest, RemountOverBatchCapRecoversAndReplaysWholeClient) {
     const std::string cluster_id = "remount_two_segments_cap_one";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
-    auto config = MasterServiceConfig::builder()
-                      .set_enable_ha(true)
-                      .set_enable_oplog(true)
-                      .set_cluster_id(cluster_id)
-                      .set_oplog_batch_max_entries(1)
-                      .build();
+    auto config = BatchOpLogConfig(cluster_id, 1);
     const UUID client = generate_uuid();
     const Segment first = MakeSegment("cap-one-first");
     const Segment second = MakeSegment(
@@ -6376,9 +6366,7 @@ TEST_F(MasterServiceHATest, RemountOverBatchCapRecoversAndReplaysWholeClient) {
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
     MasterService original(config);
-    ASSERT_EQ(ErrorCode::OK,
-              MasterServiceTestPeer(original).SetBatchOpLogBackendForTesting(
-                  backend));
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(original, backend));
     // Two individually legal mounts must remain recoverable with the same cap.
     ASSERT_TRUE(original.MountSegment(first, client));
     ReadBatchEventually(storage, 1, batch);
@@ -6393,9 +6381,7 @@ TEST_F(MasterServiceHATest, RemountOverBatchCapRecoversAndReplaysWholeClient) {
     MasterService recovered(config);
     ASSERT_TRUE(recovered.RestoreFromStandbySnapshot(
         {}, batch.last_seq, applier.GetSegmentRegistry().GetAllSegments()));
-    ASSERT_EQ(ErrorCode::OK,
-              MasterServiceTestPeer(recovered).SetBatchOpLogBackendForTesting(
-                  backend));
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(recovered, backend));
     ASSERT_TRUE(recovered.ReMountSegment({first, second}, client));
     ReadBatchEventually(storage, 3, batch);
     ASSERT_EQ(2u, batch.entries.size());
@@ -6413,14 +6399,8 @@ TEST_F(MasterServiceHATest, RemountOverBatchCapRecoversAndReplaysWholeClient) {
 TEST_F(MasterServiceHATest, InvalidMountLogEntryLeavesNoSegmentOrClient) {
     const std::string cluster_id = "invalid_mount_log_entry";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
-    MasterService service(MasterServiceConfig::builder()
-                              .set_enable_ha(true)
-                              .set_enable_oplog(true)
-                              .set_cluster_id(cluster_id)
-                              .build());
-    ASSERT_EQ(
-        ErrorCode::OK,
-        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    MasterService service(BatchOpLogConfig(cluster_id));
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(service, backend));
     Segment segment = MakeSegment("invalid-mount-log-entry");
     const UUID client = generate_uuid();
     // Reserve succeeds, but Commit rejects a key over the writer's size limit.
@@ -6454,14 +6434,8 @@ TEST_F(MasterServiceHATest, InvalidMountLogEntryLeavesNoSegmentOrClient) {
 TEST_F(MasterServiceHATest, InvalidRemountLogEntryRejectsTheWholeGroup) {
     const std::string cluster_id = "invalid_remount_log_entry";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
-    MasterService service(MasterServiceConfig::builder()
-                              .set_enable_ha(true)
-                              .set_enable_oplog(true)
-                              .set_cluster_id(cluster_id)
-                              .build());
-    ASSERT_EQ(
-        ErrorCode::OK,
-        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    MasterService service(BatchOpLogConfig(cluster_id));
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(service, backend));
     const Segment first = MakeSegment("valid-remount-log-entry");
     Segment second = MakeSegment("invalid-remount-log-entry",
                                  kDefaultSegmentBase + kDefaultSegmentSize);
@@ -6490,14 +6464,8 @@ TEST_F(MasterServiceHATest, InvalidRemountLogEntryRejectsTheWholeGroup) {
 
 TEST_F(MasterServiceHATest, InvalidUnmountLogEntryKeepsTheAllocatorLive) {
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
-    MasterService service(MasterServiceConfig::builder()
-                              .set_enable_ha(true)
-                              .set_enable_oplog(true)
-                              .set_cluster_id("invalid_unmount_log_entry")
-                              .build());
-    ASSERT_EQ(
-        ErrorCode::OK,
-        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    MasterService service(BatchOpLogConfig("invalid_unmount_log_entry"));
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(service, backend));
     Segment segment = MakeSegment("invalid-unmount-log-entry");
     segment.te_endpoint = std::string(kMaxOpLogObjectKeySize + 1, 'x');
     const UUID client = generate_uuid();
