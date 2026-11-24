@@ -766,7 +766,8 @@ bool TransferExecutorBase::isIoAdmissionClosed(
         auto owner = slice->callback_batch_owner.lock();
         return !owner ||
                owner->io_admission_closed.load(std::memory_order_acquire) ||
-               owner->cleanup_expired.load(std::memory_order_acquire);
+               owner->cleanup_expired.load(std::memory_order_acquire) ||
+               (owner->cancellation && owner->cancellation->isCancelled());
     });
 }
 
@@ -804,6 +805,26 @@ TransferExecutorBase::IoAdmission TransferExecutorBase::acquireIoAdmission(
             owner->cleanup_expired.load(std::memory_order_acquire)) {
             return admission;
         }
+    }
+    // A route may mix batches from different operations. Lock each operation
+    // once in a total order; cancellation and the final admission decision
+    // share these locks. Drop them before any vendor call so cancel stays fast.
+    std::vector<std::shared_ptr<TransferCancellation>> cancellations;
+    for (const auto& owner : admission.owners) {
+        if (owner->cancellation) cancellations.push_back(owner->cancellation);
+    }
+    std::sort(cancellations.begin(), cancellations.end(),
+              [](const auto& left, const auto& right) {
+                  return std::less<TransferCancellation*>{}(left.get(),
+                                                            right.get());
+              });
+    cancellations.erase(std::unique(cancellations.begin(), cancellations.end()),
+                        cancellations.end());
+    std::vector<TransferCancellation::Admission> operation_admissions;
+    operation_admissions.reserve(cancellations.size());
+    for (const auto& cancellation : cancellations) {
+        operation_admissions.push_back(cancellation->acquireAdmission());
+        if (!operation_admissions.back().admitted) return admission;
     }
     admission.admitted = true;
     return admission;

@@ -3329,6 +3329,62 @@ struct RestoreAgentMode {
 };
 }  // namespace
 
+TEST_F(AscendDirectTransportTest,
+       OperationCancelRejectsQueuedCurrentAndFollowingBatch) {
+    auto bootstrap = createTransport();
+    ASSERT_NE(bootstrap, nullptr);
+    TransferExecutorBase::InitParams params;
+    params.metadata = bootstrap->meta();
+    params.local_engine_device_ids = {0};
+    params.local_adxl_engine_names = {"sync-admission-local"};
+    params.local_engine_contexts = {ContextForDevice(0)};
+    SyncTransferExecutor executor(params);
+    ASSERT_EQ(executor.initialize(), 0);
+    auto owner = std::make_shared<Transport::BatchDesc>();
+    auto cancellation = std::make_shared<TransferCancellation>();
+    owner->cancellation = cancellation;
+    Transport::TransferTask task{}, following_task{};
+    task.slice_count = 1;
+    following_task.slice_count = 1;
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.source_addr = test_buffer_src_;
+    slice.ascend_direct.dest_addr =
+        reinterpret_cast<uint64_t>(test_buffer_dst_);
+    slice.length = kTransferBufSize;
+    slice.work_references = std::make_shared<std::atomic<uint32_t>>(1);
+    slice.callback_batch_owner = owner;
+    std::promise<void> entered, resume;
+    auto entered_future = entered.get_future();
+    auto resume_future = resume.get_future().share();
+    adxl_mock::set_connect_hook([&] {
+        entered.set_value();
+        resume_future.wait();
+    });
+    auto result = std::async(std::launch::async, [&] {
+        return executor.execute(0, "sync-admission-remote", adxl::WRITE,
+                                {&slice});
+    });
+    EXPECT_EQ(entered_future.wait_for(std::chrono::seconds(3)),
+              std::future_status::ready);
+    // Must return while Connect is still blocked; no vendor lock is held by
+    // the operation gate. Closing it also covers batches created earlier.
+    cancellation->cancel();
+    resume.set_value();
+    EXPECT_NE(result.get().ret, 0);
+    EXPECT_EQ(adxl_mock::get_transfer_count(), 0);
+    adxl_mock::set_connect_hook({});
+    auto following = std::make_shared<Transport::BatchDesc>();
+    following->cancellation = cancellation;
+    slice.callback_batch_owner = following;
+    slice.task = &following_task;
+    slice.status = Transport::Slice::PENDING;
+    EXPECT_NE(
+        executor.execute(0, "sync-admission-remote", adxl::WRITE, {&slice}).ret,
+        0);
+    EXPECT_EQ(adxl_mock::get_transfer_count(), 0);
+}
+
 TEST_F(AscendDirectTransportTest, SyncAdmissionRejectsRevocationDuringConnect) {
     auto bootstrap = createTransport();
     ASSERT_NE(bootstrap, nullptr);

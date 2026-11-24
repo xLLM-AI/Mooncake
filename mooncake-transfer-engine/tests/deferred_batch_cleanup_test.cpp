@@ -207,6 +207,29 @@ void expect_reclaimed(MultiTransport& transport, const Batch& batch,
     EXPECT_TRUE(counts.hook_before_slice.load());
 }
 
+TEST(DeferredBatchCleanupTest,
+     CancelledOperationCannotAllocateOrSubmitNewBatch) {
+    std::string name = "operation-cancel";
+    MultiTransport transport(nullptr, name);
+    auto cancellation = std::make_shared<TransferCancellation>();
+    const auto id = transport.allocateBatchID(1, cancellation);
+    ASSERT_NE(id, static_cast<Transport::BatchID>(-1));
+    EXPECT_EQ(Transport::toBatchDesc(id).cancellation, cancellation);
+    cancellation->cancel();
+    EXPECT_FALSE(transport.submitTransfer(id, {}).ok());
+    EXPECT_TRUE(transport.freeBatchID(id).ok());
+    // No BatchID is captured by cancel: old descriptor deletion cannot close
+    // another operation, even if the allocator recycles its address.
+    cancellation->cancel();
+    EXPECT_EQ(transport.allocateBatchID(1, cancellation),
+              static_cast<Transport::BatchID>(-1));
+    auto next = std::make_shared<TransferCancellation>();
+    const auto next_id = transport.allocateBatchID(1, next);
+    ASSERT_NE(next_id, static_cast<Transport::BatchID>(-1));
+    EXPECT_TRUE(transport.submitTransfer(next_id, {}).ok());
+    EXPECT_TRUE(transport.freeBatchID(next_id).ok());
+}
+
 TEST(DeferredBatchCleanupTest, InitialQueryErrorTransfersCleanupOwnership) {
     std::string name = "initial-query-error";
     ControlledTransport backend;

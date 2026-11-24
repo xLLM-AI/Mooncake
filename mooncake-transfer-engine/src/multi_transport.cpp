@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include "multi_transport.h"
+
+#include <optional>
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -121,6 +123,18 @@ MultiTransport::~MultiTransport() {
 }
 
 MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
+    return allocateBatchID(batch_size, nullptr);
+}
+
+MultiTransport::BatchID MultiTransport::allocateBatchID(
+    size_t batch_size, std::shared_ptr<TransferCancellation> cancellation) {
+    // Linearize allocation against cancellation without a stale BatchID
+    // callback. The descriptor retains the same gate through queued execution.
+    std::optional<TransferCancellation::Admission> admission;
+    if (cancellation) {
+        admission.emplace(cancellation->acquireAdmission());
+        if (!admission->admitted) return static_cast<BatchID>(-1);
+    }
     // Keep the original teardown policy for batches never handed back by
     // their caller; only explicit cleanup is allowed to delete their metadata.
     auto owner =
@@ -130,6 +144,7 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
         });
     auto* batch_desc = owner.get();
     batch_desc->cleanup_owner = owner;
+    batch_desc->cancellation = std::move(cancellation);
     {
         std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
         batch_owners_.emplace(BatchID(batch_desc), owner);
@@ -549,6 +564,9 @@ Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     std::vector<size_t>* task_sizes) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
+    if (batch_desc.cancellation && batch_desc.cancellation->isCancelled()) {
+        return Status::Context("Transfer operation cancelled");
+    }
     if (!task_sizes &&
         batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         return Status::TooManyRequests(

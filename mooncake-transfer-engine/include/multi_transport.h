@@ -56,6 +56,10 @@ class MultiTransport {
     };
 
     BatchID allocateBatchID(size_t batch_size);
+    // Classic Ascend batches share this admission gate with their operation.
+    // Cancel does not free a handle or acknowledge hardware retirement.
+    BatchID allocateBatchID(size_t batch_size,
+                            std::shared_ptr<TransferCancellation> cancellation);
 
     // An OK or BatchCleanupDeferred return invalidates batch_id. A deferred
     // cleanup means in-flight transport work may still own transfer buffers.

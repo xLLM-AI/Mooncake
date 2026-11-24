@@ -29,6 +29,7 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <utility>
 #include <shared_mutex>
 #include <condition_variable>
 
@@ -40,6 +41,34 @@
 #endif
 
 namespace mooncake {
+
+// Shared across every batch in one application transfer. Cancellation closes
+// future admission, not an already admitted vendor call. Never hold this short
+// control-plane lock over Connect, a slot wait, or a vendor invocation.
+class TransferCancellation final {
+   public:
+    struct Admission {
+        std::unique_lock<std::mutex> lock;
+        bool admitted;
+    };
+
+    Admission acquireAdmission() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return {std::move(lock), !cancelled_};
+    }
+    void cancel() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cancelled_ = true;
+    }
+    bool isCancelled() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return cancelled_;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    bool cancelled_ = false;
+};
 
 class RdmaEndPoint;
 class TransferMetadata;
@@ -596,6 +625,7 @@ class Transport {
         // shared access; revocation must acquire exclusive access first.
         std::atomic<bool> io_admission_closed{false};
         std::shared_mutex io_admission_mutex;
+        std::shared_ptr<TransferCancellation> cancellation;
         // Submission must not leave deferred tasks pointing into a caller's
         // temporary request vector. Keep each submission contiguous/stable.
         std::vector<std::shared_ptr<std::vector<TransferRequest>>> requests;
