@@ -28,6 +28,7 @@ struct OrderedOpLogWriter::Impl {
 
     struct PendingEntry {
         OpLogEntry entry;
+        size_t transaction_bytes{0};
         DurableCallback callback;
         // Entries committed together via CommitBatch share a non-zero group
         // id and must be sealed into the same batch record.
@@ -93,6 +94,33 @@ struct OrderedOpLogWriter::Impl {
                committed_entries[count].group ==
                    committed_entries[count - 1].group) {
             ++count;
+        }
+        if (config.entry_transaction_bytes) {
+            size_t remaining = config.max_transaction_bytes;
+            size_t admitted = 0;
+            while (admitted < count) {
+                size_t end = admitted + 1;
+                while (end < count && committed_entries[admitted].group != 0 &&
+                       committed_entries[end].group ==
+                           committed_entries[admitted].group)
+                    ++end;
+                size_t group_bytes = 0;
+                bool fits = true;
+                for (size_t i = admitted; i < end; ++i) {
+                    const size_t bytes = committed_entries[i].transaction_bytes;
+                    if (bytes > remaining - group_bytes) {
+                        fits = false;
+                        break;
+                    }
+                    group_bytes += bytes;
+                }
+                if (!fits) break;
+                remaining -= group_bytes;
+                admitted = end;
+            }
+            // Every group is checked at Commit; at least the first fits.
+            CHECK_GT(admitted, 0);
+            count = admitted;
         }
         ready_entries.reserve(count);
         for (size_t i = 0; i < count; ++i) {
@@ -270,7 +298,8 @@ OrderedOpLogWriter::Reserve() {
 }
 
 tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
-OrderedOpLogWriter::ReserveBatch(size_t entry_count) {
+OrderedOpLogWriter::ReserveBatch(size_t entry_count,
+                                 bool allow_oversized_group) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->terminal_state.has_value()) {
         return tl::make_unexpected(impl_->terminal_state->error);
@@ -281,9 +310,14 @@ OrderedOpLogWriter::ReserveBatch(size_t entry_count) {
     if (entry_count == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (entry_count > impl_->config.max_entries_per_batch ||
-        impl_->open_waiting_slots >
-            impl_->config.max_entries_per_batch - entry_count) {
+    const bool oversized = entry_count > impl_->config.max_entries_per_batch;
+    // Remount recovery is an atomic event group, not a per-client segment
+    // limit. Admit at most one oversized waiting group and let the existing
+    // group-aware seal write it as one record. Check before subtraction to
+    // avoid unsigned underflow, and preserve normal queue backpressure.
+    if (oversized ? (!allow_oversized_group || impl_->open_waiting_slots != 0)
+                  : (impl_->open_waiting_slots >
+                     impl_->config.max_entries_per_batch - entry_count)) {
         return tl::make_unexpected(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
     }
     const uint64_t id = impl_->next_reservation_id++;
@@ -316,6 +350,12 @@ OrderedOpLogWriter::Commit(Reservation&& reservation, OpLogEntry entry,
     if (impl_->stop_requested) {
         return reject_reservation(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    const size_t transaction_bytes =
+        impl_->config.entry_transaction_bytes
+            ? impl_->config.entry_transaction_bytes(entry)
+            : 0;
+    if (transaction_bytes > impl_->config.max_transaction_bytes)
+        return reject_reservation(ErrorCode::INVALID_PARAMS);
     std::string reason;
     if (!ValidateOpLogBatchEntry(entry, &reason)) {
         return reject_reservation(ErrorCode::INVALID_PARAMS);
@@ -333,6 +373,7 @@ OrderedOpLogWriter::Commit(Reservation&& reservation, OpLogEntry entry,
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
     pending.committed_at = Impl::Clock::now();
 #endif
+    pending.transaction_bytes = transaction_bytes;
     impl_->committed_entries.push_back(std::move(pending));
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
     HAMetricManager::instance().set_batch_record_committed_queue_depth(
@@ -371,7 +412,17 @@ OrderedOpLogWriter::CommitBatch(Reservation&& reservation,
     if (impl_->stop_requested) {
         return reject_reservation(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    size_t remaining = impl_->config.max_transaction_bytes;
+    std::vector<size_t> transaction_bytes;
+    transaction_bytes.reserve(entries.size());
     for (const auto& entry : entries) {
+        const size_t bytes = impl_->config.entry_transaction_bytes
+                                 ? impl_->config.entry_transaction_bytes(entry)
+                                 : 0;
+        if (bytes > remaining)
+            return reject_reservation(ErrorCode::INVALID_PARAMS);
+        remaining -= bytes;
+        transaction_bytes.push_back(bytes);
         std::string reason;
         if (!ValidateOpLogBatchEntry(entry, &reason)) {
             return reject_reservation(ErrorCode::INVALID_PARAMS);
@@ -383,6 +434,7 @@ OrderedOpLogWriter::CommitBatch(Reservation&& reservation,
     const uint64_t group = impl_->next_group_id++;
     std::vector<PendingHandle> handles;
     handles.reserve(entries.size());
+    size_t cost_index = 0;
     for (auto& entry : entries) {
         entry.timestamp_ms = 0;
         entry.checksum = ComputeOpLogChecksum(entry.payload);
@@ -395,6 +447,7 @@ OrderedOpLogWriter::CommitBatch(Reservation&& reservation,
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
         pending.committed_at = Impl::Clock::now();
 #endif
+        pending.transaction_bytes = transaction_bytes[cost_index++];
         impl_->committed_entries.push_back(std::move(pending));
     }
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS

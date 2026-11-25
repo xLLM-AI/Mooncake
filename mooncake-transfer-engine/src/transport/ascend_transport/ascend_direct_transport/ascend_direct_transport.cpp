@@ -19,6 +19,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <cassert>
 #include <memory>
 #include <numeric>
@@ -93,7 +94,16 @@ void InitializeSlice(const Transport::TransferRequest& request,
     slice->target_id = request.target_id;
     slice->ascend_direct.dest_addr = request.target_offset;
     slice->ascend_direct.engine_id = current_engine_id;
+    slice->ascend_direct.unsafe_terminal = false;
     slice->task = task;
+    auto owner =
+        task->batch_id
+            ? Transport::toBatchDesc(task->batch_id).cleanup_owner.lock()
+            : nullptr;
+    if (owner) {
+        slice->callback_batch_owner = owner;
+        slice->work_references = std::make_shared<std::atomic<uint32_t>>(1);
+    }
     slice->status = Transport::Slice::PENDING;
     slice->ts = 0;
 }
@@ -131,17 +141,11 @@ int AscendDirectTransport::install(std::string& local_server_name,
             << ret;
         return ret;
     }
-    ret = metadata_->updateLocalSegmentDesc();
-    if (ret) {
-        LOG(ERROR) << "cannot publish segments, "
-                      "check the availability of metadata storage, ret: "
-                   << ret;
-        return ret;
-    }
-
     TransferExecutorBase::InitParams exec_params;
     exec_params.metadata = metadata_;
     exec_params.local_engine_contexts = local_engine_contexts_;
+    exec_params.local_engine_device_ids = local_engine_device_ids_;
+    exec_params.base_port = base_port_;
     exec_params.agent_mode = agent_mode_;
     exec_params.roce_mode = roce_mode_;
     exec_params.use_fabric_mem = use_fabric_mem_;
@@ -152,6 +156,13 @@ int AscendDirectTransport::install(std::string& local_server_name,
         LOG(ERROR)
             << "AscendDirectTransport: TransferExecutor init failed, ret: "
             << ret;
+        return ret;
+    }
+    ret = metadata_->updateLocalSegmentDesc();
+    if (ret) {
+        LOG(ERROR) << "cannot publish segments, "
+                      "check the availability of metadata storage, ret: "
+                   << ret;
         return ret;
     }
 
@@ -355,12 +366,21 @@ Status AscendDirectTransport::getTransferStatus(BatchID batch_id,
     status.transferred_bytes =
         __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
-        if (failed_slice_count) {
+        // The acquire counter loads above publish all preceding flag writes.
+        // TIMEOUT is software-terminal; it never authorizes buffer reuse.
+        const bool unsafe =
+            std::any_of(task.slice_list.begin(), task.slice_list.end(),
+                        [](const Slice* slice) {
+                            return slice->ascend_direct.unsafe_terminal;
+                        });
+        if (unsafe) {
+            status.s = TransferStatusEnum::TIMEOUT;
+        } else if (failed_slice_count) {
             status.s = TransferStatusEnum::FAILED;
         } else {
             status.s = TransferStatusEnum::COMPLETED;
         }
-        task.is_finished = true;
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
     } else {
         status.s = TransferStatusEnum::WAITING;
     }
@@ -446,14 +466,17 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
 
 int AscendDirectTransport::unregisterLocalMemory(void* addr,
                                                  bool update_metadata) {
+    // The executor binds each registration's context. Do not reject cleanup
+    // here before that fallback can run on a context-less teardown thread.
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtGetCurrentContext failed, errmsg: "
-                   << aclGetRecentErrMsg();
-        return -1;
+        saved_ctx = nullptr;
     }
-    MAKE_GUARD(ctx_restore,
-               [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
+    MAKE_GUARD(ctx_restore, [saved_ctx]() {
+        if (saved_ctx != nullptr) {
+            (void)aclrtSetCurrentContext(saved_ctx);
+        }
+    });
 
     int ret = transfer_executor_->deregisterMem(addr);
     if (ret != 0) {

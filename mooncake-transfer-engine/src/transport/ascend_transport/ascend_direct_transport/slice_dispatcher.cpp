@@ -197,7 +197,9 @@ void DefaultSliceDispatcher::enqueueShared(
     auto contexts = local_engine_contexts_;
     auto* pool = thread_pool_.get();
     for (auto& [key, slices] : seg_to_slices) {
-        pool->enqueue([executor, contexts, moved_slices = std::move(slices)] {
+        auto work_owner = Transport::retainSlices(slices);
+        pool->enqueue([executor, contexts, work_owner,
+                       moved_slices = std::move(slices)] {
             size_t engine_idx = 0;
             if (!moved_slices.empty() &&
                 moved_slices[0]->ascend_direct.engine_id >= 0) {
@@ -244,8 +246,10 @@ void DefaultSliceDispatcher::enqueuePerDevice(
     auto contexts = local_engine_contexts_;
     for (auto& [key, slices] : grouped) {
         const size_t engine_idx = std::get<0>(key);
+        auto work_owner = Transport::retainSlices(slices);
         device_thread_pools_[engine_idx]->enqueue(
-            [executor, contexts, engine_idx, moved_slices = std::move(slices)] {
+            [executor, contexts, engine_idx, work_owner,
+             moved_slices = std::move(slices)] {
                 if (engine_idx < contexts.size()) {
                     auto ret = aclrtSetCurrentContext(contexts[engine_idx]);
                     if (ret != ACL_ERROR_NONE) {
@@ -346,7 +350,8 @@ void RoceDummyRealSliceDispatcher::enqueue(
     }
     for (auto& [key, slices] : grouped) {
         size_t engine_idx = std::get<0>(key);
-        SliceTask task{std::move(slices)};
+        auto work_owner = Transport::retainSlices(slices);
+        SliceTask task{std::move(slices), std::move(work_owner)};
         {
             std::lock_guard<std::mutex> lock(queue_mutexes_[engine_idx]);
             engine_queues_[engine_idx].push(std::move(task));

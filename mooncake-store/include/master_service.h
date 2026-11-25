@@ -84,6 +84,8 @@ class PrefetchTaskMasterTest;
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
+ * 0. segment_lifecycle_mutex_ (segment transitions through OpLog enqueue;
+ *    never held while waiting for durability)
  * 1. client_mutex_
  * 2. the namespace policy's admission token (NamespacePolicy::AdmitWrite;
  *    the tenant quota policy's policy lock)
@@ -1943,6 +1945,10 @@ class MasterService {
     const int64_t allocation_epoch_;
 
     // Client related members
+    // Keep local segment transitions and their ordered event enqueue atomic
+    // with respect to mount, remount, explicit unmount and client offboarding.
+    std::mutex segment_lifecycle_mutex_;
+
     mutable std::shared_mutex client_mutex_;
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
                        boost::hash<UUID>>
@@ -2396,14 +2402,12 @@ class MasterService {
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     /**
-     * Appends a SEGMENT_MOUNT / SEGMENT_UNMOUNT entry without waiting for it
-     * to become durable. The local segment change has already happened and
-     * cannot be rolled back, so a failed append is only logged; nothing
-     * retries it.
+     * Commits a segment event using capacity reserved before the local change.
+     * Does not wait for durability; commit failures are returned to the caller.
      */
-    void PersistSegmentOpForHA(const char* why, OpType type,
-                               const std::string& key,
-                               const std::string& payload);
+    tl::expected<void, ErrorCode> PersistSegmentOpForHA(
+        const char* why, OrderedOpLogWriter::Reservation&& reservation,
+        const OpLogEntry& entry, DurableFinalizeCallback callback = nullptr);
 
     /**
      * Appends a REMOVE entry for the key, without waiting for it to become

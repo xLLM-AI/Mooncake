@@ -1719,17 +1719,61 @@ TEST(OrderedOpLogWriterCallbackTest, SlowCallbackDoesNotPreventNextBatchWrite) {
     writer.Stop();
 }
 
+TEST(OrderedOpLogWriterAdmissionTest, ByteBudgetKeepsCommitGroupsAtomic) {
+    FakeBatchWriter storage;
+    storage.BlockWrites();
+    OrderedOpLogWriterConfig config;
+    config.max_entries_per_batch = 10;
+    config.max_transaction_bytes = 2;
+    config.entry_transaction_bytes = [](const OpLogEntry&) {
+        return size_t{1};
+    };
+    OrderedOpLogWriter writer(config, [&](const OpLogBatchRecord& batch,
+                                          const DurablePrefix& prefix) {
+        return storage.Write(batch, prefix);
+    });
+    auto unblock =
+        std::shared_ptr<void>(nullptr, [&](void*) { storage.UnblockWrites(); });
+    writer.Start();
+    auto first = writer.Reserve();
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(writer.Commit(std::move(*first), MakeEntry("inflight"), {}));
+    ASSERT_TRUE(storage.WaitForBlockedWrite());
+    auto oversized = writer.ReserveBatch(3);
+    ASSERT_TRUE(oversized);
+    EXPECT_FALSE(writer.CommitBatch(
+        std::move(*oversized),
+        {MakeEntry("bad1"), MakeEntry("bad2"), MakeEntry("bad3")}, {}));
+    auto single = writer.Reserve();
+    ASSERT_TRUE(single);
+    ASSERT_TRUE(writer.Commit(std::move(*single), MakeEntry("single"), {}));
+    auto group = writer.ReserveBatch(2);
+    ASSERT_TRUE(group);
+    ASSERT_TRUE(writer.CommitBatch(std::move(*group),
+                                   {MakeEntry("g1"), MakeEntry("g2")}, {}));
+    storage.UnblockWrites();
+    ASSERT_TRUE(storage.WaitForWrites(3));
+    writer.Stop();
+    const auto batches = storage.Batches();
+    ASSERT_EQ(batches.size(), 3u);
+    EXPECT_EQ(batches[1].entries.size(), 1u);
+    ASSERT_EQ(batches[2].entries.size(), 2u);
+    EXPECT_EQ(batches[2].entries[0].object_key, "g1");
+    EXPECT_EQ(batches[2].entries[1].object_key, "g2");
+    EXPECT_EQ(batches[2].last_seq, 4u);
+}
+
 TEST(OrderedOpLogWriterAdmissionTest, CommitBatchSealsWholeGroupIntoOneRecord) {
     FakeBatchWriter storage;
     OrderedOpLogWriter writer(
-        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 1},
         [&](const OpLogBatchRecord& batch,
             const DurablePrefix& expected_prefix) {
             return storage.Write(batch, expected_prefix);
         });
     writer.Start();
 
-    auto reservation = writer.ReserveBatch(2);
+    auto reservation = writer.ReserveBatch(2, /*allow_oversized_group=*/true);
     ASSERT_TRUE(reservation.has_value());
     std::atomic<size_t> callbacks{0};
     std::vector<OpLogEntry> entries;
@@ -1818,8 +1862,16 @@ TEST(OrderedOpLogWriterAdmissionTest, ReserveBatchEnforcesAdmissionCap) {
     auto no_room = writer.ReserveBatch(2);
     ASSERT_FALSE(no_room.has_value());
     EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, no_room.error());
+    auto busy_recovery = writer.ReserveBatch(3, true);
+    ASSERT_FALSE(busy_recovery.has_value());
+    EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, busy_recovery.error());
 
     writer.Abort(std::move(*first));
+    auto recovery = writer.ReserveBatch(3, true);
+    ASSERT_TRUE(recovery.has_value());
+    EXPECT_FALSE(writer.Reserve().has_value());
+    EXPECT_FALSE(writer.ReserveBatch(3, true).has_value());
+    writer.Abort(std::move(*recovery));
     auto reservation = writer.ReserveBatch(2);
     ASSERT_TRUE(reservation.has_value());
     writer.Abort(std::move(*reservation));

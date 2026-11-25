@@ -53,6 +53,8 @@ class TransferExecutorBase {
         std::shared_ptr<TransferMetadata> metadata;
         std::vector<std::string> local_adxl_engine_names;
         std::vector<aclrtContext> local_engine_contexts;
+        std::vector<int32_t> local_engine_device_ids;
+        int32_t base_port = 20000;
         int32_t connect_timeout = 10000;
         int32_t transfer_timeout = 10000;
         bool use_async_transfer = false;
@@ -97,6 +99,16 @@ class TransferExecutorBase {
     static void ParseExecutorEnvIntoInitParams(InitParams& params);
 
    protected:
+    struct IoAdmission {
+        std::vector<std::shared_ptr<Transport::BatchDesc>> owners;
+        std::vector<std::shared_lock<std::shared_mutex>> locks;
+        bool admitted = false;
+    };
+    static bool isIoAdmissionClosed(
+        const std::vector<Transport::Slice*>& slices);
+    static IoAdmission acquireIoAdmission(
+        const std::vector<Transport::Slice*>& slices);
+
     int initEngines();
     void cleanupConnections();
     void finalizeEngines();

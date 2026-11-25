@@ -88,6 +88,10 @@ struct AutoDiscoverConfig {
 
 class TransferEngine {
    public:
+    // Classic TE owns request records after submission, including deferred
+    // cleanup. Version 3 also shares operation cancellation across batches.
+    // Clients must pair these headers with the matching built library.
+    static constexpr uint32_t kDeferredBatchOwnershipVersion = 4;
 #ifdef ENABLE_MULTI_PROTOCOL
     struct RegisteredBuffer {
         void* addr;
@@ -267,9 +271,15 @@ class TransferEngine {
     int unregisterLocalMemoryBatch(const std::vector<void*>& addr_list);
 
     BatchID allocateBatchID(size_t batch_size);
+    // Classic Ascend batches share this admission gate with their operation.
+    // Cancel does not free a handle or acknowledge hardware retirement.
+    BatchID allocateBatchID(size_t batch_size,
+                            std::shared_ptr<TransferCancellation> cancellation);
 
-    // An OK or BatchCleanupDeferred return invalidates batch_id. A deferred
-    // cleanup means in-flight transport work may still own transfer buffers.
+    // An OK or BatchCleanupDeferred return invalidates batch_id. This is a
+    // descriptor-cleanup ownership boundary, not proof of buffer retirement.
+    // In particular an unconfirmed TIMEOUT may outlive software completion;
+    // callers must retain borrowed buffers until a separate safe boundary.
     Status freeBatchID(BatchID batch_id);
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);

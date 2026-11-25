@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -29,6 +30,8 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <utility>
+#include <shared_mutex>
 #include <condition_variable>
 
 #include "mooncake_te_build_config.h"
@@ -39,6 +42,40 @@
 #endif
 
 namespace mooncake {
+
+// Shared across every batch in one application transfer. Cancellation closes
+// future admission, not an already admitted vendor call. Never hold this short
+// control-plane lock over Connect, a slot wait, or a vendor invocation.
+class TransferCancellation final {
+   public:
+    struct Admission {
+        std::unique_lock<std::mutex> lock;
+        bool admitted;
+    };
+
+    using Clock = std::chrono::steady_clock;
+    explicit TransferCancellation(
+        Clock::time_point deadline = Clock::time_point::max())
+        : deadline_(deadline) {}
+
+    Admission acquireAdmission() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return {std::move(lock), !cancelled_ && Clock::now() < deadline_};
+    }
+    void cancel() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cancelled_ = true;
+    }
+    bool isCancelled() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return cancelled_ || Clock::now() >= deadline_;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    bool cancelled_ = false;
+    const Clock::time_point deadline_;
+};
 
 class RdmaEndPoint;
 class TransferMetadata;
@@ -205,6 +242,12 @@ class Transport {
         std::vector<mr_key_t> dest_rkeys;
         bool from_cache;
 
+        // Ascend queued work retains slices independently of the batch. A
+        // revoked batch can disappear while a late callback safely becomes
+        // a no-op. This is metadata lifetime protection, not DMA cancellation.
+        std::shared_ptr<std::atomic<uint32_t>> work_references;
+        std::weak_ptr<BatchDesc> callback_batch_owner;
+
         // Optional resource cleanup invoked exactly once before the slice is
         // deleted or returned to the thread-local cache. The callback must not
         // delete the slice.
@@ -270,6 +313,10 @@ class Transport {
                 void *handle;
                 int64_t start_time;
                 int32_t engine_id;
+                // Software-terminal timeout without a hardware cancellation
+                // proof. Published before the release completion counter;
+                // pollers acquire that counter before reading this flag.
+                bool unsafe_terminal;
             } ascend_direct;
             struct {
                 uint64_t dest_addr;
@@ -294,6 +341,12 @@ class Transport {
             // while this callback still dereferences task/batch state.
             // slice->status is transport-internal, not a terminal channel,
             // so its store may stay outside the pin.
+            auto owner = callback_batch_owner.lock();
+            if (work_references && (!owner || owner->cleanup_expired.load(
+                                                  std::memory_order_acquire))) {
+                status = Slice::SUCCESS;
+                return;
+            }
             CompletionCallbackPin pin(task);
             status = Slice::SUCCESS;
             TransferTask *t = task.load(std::memory_order_acquire);
@@ -307,6 +360,12 @@ class Transport {
         }
 
         void markFailed() {
+            auto owner = callback_batch_owner.lock();
+            if (work_references && (!owner || owner->cleanup_expired.load(
+                                                  std::memory_order_acquire))) {
+                status = Slice::FAILED;
+                return;
+            }
             CompletionCallbackPin pin(task);
             status = Slice::FAILED;
             TransferTask *t = task.load(std::memory_order_acquire);
@@ -463,6 +522,13 @@ class Transport {
         }
 
         void deallocate(Slice *slice) {
+            if (slice->work_references &&
+                slice->work_references->fetch_sub(
+                    1, std::memory_order_acq_rel) != 1) {
+                return;
+            }
+            slice->work_references.reset();
+            slice->callback_batch_owner.reset();
             // Clear before invoking so a cached slice cannot carry a
             // transport-specific cleanup callback into its next use.
             auto cleanup = slice->cleanup_callback;
@@ -551,6 +617,7 @@ class Transport {
         uint64_t pending_batches = 0;
         uint64_t query_error_batches = 0;
         uint64_t oldest_age_ms = 0;
+        uint64_t forced_cleanup_batches = 0;
     };
 
     struct BatchDesc {
@@ -559,6 +626,16 @@ class Transport {
         std::vector<TransferTask> task_list;
         void *context;  // for transport implementers.
         int64_t start_timestamp;
+        std::weak_ptr<BatchDesc> cleanup_owner;
+        std::atomic<bool> cleanup_expired{false};
+        // Close new admission on cleanup handoff. Actual I/O invocations hold
+        // shared access; revocation must acquire exclusive access first.
+        std::atomic<bool> io_admission_closed{false};
+        std::shared_mutex io_admission_mutex;
+        std::shared_ptr<TransferCancellation> cancellation;
+        // Submission must not leave deferred tasks pointing into a caller's
+        // temporary request vector. Keep each submission contiguous/stable.
+        std::vector<std::shared_ptr<std::vector<TransferRequest>>> requests;
 
         // Track batch progress and notifies waiters
         std::atomic<bool> has_failure{false};
@@ -628,6 +705,20 @@ class Transport {
     // tasks, submits, then seals each task after submitTransferTask() has
     // finished constructing its slices.
     virtual bool supportsBatchCompletionCounter() const { return false; }
+
+    static std::shared_ptr<void> retainSlices(
+        const std::vector<Slice *> &slices) {
+        auto owners = std::make_shared<std::vector<std::shared_ptr<Slice>>>();
+        owners->reserve(slices.size());
+        for (auto *slice : slices) {
+            if (!slice->work_references) continue;
+            slice->work_references->fetch_add(1, std::memory_order_relaxed);
+            owners->emplace_back(slice, [](Slice *released) {
+                getSliceCache().deallocate(released);
+            });
+        }
+        return owners;
+    }
 
     /// @brief Get the status of a submitted transfer. This function shall not
     /// be called again after completion.

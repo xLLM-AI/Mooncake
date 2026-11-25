@@ -46,8 +46,10 @@ class AsyncTransferExecutor : public TransferExecutorBase {
         const std::vector<Transport::Slice*>& slice_list) override;
 
    private:
+    friend class AsyncTransferExecutorTestPeer;
     struct QueryBatch {
         std::vector<Transport::Slice*> slices;
+        std::shared_ptr<void> work_owner;
         size_t engine_idx;
         std::string target_adxl_engine_name;
     };

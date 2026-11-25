@@ -38,6 +38,7 @@ constexpr const char* kAutoConnect = "AutoConnect";
 constexpr const char* kEnabled = "1";
 constexpr const char* kDisabled = "0";
 constexpr int32_t kTransferRetryTimes = 2;
+constexpr int kMaxAdxlInitAttempts = 4;
 
 void markSlicesFailed(const std::vector<Transport::Slice*>& slice_list) {
     for (auto* slice : slice_list) {
@@ -181,7 +182,11 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
     }
     char* use_async = std::getenv("ASCEND_USE_ASYNC_TRANSFER");
     if (use_async) {
-        params.use_async_transfer = true;
+        std::string text(use_async);
+        std::transform(text.begin(), text.end(), text.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        params.use_async_transfer =
+            text != "0" && text != "false" && text != "off" && text != "no";
     }
     char* auto_connect = std::getenv("ASCEND_AUTO_CONNECT");
     if (auto_connect) {
@@ -323,31 +328,62 @@ int TransferExecutorBase::initEngines() {
         LOG(INFO) << "Use async transfer";
     }
 
-    const auto& endpoints = local_segment_desc->rank_info.endpoints;
+    auto& endpoints = local_segment_desc->rank_info.endpoints;
     for (size_t idx = 0; idx < endpoints.size(); ++idx) {
-        if (idx >= local_engine_contexts_.size()) {
-            LOG(ERROR) << "Endpoint count exceeds local_engine_contexts size, "
+        if (idx >= local_engine_contexts_.size() ||
+            idx >= params_.local_engine_device_ids.size()) {
+            LOG(ERROR) << "Endpoint count exceeds local engine state, "
                        << "idx: " << idx << ", endpoints: " << endpoints.size()
                        << ", local_engine_contexts: "
-                       << local_engine_contexts_.size();
+                       << local_engine_contexts_.size()
+                       << ", local_engine_device_ids: "
+                       << params_.local_engine_device_ids.size();
             return -1;
         }
         CHECK_ACL(aclrtSetCurrentContext(local_engine_contexts_[idx]));
-        const auto& adxl_engine_name = endpoints[idx];
-        auto engine = std::make_shared<adxl::AdxlEngine>();
-        if (!engine) {
-            return ERR_MEMORY;
+        std::vector<uint16_t> excluded_ports;
+        for (int attempt = 0; attempt < kMaxAdxlInitAttempts; ++attempt) {
+            if (attempt > 0) {
+                // The probe and ADXL's listener bind are separate operations.
+                // Retry with a fresh candidate if another initializer won that
+                // race after the probe released the port.
+                const auto port = FindAdxlListenPort(
+                    params_.base_port, params_.local_engine_device_ids[idx],
+                    excluded_ports);
+                if (port == 0) {
+                    LOG(ERROR) << "Find available port failed for device: "
+                               << params_.local_engine_device_ids[idx];
+                    return -1;
+                }
+                endpoints[idx] = GenAdxlEngineName(
+                    local_segment_desc->rank_info.hostIp, port);
+            }
+            const auto& adxl_engine_name = endpoints[idx];
+            auto engine = std::make_shared<adxl::AdxlEngine>();
+            if (!engine) {
+                return ERR_MEMORY;
+            }
+            auto status = engine->Initialize(adxl_engine_name.c_str(), options);
+            if (status == adxl::SUCCESS) {
+                params_.local_adxl_engine_names.push_back(adxl_engine_name);
+                adxl_engines_.emplace_back(std::move(engine));
+                LOG(INFO) << "Success to initialize adxl engine:"
+                          << adxl_engine_name << ", pid:" << getpid();
+                break;
+            }
+            const auto parsed_name = parseHostNameWithPort(adxl_engine_name);
+            excluded_ports.push_back(static_cast<uint16_t>(parsed_name.second));
+            if (attempt + 1 == kMaxAdxlInitAttempts) {
+                LOG(ERROR) << "Failed to initialize AdxlEngine after "
+                           << kMaxAdxlInitAttempts
+                           << " attempts, status: " << status
+                           << ", errmsg: " << aclGetRecentErrMsg();
+                return -1;
+            }
+            LOG(WARNING) << "ADXL initialization failed for "
+                         << adxl_engine_name << ", status: " << status
+                         << "; retrying with a different listen port";
         }
-        auto status = engine->Initialize(adxl_engine_name.c_str(), options);
-        if (status != adxl::SUCCESS) {
-            LOG(ERROR) << "Failed to initialize AdxlEngine, status: " << status
-                       << ", errmsg: " << aclGetRecentErrMsg();
-            return -1;
-        }
-        params_.local_adxl_engine_names.push_back(adxl_engine_name);
-        adxl_engines_.emplace_back(std::move(engine));
-        LOG(INFO) << "Success to initialize adxl engine:" << adxl_engine_name
-                  << ", pid:" << getpid();
     }
     return 0;
 }
@@ -610,14 +646,20 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
 }
 
 int TransferExecutorBase::deregisterMem(void* addr) {
+    // Cleanup threads may have no context. The registration's engine context
+    // is used for each handle; a missing caller context only skips restoration.
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtGetCurrentContext failed, errmsg: "
-                   << aclGetRecentErrMsg();
-        return -1;
+        LOG_FIRST_N(WARNING, 1)
+            << "No caller ACL context while deregistering memory, errmsg: "
+            << aclGetRecentErrMsg();
+        saved_ctx = nullptr;
     }
-    MAKE_GUARD(ctx_restore,
-               [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
+    MAKE_GUARD(ctx_restore, [saved_ctx]() {
+        if (saved_ctx != nullptr) {
+            (void)aclrtSetCurrentContext(saved_ctx);
+        }
+    });
 
     std::lock_guard<std::mutex> lock(mem_handle_mutex_);
     auto it = addr_to_mem_handles_.find(addr);
@@ -717,6 +759,77 @@ void TransferExecutorBase::processSliceList(
     }
 }
 
+bool TransferExecutorBase::isIoAdmissionClosed(
+    const std::vector<Transport::Slice*>& slices) {
+    return std::any_of(slices.begin(), slices.end(), [](auto* slice) {
+        if (!slice->work_references) return false;
+        auto owner = slice->callback_batch_owner.lock();
+        return !owner ||
+               owner->io_admission_closed.load(std::memory_order_acquire) ||
+               owner->cleanup_expired.load(std::memory_order_acquire) ||
+               (owner->cancellation && owner->cancellation->isCancelled());
+    });
+}
+
+TransferExecutorBase::IoAdmission TransferExecutorBase::acquireIoAdmission(
+    const std::vector<Transport::Slice*>& slices) {
+    IoAdmission admission;
+    admission.owners.reserve(slices.size());
+    for (auto* slice : slices) {
+        if (!slice->work_references) continue;
+        auto owner = slice->callback_batch_owner.lock();
+        if (!owner) return admission;
+        admission.owners.emplace_back(std::move(owner));
+    }
+    // A homogeneous route can contain more than one batch. Use a total lock
+    // order, and lock each batch once, to preserve concurrent route admission.
+    std::sort(admission.owners.begin(), admission.owners.end(),
+              [](const auto& left, const auto& right) {
+                  return std::less<Transport::BatchDesc*>{}(left.get(),
+                                                            right.get());
+              });
+    admission.owners.erase(
+        std::unique(admission.owners.begin(), admission.owners.end()),
+        admission.owners.end());
+    admission.locks.reserve(admission.owners.size());
+    for (const auto& owner : admission.owners) {
+        admission.locks.emplace_back(owner->io_admission_mutex);
+        if (owner->io_admission_closed.load(std::memory_order_acquire) ||
+            owner->cleanup_expired.load(std::memory_order_acquire)) {
+            return admission;
+        }
+    }
+    // Another batch's lock acquisition may have waited past handoff.
+    for (const auto& owner : admission.owners) {
+        if (owner->io_admission_closed.load(std::memory_order_acquire) ||
+            owner->cleanup_expired.load(std::memory_order_acquire)) {
+            return admission;
+        }
+    }
+    // A route may mix batches from different operations. Lock each operation
+    // once in a total order; cancellation and the final admission decision
+    // share these locks. Drop them before any vendor call so cancel stays fast.
+    std::vector<std::shared_ptr<TransferCancellation>> cancellations;
+    for (const auto& owner : admission.owners) {
+        if (owner->cancellation) cancellations.push_back(owner->cancellation);
+    }
+    std::sort(cancellations.begin(), cancellations.end(),
+              [](const auto& left, const auto& right) {
+                  return std::less<TransferCancellation*>{}(left.get(),
+                                                            right.get());
+              });
+    cancellations.erase(std::unique(cancellations.begin(), cancellations.end()),
+                        cancellations.end());
+    std::vector<TransferCancellation::Admission> operation_admissions;
+    operation_admissions.reserve(cancellations.size());
+    for (const auto& cancellation : cancellations) {
+        operation_admissions.push_back(cancellation->acquireAdmission());
+        if (!operation_admissions.back().admitted) return admission;
+    }
+    admission.admitted = true;
+    return admission;
+}
+
 void TransferExecutorBase::processHomogeneousSliceList(
     const std::vector<Transport::Slice*>& slice_list) {
     if (slice_list.empty()) {
@@ -749,7 +862,14 @@ void TransferExecutorBase::processHomogeneousSliceList(
     ExecuteResult result;
     std::string target_adxl_engine_name;
     bool force_update = false;
+    const auto cleanup_expired = [&] {
+        return isIoAdmissionClosed(slice_list);
+    };
     for (int32_t retry = 0; retry < kTransferRetryTimes; ++retry) {
+        if (cleanup_expired()) {
+            markSlicesFailed(slice_list);
+            return;
+        }
         auto target_segment_desc = metadata_->getSegmentDescByID(
             slice_list[0]->target_id, force_update);
         if (!target_segment_desc) {
@@ -780,7 +900,16 @@ void TransferExecutorBase::processHomogeneousSliceList(
             (target_adxl_engine_name == local_engine_name ||
              resolveLocalCopyDestinations(target_segment_desc, slice_list,
                                           local_dest_addrs));
+        if (cleanup_expired()) {
+            markSlicesFailed(slice_list);
+            return;
+        }
         if (need_local_copy && local_copy_engine_) {
+            auto admission = acquireIoAdmission(slice_list);
+            if (!admission.admitted) {
+                markSlicesFailed(slice_list);
+                return;
+            }
             auto start = std::chrono::steady_clock::now();
             local_copy_engine_->Copy(slice_list[0]->opcode, slice_list,
                                      local_dest_addrs);
@@ -806,6 +935,11 @@ void TransferExecutorBase::processHomogeneousSliceList(
         return;
     }
     if (result.status == adxl::TIMEOUT) {
+        // markSlicesFailed publishes this flag through its ACQ_REL completion
+        // counters. This records uncertainty, not a hardware-retirement proof.
+        for (auto* slice : slice_list) {
+            slice->ascend_direct.unsafe_terminal = true;
+        }
         LOG(ERROR) << "Transfer timeout to: " << target_adxl_engine_name
                    << ", errmsg: " << aclGetRecentErrMsg();
     } else {

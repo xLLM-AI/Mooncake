@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -46,6 +47,22 @@ class MultiTransportBatchTestPeer final {
         transport.deferred_cleanup_cv_.notify_one();
     }
 
+    static bool tryRevoke(MultiTransport& transport, Transport::BatchID id) {
+        std::lock_guard<std::mutex> lock(transport.deferred_cleanup_mutex_);
+        return transport.forceFreeBatchID(id, {});
+    }
+
+    static void expire(MultiTransport& transport) {
+        std::lock_guard<std::mutex> lock(transport.deferred_cleanup_mutex_);
+        for (auto& [id, entry] : transport.deferred_cleanup_batches_) {
+            entry.enqueued_at = std::chrono::steady_clock::now() -
+                                transport.deferred_cleanup_timeout_;
+        }
+        transport.deferred_cleanup_cv_.notify_one();
+    }
+    static int64_t timeoutSeconds(MultiTransport& transport) {
+        return transport.deferred_cleanup_timeout_.count();
+    }
     static bool pending(MultiTransport& transport, Transport::BatchID id) {
         std::lock_guard<std::mutex> lock(transport.deferred_cleanup_mutex_);
         return transport.deferred_cleanup_batches_.count(id) != 0;
@@ -190,45 +207,103 @@ void expect_reclaimed(MultiTransport& transport, const Batch& batch,
     EXPECT_TRUE(counts.hook_before_slice.load());
 }
 
-TEST(DeferredBatchCleanupTest, InitialQueryErrorDoesNotTransferOwnership) {
+TEST(DeferredBatchCleanupTest,
+     CancelledOperationCannotAllocateOrSubmitNewBatch) {
+    std::string name = "operation-cancel";
+    MultiTransport transport(nullptr, name);
+    auto cancellation = std::make_shared<TransferCancellation>();
+    const auto id = transport.allocateBatchID(1, cancellation);
+    ASSERT_NE(id, static_cast<Transport::BatchID>(-1));
+    EXPECT_EQ(Transport::toBatchDesc(id).cancellation, cancellation);
+    cancellation->cancel();
+    EXPECT_FALSE(transport.submitTransfer(id, {}).ok());
+    EXPECT_TRUE(transport.freeBatchID(id).ok());
+    // No BatchID is captured by cancel: old descriptor deletion cannot close
+    // another operation, even if the allocator recycles its address.
+    cancellation->cancel();
+    EXPECT_EQ(transport.allocateBatchID(1, cancellation),
+              static_cast<Transport::BatchID>(-1));
+    auto next = std::make_shared<TransferCancellation>();
+    const auto next_id = transport.allocateBatchID(1, next);
+    ASSERT_NE(next_id, static_cast<Transport::BatchID>(-1));
+    EXPECT_TRUE(transport.submitTransfer(next_id, {}).ok());
+    EXPECT_TRUE(transport.freeBatchID(next_id).ok());
+}
+
+TEST(DeferredBatchCleanupTest, InitialQueryErrorTransfersCleanupOwnership) {
     std::string name = "initial-query-error";
     ControlledTransport backend;
     CleanupCounts counts;
     MultiTransport transport(nullptr, name);
     auto batch = make_batch(transport, backend, counts);
     backend.error = QueryError::Context;
-    EXPECT_TRUE(
-        Peer::free(transport, batch.id, [&] { ++counts.deleted; }).IsContext());
-    EXPECT_FALSE(Peer::pending(transport, batch.id));
-    EXPECT_EQ(counts.deleted.load(), 0);
+    EXPECT_TRUE(Peer::free(transport, batch.id, [&] {
+                    ++counts.deleted;
+                }).IsBatchCleanupDeferred());
+    EXPECT_TRUE(Peer::pending(transport, batch.id));
     batch.slices.front()->markFailed();
     backend.error = QueryError::None;
-    EXPECT_TRUE(
-        Peer::free(transport, batch.id, [&] { ++counts.deleted; }).ok());
-    EXPECT_EQ(counts.deleted.load(), 1);
-    EXPECT_EQ(counts.slices.load(), 1);
+    expect_reclaimed(transport, batch, counts);
 }
 
-TEST(DeferredBatchCleanupTest, EmptyTaskKeepsInitialQueryErrorCallerOwned) {
-    std::string name = "empty-task-before-query-error";
+TEST(DeferredBatchCleanupTest, ExpiryRevokesBatchBeforeLateCallback) {
+    std::string name = "forced-cleanup";
     ControlledTransport backend;
+    backend.counter_completion = false;
     CleanupCounts counts;
     MultiTransport transport(nullptr, name);
     auto batch = make_batch(transport, backend, counts, 2);
-    batch.desc->task_list.front().slice_count = 0;
+    for (auto* slice : batch.slices) {
+        slice->callback_batch_owner = batch.desc->cleanup_owner;
+        slice->work_references = std::make_shared<std::atomic<uint32_t>>(1);
+    }
+    auto work_owner = Transport::retainSlices(batch.slices);
     backend.error = QueryError::Context;
-    EXPECT_TRUE(
-        Peer::free(transport, batch.id, [&] { ++counts.deleted; }).IsContext());
-    EXPECT_TRUE(__atomic_load_n(&batch.desc->task_list.front().is_finished,
-                                __ATOMIC_ACQUIRE));
-    EXPECT_FALSE(Peer::pending(transport, batch.id));
+    ASSERT_TRUE(Peer::free(transport, batch.id, [&] {
+                    ++counts.deleted;
+                }).IsBatchCleanupDeferred());
+    EXPECT_TRUE(Peer::pending(transport, batch.id));
     EXPECT_EQ(counts.deleted.load(), 0);
-    batch.slices.back()->markFailed();
-    backend.error = QueryError::None;
-    EXPECT_TRUE(
-        Peer::free(transport, batch.id, [&] { ++counts.deleted; }).ok());
+    // Model an SDK invocation that already passed its admission point.
+    auto admitted_owner = batch.desc->cleanup_owner.lock();
+    std::shared_lock<std::shared_mutex> invocation(
+        admitted_owner->io_admission_mutex);
+    EXPECT_FALSE(Peer::tryRevoke(transport, batch.id));
+    EXPECT_EQ(counts.deleted.load(), 0);
+    EXPECT_EQ(transport.getDeferredCleanupStats().forced_cleanup_batches, 0);
+    invocation.unlock();
+    admitted_owner.reset();
+    Peer::expire(transport);
+    ASSERT_TRUE(
+        wait_until([&] { return !Peer::pending(transport, batch.id); }));
     EXPECT_EQ(counts.deleted.load(), 1);
+    EXPECT_EQ(counts.slices.load(), 0);  // Live jobs still own their slices.
+    EXPECT_EQ(transport.getDeferredCleanupStats().forced_cleanup_batches, 1);
+    batch.slices[0]->markSuccess();
+    batch.slices[1]->markFailed();  // No dereference of the revoked task.
+    work_owner.reset();
     EXPECT_EQ(counts.slices.load(), 2);
+}
+
+TEST(DeferredBatchCleanupTest, ConfigurableExpiryUsesSeconds) {
+    const char* previous = std::getenv("MC_DEFER_CLEANUP_TIMEOUT");
+    const std::string saved = previous ? previous : "";
+    const bool had_previous = previous != nullptr;
+    std::string name = "timeout-config";
+    setenv("MC_DEFER_CLEANUP_TIMEOUT", "7", 1);
+    {
+        MultiTransport transport(nullptr, name);
+        EXPECT_EQ(Peer::timeoutSeconds(transport), 7);
+    }
+    setenv("MC_DEFER_CLEANUP_TIMEOUT", "0", 1);
+    {
+        MultiTransport transport(nullptr, name);
+        EXPECT_EQ(Peer::timeoutSeconds(transport), 120);
+    }
+    if (had_previous)
+        setenv("MC_DEFER_CLEANUP_TIMEOUT", saved.c_str(), 1);
+    else
+        unsetenv("MC_DEFER_CLEANUP_TIMEOUT");
 }
 
 TEST(DeferredBatchCleanupTest, TransientQueryErrorRetainsOwnerAndRecovers) {

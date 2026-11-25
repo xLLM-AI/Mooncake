@@ -28,18 +28,25 @@
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
 #include "transport/ascend_transport/ascend_direct_transport/utils.h"
 #include "ascend_allocator.h"
+#include "transport/ascend_transport/ascend_direct_transport/sync_transfer_executor.h"
+#include "transport/ascend_transport/ascend_direct_transport/async_transfer_executor.h"
 #include "transport/ascend_transport/ascend_direct_transport/adxl_compat.h"
 #include "transfer_metadata.h"
 #include "config.h"
 #include <cstring>
 #include <deque>
+#include <future>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <set>
 #include <string>
+#include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace mooncake;
@@ -54,6 +61,7 @@ constexpr int kTransferStatusMaxRetries = 1000;
 // threads do not clobber the test thread's current device.
 static thread_local int g_device_id = 0;
 static int g_device_count = 1;
+static thread_local bool g_thread_context_bound = true;
 static thread_local aclrtContext g_context =
     reinterpret_cast<aclrtContext>(0x10000);
 static thread_local aclError g_get_device_result = ACL_ERROR_NONE;
@@ -67,6 +75,7 @@ static int g_set_device_call_count = 0;
 static std::set<int> g_set_device_ids;
 static std::map<const void*, aclrtMemLocation> g_memory_locations;
 static std::mutex g_acl_mutex;
+static std::atomic<bool> g_null_recent_error{false};
 // 0 = no size limit; otherwise aclrtMallocPhysical fails when size > threshold.
 static size_t g_malloc_physical_max_success = 0;
 static int g_malloc_physical_call_count = 0;
@@ -87,12 +96,15 @@ int DeviceForContext(aclrtContext context) {
 }
 
 namespace mock_acl {
+void set_thread_context_bound(bool bound) { g_thread_context_bound = bound; }
 void reset() {
     std::lock_guard<std::mutex> lock(g_acl_mutex);
+    g_null_recent_error = false;
     g_device_id = 0;
     g_get_device_result = ACL_ERROR_NONE;
     g_device_count = 1;
     g_context = ContextForDevice(0);
+    g_thread_context_bound = true;
     g_memcpy_result = ACL_ERROR_NONE;
     g_memcpy_async_result = ACL_ERROR_NONE;
     g_memcpy_async_call_count = 0;
@@ -201,11 +213,16 @@ aclError aclrtSetDevice(int deviceId) {
 }
 
 aclError aclrtGetCurrentContext(aclrtContext* context) {
+    if (!g_thread_context_bound) {
+        *context = nullptr;
+        return ACL_ERROR_FAILURE;
+    }
     *context = g_context;
     return ACL_ERROR_NONE;
 }
 
 aclError aclrtSetCurrentContext(aclrtContext context) {
+    g_thread_context_bound = context != nullptr;
     g_context = context;
     const int device_id = DeviceForContext(context);
     if (device_id >= 0) {
@@ -291,7 +308,9 @@ aclError aclrtPointerGetAttributes(const void* ptr,
     return ACL_ERROR_NONE;
 }
 
-const char* aclGetRecentErrMsg() { return "mock acl error message"; }
+const char* aclGetRecentErrMsg() {
+    return g_null_recent_error ? nullptr : "mock acl error message";
+}
 
 aclError aclrtGetPhyDevIdByLogicDevId(int32_t logic_dev_id,
                                       int32_t* physical_dev_id) {
@@ -390,10 +409,13 @@ static adxl::TransferStatus g_transfer_status_enum =
     adxl::TransferStatus::COMPLETED;
 static std::deque<adxl::Status> g_transfer_results;
 static std::deque<adxl::Status> g_transfer_async_results;
+static std::deque<adxl::Status> g_initialize_results;
+static std::vector<std::string> g_initialize_names;
 static std::vector<uintptr_t> g_registered_mem_handles;
 static std::vector<uintptr_t> g_deregistered_mem_handles;
 static std::set<std::string> g_connected;
 static std::mutex g_mutex;
+static std::function<void()> g_connect_hook;
 static bool g_was_initialize_called = false;
 static int g_next_handle = 1;
 static int g_connect_count = 0;
@@ -410,6 +432,10 @@ static int32_t g_get_capability_value = 0;
 static std::map<std::string, std::string> g_last_init_options;
 
 namespace adxl_mock {
+void set_connect_hook(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_connect_hook = std::move(hook);
+}
 void reset() {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_connect_result = adxl::SUCCESS;
@@ -421,9 +447,12 @@ void reset() {
     g_transfer_status_enum = adxl::TransferStatus::COMPLETED;
     g_transfer_results.clear();
     g_transfer_async_results.clear();
+    g_initialize_results.clear();
+    g_initialize_names.clear();
     g_registered_mem_handles.clear();
     g_deregistered_mem_handles.clear();
     g_connected.clear();
+    g_connect_hook = {};
     g_was_initialize_called = false;
     g_next_handle = 1;
     g_connect_count = 0;
@@ -486,6 +515,16 @@ void set_transfer_status_enum(adxl::TransferStatus status) {
 void set_initialize_result(adxl::Status status) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_initialize_result = status;
+}
+
+void set_initialize_sequence(const std::vector<adxl::Status>& statuses) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_initialize_results.assign(statuses.begin(), statuses.end());
+}
+
+std::vector<std::string> get_initialize_names() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_initialize_names;
 }
 
 void set_register_mem_result(adxl::Status status) {
@@ -572,12 +611,18 @@ AdxlEngine::~AdxlEngine() = default;
 Status AdxlEngine::Initialize(
     const AscendString& name,
     const std::map<AscendString, AscendString>& options) {
-    (void)name;
+    std::lock_guard<std::mutex> lock(g_mutex);
     g_was_initialize_called = true;
+    g_initialize_names.emplace_back(name.GetString());
     g_last_init_options.clear();
     for (const auto& kv : options) {
         g_last_init_options[std::string(kv.first.GetString())] =
             std::string(kv.second.GetString());
+    }
+    if (!g_initialize_results.empty()) {
+        auto result = g_initialize_results.front();
+        g_initialize_results.pop_front();
+        return result;
     }
     return g_initialize_result;
 }
@@ -612,12 +657,19 @@ void AdxlEngine::Finalize() {}
 Status AdxlEngine::Connect(const AscendString& remote_engine,
                            int32_t timeout_in_millis) {
     (void)timeout_in_millis;
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_connected.insert(std::string(remote_engine.GetString()));
-    g_last_connect_target = remote_engine.GetString();
-    g_connect_targets.push_back(g_last_connect_target);
-    g_connect_count++;
-    return g_connect_result;
+    std::function<void()> hook;
+    adxl::Status result;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_connected.insert(std::string(remote_engine.GetString()));
+        g_last_connect_target = remote_engine.GetString();
+        g_connect_targets.push_back(g_last_connect_target);
+        g_connect_count++;
+        hook = g_connect_hook;
+        result = g_connect_result;
+    }
+    if (hook) hook();
+    return result;
 }
 
 Status AdxlEngine::Disconnect(const AscendString& remote_engine,
@@ -927,7 +979,8 @@ class AscendDirectTransportTest : public ::testing::Test {
                         << "getTransferStatus failed for task " << task_id;
                     return {false, false, status};
                 }
-                if (status.s == Transport::FAILED) {
+                if (status.s == Transport::FAILED ||
+                    status.s == Transport::TIMEOUT) {
                     return {true, true, status};
                 }
                 if (status.s == Transport::COMPLETED) {
@@ -994,6 +1047,69 @@ TEST_F(AscendDirectTransportTest, Basic_InstallFailsWhenAdxlInitializeFails) {
 
     int ret = transport->install(local_server_name, metadata, topology);
     EXPECT_NE(ret, 0);
+    EXPECT_EQ(adxl_mock::get_initialize_names().size(), 4u);
+}
+
+TEST_F(AscendDirectTransportTest,
+       Basic_InstallRetriesPortCollisionAndPublishesSuccessfulEndpoint) {
+    adxl_mock::set_initialize_sequence(
+        {adxl::FAILED, adxl::FAILED, adxl::SUCCESS});
+
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const auto names = adxl_mock::get_initialize_names();
+    ASSERT_EQ(names.size(), 3u);
+    EXPECT_NE(names[0], names[1]);
+    EXPECT_NE(names[0], names[2]);
+    EXPECT_NE(names[1], names[2]);
+
+    auto local_desc = transport->meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local_desc, nullptr);
+    ASSERT_EQ(local_desc->rank_info.endpoints.size(), 1u);
+    EXPECT_EQ(local_desc->rank_info.endpoints[0], names[2]);
+}
+
+TEST_F(AscendDirectTransportTest,
+       FindAdxlListenPort_DoesNotShareAdjacentDeviceBoundary) {
+    constexpr int kPortsPerDevice = 100;
+    std::vector<int> sockets;
+    int base_port = 0;
+    for (int candidate = 30000; candidate < 50000; candidate += 1000) {
+        bool complete = true;
+        for (int offset = 0; offset < kPortsPerDevice; ++offset) {
+            const int fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (fd < 0) {
+                complete = false;
+                break;
+            }
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_port = htons(candidate + offset);
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&address),
+                     sizeof(address)) != 0) {
+                close(fd);
+                complete = false;
+                break;
+            }
+            sockets.push_back(fd);
+        }
+        if (complete) {
+            base_port = candidate;
+            break;
+        }
+        for (const int fd : sockets) close(fd);
+        sockets.clear();
+    }
+    if (base_port == 0) {
+        FAIL() << "Could not reserve a consecutive test port range";
+    }
+
+    // Device 0 owns [base, base + 100). Leaving base + 100 free must not
+    // let it fall through into device 1's range.
+    const auto selected = FindAdxlListenPort(base_port, 0);
+    for (const int fd : sockets) close(fd);
+    EXPECT_EQ(selected, 0);
 }
 
 TEST_F(AscendDirectTransportTest,
@@ -1356,6 +1472,31 @@ TEST_F(AscendDirectTransportTest, Memory_RegisterAndUnregister) {
                                              "cpu:0", true, true),
               0);
     EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest, AsyncEnvironmentZeroDisablesTransfer) {
+    TransferExecutorBase::InitParams params;
+    unsetenv("ASCEND_USE_ASYNC_TRANSFER");
+    TransferExecutorBase::ParseExecutorEnvIntoInitParams(params);
+    EXPECT_FALSE(params.use_async_transfer);
+    setenv("ASCEND_USE_ASYNC_TRANSFER", "1", 1);
+    TransferExecutorBase::ParseExecutorEnvIntoInitParams(params);
+    EXPECT_TRUE(params.use_async_transfer);
+    setenv("ASCEND_USE_ASYNC_TRANSFER", "0", 1);
+    TransferExecutorBase::ParseExecutorEnvIntoInitParams(params);
+    EXPECT_FALSE(params.use_async_transfer);
+    unsetenv("ASCEND_USE_ASYNC_TRANSFER");
+}
+
+TEST_F(AscendDirectTransportTest, Memory_UnregisterWithoutCallerContext) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    mock_acl::set_thread_context_bound(false);
+    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 1);
 }
 
 TEST_F(AscendDirectTransportTest, Memory_RegisterPassesLocalOnly) {
@@ -1941,6 +2082,35 @@ TEST_F(AscendDirectTransportTest,
     EXPECT_EQ(adxl_mock::get_disconnect_count(), 1);
 }
 
+TEST_F(AscendDirectTransportTest,
+       RemoteTransfer_Sync_TimeoutDoesNotRetryOrPoisonNextSlice) {
+    const RemoteSegmentSetup remote_setup = {1, "127.0.0.1:43002", "127.0.0.1",
+                                             43002};
+    auto remote_metadata = startRemoteMetadataServer(remote_setup);
+    ASSERT_NE(remote_metadata, nullptr);
+    adxl_mock::set_transfer_sequence({adxl::TIMEOUT, adxl::SUCCESS});
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(), remote_setup);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    0x10000, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_TRUE(result.failed);
+    EXPECT_EQ(result.status.s, Transport::TIMEOUT);
+    EXPECT_EQ(adxl_mock::get_transfer_count(), 1);
+
+    // Cached slices must clear the old uncertainty before a fresh submission.
+    adxl_mock::set_transfer_result(adxl::SUCCESS);
+    auto next = runRemoteTransfer(transport.get(), test_buffer_src_, 1, 0x10000,
+                                  kTransferBufSize);
+    ASSERT_TRUE(next.finished);
+    EXPECT_FALSE(next.failed);
+    EXPECT_EQ(next.status.s, Transport::COMPLETED);
+}
+
 TEST_F(AscendDirectTransportTest, RemoteTransfer_Async_Success) {
     adxl_mock::set_transfer_async_result(adxl::SUCCESS);
     adxl_mock::set_get_transfer_status_result(adxl::SUCCESS);
@@ -2044,6 +2214,49 @@ TEST_F(AscendDirectTransportTest,
     ASSERT_TRUE(result.finished);
     EXPECT_TRUE(result.failed)
         << "Transfer should have failed due to GetTransferStatus failure";
+}
+
+TEST_F(AscendDirectTransportTest,
+       RemoteTransfer_Async_GetStatusFailureWithoutAclErrorMessage) {
+    adxl_mock::set_transfer_async_result(adxl::SUCCESS);
+    adxl_mock::set_get_transfer_status_result(adxl::FAILED);
+    g_null_recent_error = true;
+
+    auto transport = createTransport(true);
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(),
+                     {1, "remote_server", "192.168.1.100", 30000});
+    initTestData(kTransferBufSize);
+    const auto result = runRemoteTransfer(
+        transport.get(), test_buffer_src_, 1,
+        reinterpret_cast<uint64_t>(test_buffer_dst_), kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_TRUE(result.failed);
+}
+
+TEST_F(AscendDirectTransportTest,
+       RemoteTransfer_Async_FailedStatusWithoutAclErrorMessage) {
+    adxl_mock::set_transfer_async_result(adxl::SUCCESS);
+    adxl_mock::set_get_transfer_status_result(adxl::SUCCESS);
+    adxl_mock::set_transfer_status_enum(adxl::TransferStatus::FAILED);
+    g_null_recent_error = true;
+
+    auto transport = createTransport(true);
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(),
+                     {1, "remote_server", "192.168.1.100", 30000});
+    initTestData(kTransferBufSize);
+    const auto result = runRemoteTransfer(
+        transport.get(), test_buffer_src_, 1,
+        reinterpret_cast<uint64_t>(test_buffer_dst_), kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_TRUE(result.failed);
 }
 
 TEST_F(AscendDirectTransportTest, RemoteTransfer_Async_TransferTimeout) {
@@ -3060,6 +3273,34 @@ TEST_F(ClientServerModeTest, AcceptZeroBufferPoolInClientServerMode) {
 // Bind the real transport without a remote server; only device resolution
 // fails.
 namespace mooncake {
+class AsyncTransferExecutorTestPeer {
+   public:
+    static void setActiveSlots(AsyncTransferExecutor& executor, size_t count) {
+        std::lock_guard<std::mutex> lock(executor.async_task_mutex_);
+        executor.active_async_tasks_ = count;
+        executor.async_task_cv_.notify_all();
+    }
+    static size_t activeSlots(AsyncTransferExecutor& executor) {
+        std::lock_guard<std::mutex> lock(executor.async_task_mutex_);
+        return executor.active_async_tasks_;
+    }
+};
+
+class MultiTransportTestPeer {
+   public:
+    static void bind(MultiTransport& multi,
+                     std::shared_ptr<Transport> transport) {
+        multi.transport_map_.emplace("ascend", std::move(transport));
+    }
+    static void expire(MultiTransport& multi) {
+        std::lock_guard<std::mutex> lock(multi.deferred_cleanup_mutex_);
+        for (auto& [id, entry] : multi.deferred_cleanup_batches_) {
+            entry.enqueued_at = std::chrono::steady_clock::now() -
+                                multi.deferred_cleanup_timeout_;
+        }
+        multi.deferred_cleanup_cv_.notify_one();
+    }
+};
 class TransferEngineImplTestPeer {
    public:
     static void bindAscend(TransferEngine& engine,
@@ -3087,6 +3328,236 @@ struct RestoreAgentMode {
     ~RestoreAgentMode() { globalConfig().ascend_agent_mode = original; }
 };
 }  // namespace
+
+TEST_F(AscendDirectTransportTest,
+       OperationCancelRejectsQueuedCurrentAndFollowingBatch) {
+    auto bootstrap = createTransport();
+    ASSERT_NE(bootstrap, nullptr);
+    TransferExecutorBase::InitParams params;
+    params.metadata = bootstrap->meta();
+    params.local_engine_device_ids = {0};
+    params.local_adxl_engine_names = {"sync-admission-local"};
+    params.local_engine_contexts = {ContextForDevice(0)};
+    SyncTransferExecutor executor(params);
+    ASSERT_EQ(executor.initialize(), 0);
+    auto owner = std::make_shared<Transport::BatchDesc>();
+    auto cancellation = std::make_shared<TransferCancellation>();
+    owner->cancellation = cancellation;
+    Transport::TransferTask task{}, following_task{};
+    task.slice_count = 1;
+    following_task.slice_count = 1;
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.source_addr = test_buffer_src_;
+    slice.ascend_direct.dest_addr =
+        reinterpret_cast<uint64_t>(test_buffer_dst_);
+    slice.length = kTransferBufSize;
+    slice.work_references = std::make_shared<std::atomic<uint32_t>>(1);
+    slice.callback_batch_owner = owner;
+    std::promise<void> entered, resume;
+    auto entered_future = entered.get_future();
+    auto resume_future = resume.get_future().share();
+    adxl_mock::set_connect_hook([&] {
+        entered.set_value();
+        resume_future.wait();
+    });
+    auto result = std::async(std::launch::async, [&] {
+        return executor.execute(0, "sync-admission-remote", adxl::WRITE,
+                                {&slice});
+    });
+    EXPECT_EQ(entered_future.wait_for(std::chrono::seconds(3)),
+              std::future_status::ready);
+    // Must return while Connect is still blocked; no vendor lock is held by
+    // the operation gate. Closing it also covers batches created earlier.
+    cancellation->cancel();
+    resume.set_value();
+    EXPECT_NE(result.get().ret, 0);
+    EXPECT_EQ(adxl_mock::get_transfer_count(), 0);
+    adxl_mock::set_connect_hook({});
+    auto following = std::make_shared<Transport::BatchDesc>();
+    following->cancellation = cancellation;
+    slice.callback_batch_owner = following;
+    slice.task = &following_task;
+    slice.status = Transport::Slice::PENDING;
+    EXPECT_NE(
+        executor.execute(0, "sync-admission-remote", adxl::WRITE, {&slice}).ret,
+        0);
+    EXPECT_EQ(adxl_mock::get_transfer_count(), 0);
+}
+
+TEST_F(AscendDirectTransportTest,
+       SyncAdmissionRejectsExpiredReadGrantDuringConnect) {
+    auto bootstrap = createTransport();
+    ASSERT_NE(bootstrap, nullptr);
+    TransferExecutorBase::InitParams params;
+    params.metadata = bootstrap->meta();
+    params.local_engine_device_ids = {0};
+    params.local_adxl_engine_names = {"leased-admission-local"};
+    params.local_engine_contexts = {ContextForDevice(0)};
+    SyncTransferExecutor executor(params);
+    ASSERT_EQ(executor.initialize(), 0);
+    auto owner = std::make_shared<Transport::BatchDesc>();
+    owner->cancellation = std::make_shared<TransferCancellation>(
+        TransferCancellation::Clock::now() + std::chrono::milliseconds(200));
+    Transport::Slice slice{};
+    slice.source_addr = test_buffer_src_;
+    slice.ascend_direct.dest_addr =
+        reinterpret_cast<uint64_t>(test_buffer_dst_);
+    slice.length = kTransferBufSize;
+    slice.work_references = std::make_shared<std::atomic<uint32_t>>(1);
+    slice.callback_batch_owner = owner;
+    bool connected = false;
+    adxl_mock::set_connect_hook([&] {
+        connected = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    });
+    const auto calls = adxl_mock::get_transfer_count();
+    EXPECT_NE(
+        executor.execute(0, "leased-admission-remote", adxl::READ, {&slice})
+            .ret,
+        0);
+    EXPECT_TRUE(connected);
+    EXPECT_EQ(adxl_mock::get_transfer_count(), calls);
+}
+
+TEST_F(AscendDirectTransportTest, SyncAdmissionRejectsRevocationDuringConnect) {
+    auto bootstrap = createTransport();
+    ASSERT_NE(bootstrap, nullptr);
+    TransferExecutorBase::InitParams params;
+    params.metadata = bootstrap->meta();
+    params.local_engine_device_ids = {0};
+    params.local_adxl_engine_names = {"sync-admission-local"};
+    params.local_engine_contexts = {ContextForDevice(0)};
+    SyncTransferExecutor executor(params);
+    ASSERT_EQ(executor.initialize(), 0);
+    auto owner = std::make_shared<Transport::BatchDesc>();
+    Transport::Slice slice{};
+    slice.source_addr = test_buffer_src_;
+    slice.ascend_direct.dest_addr =
+        reinterpret_cast<uint64_t>(test_buffer_dst_);
+    slice.length = kTransferBufSize;
+    slice.work_references = std::make_shared<std::atomic<uint32_t>>(1);
+    slice.callback_batch_owner = owner;
+    std::promise<void> entered, resume;
+    auto entered_future = entered.get_future();
+    auto resume_future = resume.get_future().share();
+    adxl_mock::set_connect_hook([&] {
+        entered.set_value();
+        resume_future.wait();
+    });
+    auto result = std::async(std::launch::async, [&] {
+        return executor.execute(0, "sync-admission-remote", adxl::WRITE,
+                                {&slice});
+    });
+    EXPECT_EQ(entered_future.wait_for(std::chrono::seconds(3)),
+              std::future_status::ready);
+    {
+        std::unique_lock<std::shared_mutex> lock(owner->io_admission_mutex);
+        owner->io_admission_closed = true;
+        owner->cleanup_expired = true;
+    }
+    owner.reset();
+    resume.set_value();
+    EXPECT_NE(result.get().ret, 0);
+    EXPECT_EQ(adxl_mock::get_transfer_count(), 0);
+    adxl_mock::set_connect_hook({});
+}
+
+TEST_F(AscendDirectTransportTest,
+       AsyncSlotWaitRejectsRevocationWithoutLeakingCapacity) {
+    auto bootstrap = createTransport();
+    ASSERT_NE(bootstrap, nullptr);
+    TransferExecutorBase::InitParams params;
+    params.metadata = bootstrap->meta();
+    params.local_engine_device_ids = {0};
+    params.local_adxl_engine_names = {"async-admission-local"};
+    params.local_engine_contexts = {ContextForDevice(0)};
+    AsyncTransferExecutor executor(params);
+    ASSERT_EQ(executor.initialize(), 0);
+    AsyncTransferExecutorTestPeer::setActiveSlots(executor, 100);
+    auto owner = std::make_shared<Transport::BatchDesc>();
+    Transport::Slice slice{};
+    slice.source_addr = test_buffer_src_;
+    slice.ascend_direct.dest_addr =
+        reinterpret_cast<uint64_t>(test_buffer_dst_);
+    slice.length = kTransferBufSize;
+    slice.work_references = std::make_shared<std::atomic<uint32_t>>(1);
+    slice.callback_batch_owner = owner;
+    std::promise<void> connected;
+    auto connected_future = connected.get_future();
+    adxl_mock::set_connect_hook([&] { connected.set_value(); });
+    // If the old executor incorrectly calls ADXL, do not enqueue a query of
+    // this test-owned slice; the call counter still detects the regression.
+    adxl_mock::set_transfer_async_result(adxl::FAILED);
+    auto result = std::async(std::launch::async, [&] {
+        return executor.execute(0, "async-admission-remote", adxl::WRITE,
+                                {&slice});
+    });
+    EXPECT_EQ(connected_future.wait_for(std::chrono::seconds(3)),
+              std::future_status::ready);
+    EXPECT_EQ(result.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    {
+        std::unique_lock<std::shared_mutex> lock(owner->io_admission_mutex);
+        owner->io_admission_closed = true;
+        owner->cleanup_expired = true;
+    }
+    owner.reset();
+    AsyncTransferExecutorTestPeer::setActiveSlots(executor, 99);
+    EXPECT_NE(result.get().ret, 0);
+    EXPECT_EQ(adxl_mock::get_transfer_async_count(), 0);
+    EXPECT_EQ(AsyncTransferExecutorTestPeer::activeSlots(executor), 99);
+    AsyncTransferExecutorTestPeer::setActiveSlots(executor, 0);
+    adxl_mock::set_connect_hook({});
+}
+
+TEST_F(AscendDirectTransportTest, DeferredExpirySurvivesLateAsyncCompletion) {
+    setenv("ASCEND_TRANSFER_TIMEOUT", "10000", 1);
+    adxl_mock::set_transfer_async_result(adxl::SUCCESS);
+    adxl_mock::set_get_transfer_status_result(adxl::SUCCESS);
+    adxl_mock::set_transfer_status_enum(adxl::TransferStatus::WAITING);
+    std::shared_ptr<AscendDirectTransport> transport(createTransport(true));
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    addRemoteSegment(transport->meta(),
+                     {1, "remote_server", "192.168.1.100", 30000});
+    std::string name = "deferred-async-expiry";
+    MultiTransport multi(transport->meta(), name);
+    MultiTransportTestPeer::bind(multi, transport);
+    auto id = multi.allocateBatchID(1);
+    std::weak_ptr<Transport::BatchDesc> owner =
+        Transport::toBatchDesc(id).cleanup_owner;
+    {
+        std::vector<Transport::TransferRequest> entries(1);
+        entries[0].opcode = Transport::TransferRequest::WRITE;
+        entries[0].source = test_buffer_src_;
+        entries[0].target_id = 1;
+        entries[0].target_offset = reinterpret_cast<uint64_t>(test_buffer_dst_);
+        entries[0].length = kTransferBufSize;
+        ASSERT_TRUE(multi.submitTransfer(id, entries).ok());
+    }  // SDK owns the submitted request records after this scope.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (adxl_mock::get_transfer_async_count() == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_GT(adxl_mock::get_transfer_async_count(), 0);
+    ASSERT_TRUE(multi.freeBatchID(id).IsBatchCleanupDeferred());
+    MultiTransportTestPeer::expire(multi);
+    while (multi.getDeferredCleanupStats().pending_batches != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(multi.getDeferredCleanupStats().pending_batches, 0);
+    EXPECT_EQ(multi.getDeferredCleanupStats().forced_cleanup_batches, 1);
+    EXPECT_TRUE(owner.expired());
+    adxl_mock::set_transfer_status_enum(adxl::TransferStatus::COMPLETED);
+    // Transport teardown drains the late query callback. Its slice work owner
+    // survives descriptor deletion, and it must not dereference the dead task.
+}
 
 class AscendScatterResolveFailureTest
     : public AscendDirectTransportTest,

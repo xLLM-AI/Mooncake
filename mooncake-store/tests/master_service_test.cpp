@@ -4681,6 +4681,32 @@ TEST_F(MasterServiceTest, StopHttpMetadataCleanupIsNoOpWhenNeverStarted) {
     service.StopHttpMetadataCleanup();
 }
 
+TEST(MasterServiceCleanupPlanTest,
+     TargetedCleanupOmitsOtherDeadMemoryDescriptors) {
+    MasterService service;
+    auto dead_allocator = std::make_shared<OffsetBufferAllocator>(
+        "dead", 0x1000, 4096, "dead-endpoint");
+    auto live_allocator = std::make_shared<OffsetBufferAllocator>(
+        "live", 0x2000, 4096, "live-endpoint");
+    std::vector<Replica> replicas;
+    replicas.reserve(3);
+    replicas.emplace_back(dead_allocator->allocate(8), ReplicaStatus::COMPLETE);
+    replicas.emplace_back(dead_allocator->allocate(8), ReplicaStatus::COMPLETE);
+    replicas.emplace_back(live_allocator->allocate(8), ReplicaStatus::COMPLETE);
+    const ReplicaID targeted_id = replicas[0].id();
+    const ReplicaID live_id = replicas[2].id();
+    dead_allocator.reset();
+    ObjectMetadata metadata(generate_uuid(), std::chrono::system_clock::now(),
+                            8, std::move(replicas));
+    auto remaining =
+        MasterServiceTestPeer(service).RemainingAfterTargetedStaleCleanup(
+            metadata, [targeted_id](const Replica& replica) {
+                return replica.id() == targeted_id;
+            });
+    ASSERT_EQ(remaining.size(), 1u);
+    EXPECT_EQ(remaining.front().id, live_id);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

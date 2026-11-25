@@ -45,6 +45,7 @@ class FakeBatchHaKvBackend : public HaKvBackend {
     }
 
     ErrorCode Get(std::string_view key, std::string& value) override {
+        std::lock_guard<std::mutex> lock(kvs_mutex_);
         auto it = kvs_.find(std::string(key));
         if (it == kvs_.end()) {
             return ErrorCode::ETCD_KEY_NOT_EXIST;
@@ -54,12 +55,14 @@ class FakeBatchHaKvBackend : public HaKvBackend {
     }
 
     ErrorCode Put(std::string_view key, std::string_view value) override {
+        std::lock_guard<std::mutex> lock(kvs_mutex_);
         kvs_[std::string(key)] = std::string(value);
         return ErrorCode::OK;
     }
 
     ErrorCode Range(std::string_view begin_key, std::string_view end_key,
                     size_t limit, std::vector<KvPair>& kvs) override {
+        std::lock_guard<std::mutex> lock(kvs_mutex_);
         kvs.clear();
         for (auto it = kvs_.lower_bound(std::string(begin_key));
              it != kvs_.end() && it->first < end_key; ++it) {
@@ -74,6 +77,7 @@ class FakeBatchHaKvBackend : public HaKvBackend {
     bool SupportsTxn() const override { return true; }
 
     ErrorCode Txn(const KvTxn& txn) override {
+        std::lock_guard<std::mutex> lock(kvs_mutex_);
         for (const auto& compare : txn.compares) {
             auto it = kvs_.find(compare.key);
             if (compare.kind == KvCompareKind::kKeyNotExists) {
@@ -92,6 +96,7 @@ class FakeBatchHaKvBackend : public HaKvBackend {
     }
 
    private:
+    std::mutex kvs_mutex_;
     std::map<std::string, std::string> kvs_;
 };
 
@@ -167,6 +172,58 @@ class FailingBatchHaKvBackend : public FakeBatchHaKvBackend {
     std::condition_variable cv_;
     ErrorCode txn_error_{ErrorCode::OK};
     size_t txn_calls_{0};
+};
+
+// Pause after local mutation but before the writer assigns a sequence number.
+// Reuse the production writer; only this deterministic scheduling boundary is
+// controlled by the test.
+class PausedSegmentMountWriter final : public OrderedOpLogWriter {
+   public:
+    PausedSegmentMountWriter(OrderedOpLogWriterConfig config,
+                             WriteBatchFn write_batch)
+        : OrderedOpLogWriter(std::move(config), std::move(write_batch)) {}
+
+    tl::expected<PendingHandle, ErrorCode> Commit(
+        Reservation&& reservation, OpLogEntry entry,
+        DurableCallback callback) override {
+        PauseMount(entry.op_type);
+        return OrderedOpLogWriter::Commit(
+            std::move(reservation), std::move(entry), std::move(callback));
+    }
+
+    tl::expected<std::vector<PendingHandle>, ErrorCode> CommitBatch(
+        Reservation&& reservation, std::vector<OpLogEntry> entries,
+        DurableCallback callback) override {
+        if (!entries.empty()) PauseMount(entries.front().op_type);
+        return OrderedOpLogWriter::CommitBatch(
+            std::move(reservation), std::move(entries), std::move(callback));
+    }
+
+    bool WaitForMount() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(2),
+                            [this] { return paused_; });
+    }
+
+    void ResumeMount() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+   private:
+    void PauseMount(OpType type) {
+        if (type != OpType::SEGMENT_MOUNT) return;
+        std::unique_lock<std::mutex> lock(mutex_);
+        paused_ = true;
+        cv_.notify_all();
+        cv_.wait(lock, [this] { return released_; });
+    }
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool paused_{false};
+    bool released_{false};
 };
 
 class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
@@ -558,6 +615,27 @@ class MasterServiceHATest : public ::testing::Test {
                 WriteTenantPolicyFile(tenant_quotas))
             .build();
     }
+
+    static MasterServiceConfig BatchOpLogConfig(
+        const std::string& cluster_id,
+        std::optional<uint32_t> max_entries = std::nullopt) {
+        auto builder = MasterServiceConfig::builder();
+        builder.set_enable_ha(true).set_enable_oplog(true).set_cluster_id(
+            cluster_id);
+        if (max_entries) builder.set_oplog_batch_max_entries(*max_entries);
+        return builder.build();
+    }
+
+    static ErrorCode SetBatchOpLogBackend(
+        MasterService& service, const std::shared_ptr<HaKvBackend>& backend) {
+        return MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+            backend);
+    }
+
+    struct ReleaseBlockedBackend {
+        std::shared_ptr<BlockingBatchHaKvBackend> backend;
+        ~ReleaseBlockedBackend() { backend->AllowTxn(); }
+    };
 
     static bool HasOpLogWriter(const MasterService& service) {
         return MasterServiceTestPeer::OrderedOplogWriter(service) != nullptr;
@@ -6078,6 +6156,385 @@ TEST_F(MasterServiceHATest,
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
+}
+
+TEST_F(MasterServiceHATest, ConcurrentMountRetirementPreservesReplayOrder) {
+    // Both first mount and remount must finish enqueueing their MOUNT before
+    // the same endpoint can locally retire and enqueue its UNMOUNT.
+    for (bool remount : {false, true}) {
+        SCOPED_TRACE(remount ? "remount" : "mount");
+        const std::string cluster_id = remount ? "concurrent_remount_retirement"
+                                               : "concurrent_mount_retirement";
+        auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+        auto config = BatchOpLogConfig(cluster_id);
+        MasterService service(config);
+        MasterServiceTestPeer(service).SetBatchOpLogWriterFactoryForTesting(
+            [](OrderedOpLogWriterConfig writer_config,
+               OrderedOpLogWriter::WriteBatchFn write_batch) {
+                return std::make_unique<PausedSegmentMountWriter>(
+                    std::move(writer_config), std::move(write_batch));
+            });
+        ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(service, backend));
+        auto* writer = static_cast<PausedSegmentMountWriter*>(
+            MasterServiceTestPeer::OrderedOplogWriter(service).get());
+        const UUID client = generate_uuid();
+        Segment owner = MakeSegment("concurrent-owner");
+        // ReMountSegment uses the name as its replay endpoint in this branch.
+        owner.te_endpoint = owner.name;
+        auto mounting = std::async(std::launch::async, [&] {
+            return remount ? service.ReMountSegment({owner}, client)
+                           : service.MountSegment(owner, client);
+        });
+        const bool paused = writer->WaitForMount();
+        if (!paused) {
+            writer->ResumeMount();
+            EXPECT_TRUE(mounting.get());
+            FAIL() << "mount did not reach the pre-enqueue scheduling boundary";
+        }
+        std::promise<void> unmount_started;
+        auto unmounting = std::async(std::launch::async, [&] {
+            unmount_started.set_value();
+            return service.UnmountSegment(owner.id, client);
+        });
+        unmount_started.get_future().wait();
+        const auto before_mount_enqueue =
+            unmounting.wait_for(std::chrono::milliseconds(200));
+        // Always unblock the test producer before inspecting either future.
+        writer->ResumeMount();
+        EXPECT_EQ(std::future_status::timeout, before_mount_enqueue);
+        EXPECT_TRUE(mounting.get());
+        ASSERT_TRUE(unmounting.get());
+        std::string name, endpoint;
+        EXPECT_FALSE(
+            MasterServiceTestPeer::SegmentManager(service).GetSegmentBasicInfo(
+                owner.id, name, endpoint));
+
+        OpLogBatchStorage storage(cluster_id, *backend);
+        DurablePrefix prefix;
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            if (storage.ReadDurablePrefix(prefix) == ErrorCode::OK &&
+                prefix.last_seq >= 2)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        ASSERT_EQ(2u, prefix.last_seq);
+        StandbyMetadataStore standby;
+        OpLogApplier applier(&standby, cluster_id);
+        OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+        ASSERT_EQ(ErrorCode::OK, reader.PollOnce(10).error);
+        EXPECT_FALSE(applier.GetSegmentRegistry().HasSegment(owner.te_endpoint))
+            << "a retired endpoint must not be resurrected on standby";
+    }
+}
+
+TEST_F(MasterServiceHATest, FullWriterMustNotLeaveRetiredOwnerInStandby) {
+    // This is not an allocator-overlap test. It reproduces a control-plane
+    // disagreement: the primary retires an owner, but a full writer drops its
+    // SEGMENT_UNMOUNT event. Reusing the logical name then leaves two endpoints
+    // with that name in standby replay, making promotion fail INVALID_PARAMS.
+    const std::string cluster_id = "retired_owner_full_writer";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto config = BatchOpLogConfig(cluster_id, 1);
+    MasterService service(config);
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(service, backend));
+    // ASSERT failures must not strand the writer in the fake transaction and
+    // hang service destruction. Declare this after service so it releases
+    // first.
+    ReleaseBlockedBackend release{backend};
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    const UUID old_client = generate_uuid();
+    Segment old_owner = MakeSegment("owner-with-stable-name");
+    old_owner.te_endpoint = "old-owner-endpoint";
+    ASSERT_TRUE(service.MountSegment(old_owner, old_client));
+    ReadBatchEventually(storage, 1, batch);
+
+    // Hold batch 2 in flight, then occupy the only waiting slot with batch 3.
+    // The unmount below cannot reserve another slot until we release the
+    // backend.
+    backend->BlockTxn();
+    ASSERT_TRUE(service.MountSegment(
+        MakeSegment("inflight-owner",
+                    kDefaultSegmentBase + kDefaultSegmentSize),
+        generate_uuid()));
+    ASSERT_TRUE(backend->WaitForBlockedTxn());
+    ASSERT_TRUE(service.MountSegment(
+        MakeSegment("waiting-owner",
+                    kDefaultSegmentBase + 2 * kDefaultSegmentSize),
+        generate_uuid()));
+
+    const auto retired = service.UnmountSegment(old_owner.id, old_client);
+    // Backpressure may reject an operation before changing primary state.
+    // Success, however, must never mean the corresponding replay event was
+    // lost.
+    if (!retired) {
+        EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, retired.error());
+    }
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 3, batch);
+    if (!retired) {
+        ASSERT_TRUE(service.UnmountSegment(old_owner.id, old_client));
+        ReadBatchEventually(storage, 4, batch);
+    }
+
+    // Model a new owner incarnation: same name, different endpoint and UUID.
+    Segment replacement = MakeSegment(old_owner.name);
+    replacement.te_endpoint = "replacement-owner-endpoint";
+    ASSERT_TRUE(service.MountSegment(replacement, generate_uuid()));
+    ReadBatchEventually(storage, retired ? 4 : 5, batch);
+
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+    ASSERT_EQ(ErrorCode::OK, reader.PollOnce(10).error);
+    const auto& registry = applier.GetSegmentRegistry();
+    EXPECT_FALSE(registry.HasSegment(old_owner.te_endpoint))
+        << "Primary retired the old endpoint, but standby still owns it";
+    EXPECT_TRUE(registry.HasSegment(replacement.te_endpoint));
+
+    // The stale entry is observable as an actual restore failure, not merely a
+    // missing log record: two endpoint-keyed entries compete for one name
+    // alias.
+    MasterService promoted(MasterServiceConfig::builder().build());
+    EXPECT_TRUE(promoted.RestoreFromStandbySnapshot({}, batch.last_seq,
+                                                    registry.GetAllSegments()))
+        << "A successful retirement must not poison standby promotion";
+}
+
+TEST_F(MasterServiceHATest, MountAndRemountRejectBeforeChangingStateWhenFull) {
+    const std::string cluster_id = "mount_admission_before_mutation";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto config = BatchOpLogConfig(cluster_id, 2);
+    MasterService service(config);
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(service, backend));
+    ReleaseBlockedBackend release{backend};
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ASSERT_TRUE(service.MountSegment(MakeSegment("initial"), generate_uuid()));
+    ReadBatchEventually(storage, 1, batch);
+    backend->BlockTxn();
+    ASSERT_TRUE(service.MountSegment(MakeSegment("inflight"), generate_uuid()));
+    ASSERT_TRUE(backend->WaitForBlockedTxn());
+    ASSERT_TRUE(
+        service.MountSegment(MakeSegment("waiting-one"), generate_uuid()));
+
+    // One of two slots is available, but both remount events must be admitted
+    // together. A partial log prefix would leave replay missing a live segment.
+    const UUID remount_client = generate_uuid();
+    const Segment first = MakeSegment("remount-first");
+    const Segment second = MakeSegment("remount-second");
+    auto remounted = service.ReMountSegment({first, second}, remount_client);
+    EXPECT_FALSE(remounted);
+    if (!remounted) {
+        EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, remounted.error());
+    }
+    std::string name, endpoint;
+    auto& manager = MasterServiceTestPeer::SegmentManager(service);
+    EXPECT_FALSE(manager.GetSegmentBasicInfo(first.id, name, endpoint));
+    EXPECT_FALSE(manager.GetSegmentBasicInfo(second.id, name, endpoint));
+
+    ASSERT_TRUE(
+        service.MountSegment(MakeSegment("waiting-two"), generate_uuid()));
+    const Segment mounted = MakeSegment("rejected-mount");
+    const UUID mount_client = generate_uuid();
+    auto result = service.MountSegment(mounted, mount_client);
+    EXPECT_FALSE(result);
+    if (!result) {
+        EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, result.error());
+    }
+    EXPECT_FALSE(manager.GetSegmentBasicInfo(mounted.id, name, endpoint));
+
+    // Rejection left primary state untouched, so normal retries can succeed
+    // after the writer drains. The remount is persisted as a complete group.
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 3, batch);
+    ASSERT_TRUE(service.ReMountSegment({first, second}, remount_client));
+    ReadBatchEventually(storage, 4, batch);
+    EXPECT_EQ(2u, batch.entries.size());
+    ASSERT_TRUE(service.MountSegment(mounted, mount_client));
+    ReadBatchEventually(storage, 5, batch);
+}
+
+TEST_F(MasterServiceHATest, RemountOverBatchCapRecoversAndReplaysWholeClient) {
+    const std::string cluster_id = "remount_two_segments_cap_one";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = BatchOpLogConfig(cluster_id, 1);
+    const UUID client = generate_uuid();
+    const Segment first = MakeSegment("cap-one-first");
+    const Segment second = MakeSegment(
+        "cap-one-second", kDefaultSegmentBase + kDefaultSegmentSize);
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    MasterService original(config);
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(original, backend));
+    // Two individually legal mounts must remain recoverable with the same cap.
+    ASSERT_TRUE(original.MountSegment(first, client));
+    ReadBatchEventually(storage, 1, batch);
+    ASSERT_TRUE(original.MountSegment(second, client));
+    ReadBatchEventually(storage, 2, batch);
+    original.StopBatchOpLogWriter();
+
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+    ASSERT_EQ(ErrorCode::OK, reader.PollOnce(10).error);
+    MasterService recovered(config);
+    ASSERT_TRUE(recovered.RestoreFromStandbySnapshot(
+        {}, batch.last_seq, applier.GetSegmentRegistry().GetAllSegments()));
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(recovered, backend));
+    ASSERT_TRUE(recovered.ReMountSegment({first, second}, client));
+    ReadBatchEventually(storage, 3, batch);
+    ASSERT_EQ(2u, batch.entries.size());
+    EXPECT_EQ(3u, batch.first_seq);
+    EXPECT_EQ(4u, batch.last_seq);
+    EXPECT_TRUE(recovered.getAliveClientsSnapshot().contains(client));
+    recovered.StopBatchOpLogWriter();
+    const auto replayed = reader.PollOnce(10);
+    ASSERT_EQ(ErrorCode::OK, replayed.error);
+    EXPECT_EQ(2u, replayed.applied_entries);
+    EXPECT_TRUE(applier.GetSegmentRegistry().HasSegment(first.te_endpoint));
+    EXPECT_TRUE(applier.GetSegmentRegistry().HasSegment(second.te_endpoint));
+}
+
+TEST_F(MasterServiceHATest, InvalidMountLogEntryLeavesNoSegmentOrClient) {
+    const std::string cluster_id = "invalid_mount_log_entry";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(BatchOpLogConfig(cluster_id));
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(service, backend));
+    Segment segment = MakeSegment("invalid-mount-log-entry");
+    const UUID client = generate_uuid();
+    // Reserve succeeds, but Commit rejects a key over the writer's size limit.
+    // Validating after MountSegment would leave an installed segment despite
+    // returning INVALID_PARAMS; its idempotent retry would skip the log.
+    segment.te_endpoint = std::string(kMaxOpLogObjectKeySize + 1, 'x');
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const auto result = service.MountSegment(segment, client);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+        std::string name, endpoint;
+        EXPECT_FALSE(
+            MasterServiceTestPeer::SegmentManager(service).GetSegmentBasicInfo(
+                segment.id, name, endpoint));
+        EXPECT_FALSE(
+            MasterServiceTestPeer::ClientLivenessRecords(service).contains(
+                client));
+    }
+    // The limit itself is legal. Correcting the request must mount and log it,
+    // rather than finding state left behind by the rejected request.
+    segment.te_endpoint.resize(kMaxOpLogObjectKeySize);
+    ASSERT_TRUE(service.MountSegment(segment, client));
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::SEGMENT_MOUNT, batch.entries.front().op_type);
+    EXPECT_EQ(segment.te_endpoint, batch.entries.front().object_key);
+}
+
+TEST_F(MasterServiceHATest,
+       RemountTransactionBudgetRejectsBeforePrimaryMutation) {
+    class BoundedBackend : public FakeBatchHaKvBackend {
+       public:
+        size_t transactionByteLimit() const override { return 4096; }
+    };
+    const std::string cluster = "remount-byte-budget";
+    auto backend = std::make_shared<BoundedBackend>();
+    MasterService service(BatchOpLogConfig(cluster, 1));
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(service, backend));
+    const UUID client = generate_uuid();
+    Segment first = MakeSegment(std::string(400, 'a'));
+    Segment second = MakeSegment(std::string(400, 'b'),
+                                 kDefaultSegmentBase + kDefaultSegmentSize);
+    OpLogBatchStorage storage(cluster, *backend);
+    auto prepare = [](const Segment& segment) {
+        SegmentMountOp op{segment.name, segment.te_endpoint, segment.size,
+                          true};
+        auto bytes = struct_pack::serialize(op);
+        OpLogEntry entry;
+        entry.op_type = OpType::SEGMENT_MOUNT;
+        entry.tenant_id = "default";
+        entry.object_key = segment.name;
+        entry.payload.assign(bytes.begin(), bytes.end());
+        return entry;
+    };
+    ASSERT_TRUE(storage.CanWriteEntries({prepare(first)}));
+    ASSERT_TRUE(storage.CanWriteEntries({prepare(second)}));
+    ASSERT_FALSE(storage.CanWriteEntries({prepare(first), prepare(second)}));
+    auto result = service.ReMountSegment({first, second}, client);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    std::string name, endpoint;
+    auto& manager = MasterServiceTestPeer::SegmentManager(service);
+    EXPECT_FALSE(manager.GetSegmentBasicInfo(first.id, name, endpoint));
+    EXPECT_FALSE(manager.GetSegmentBasicInfo(second.id, name, endpoint));
+    EXPECT_FALSE(
+        MasterServiceTestPeer::ClientLivenessRecords(service).contains(client));
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(prefix.last_seq, 0u);
+    // Correcting size keeps count-cap bypass and atomic group recovery valid.
+    first.name = first.te_endpoint = "first";
+    second.name = second.te_endpoint = "second";
+    ASSERT_TRUE(service.ReMountSegment({first, second}, client));
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    EXPECT_EQ(batch.entries.size(), 2u);
+}
+
+TEST_F(MasterServiceHATest, InvalidRemountLogEntryRejectsTheWholeGroup) {
+    const std::string cluster_id = "invalid_remount_log_entry";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(BatchOpLogConfig(cluster_id));
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(service, backend));
+    const Segment first = MakeSegment("valid-remount-log-entry");
+    Segment second = MakeSegment("invalid-remount-log-entry",
+                                 kDefaultSegmentBase + kDefaultSegmentSize);
+    second.name = std::string(kMaxOpLogObjectKeySize + 1, 'x');
+    const UUID client = generate_uuid();
+    // CommitBatch validates every entry before enqueueing any. The primary
+    // must do the same before rebinding allocators or marking the client OK.
+    const auto result = service.ReMountSegment({first, second}, client);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    std::string name, endpoint;
+    auto& manager = MasterServiceTestPeer::SegmentManager(service);
+    EXPECT_FALSE(manager.GetSegmentBasicInfo(first.id, name, endpoint));
+    EXPECT_FALSE(manager.GetSegmentBasicInfo(second.id, name, endpoint));
+    EXPECT_FALSE(
+        MasterServiceTestPeer::ClientLivenessRecords(service).contains(client));
+    second.name.resize(kMaxOpLogObjectKeySize);
+    ASSERT_TRUE(service.ReMountSegment({first, second}, client));
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    ASSERT_EQ(2u, batch.entries.size());
+    EXPECT_EQ(first.name, batch.entries[0].object_key);
+    EXPECT_EQ(second.name, batch.entries[1].object_key);
+}
+
+TEST_F(MasterServiceHATest, InvalidUnmountLogEntryKeepsTheAllocatorLive) {
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(BatchOpLogConfig("invalid_unmount_log_entry"));
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(service, backend));
+    Segment segment = MakeSegment("invalid-unmount-log-entry");
+    segment.te_endpoint = std::string(kMaxOpLogObjectKeySize + 1, 'x');
+    const UUID client = generate_uuid();
+    auto& manager = MasterServiceTestPeer::SegmentManager(service);
+    {
+        // Seed the registry directly to represent state admitted by an older
+        // master that did not validate its mount record before installing it.
+        auto access = manager.getSegmentAccess();
+        auto session = std::make_shared<ClientLivenessRecord>(
+            ClientLivenessRecord::Clock::now());
+        ASSERT_EQ(ErrorCode::OK, access.MountSegment(segment, client, session));
+    }
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const auto result = service.UnmountSegment(segment.id, client);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+        auto access = manager.getSegmentAccess();
+        EXPECT_NE(nullptr, access.GetAllocator(segment.id));
+    }
 }
 
 TEST_F(MasterServiceHATest, SegmentLifecycleWritesBatchRecordOpLogs) {

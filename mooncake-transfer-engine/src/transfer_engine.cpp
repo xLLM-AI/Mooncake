@@ -268,6 +268,11 @@ BatchID TransferEngine::allocateBatchID(size_t batch_size) {
     return impl_->allocateBatchID(batch_size);
 }
 
+BatchID TransferEngine::allocateBatchID(
+    size_t batch_size, std::shared_ptr<TransferCancellation> cancellation) {
+    return impl_->allocateBatchID(batch_size, std::move(cancellation));
+}
+
 Status TransferEngine::freeBatchID(BatchID batch_id) {
     return impl_->freeBatchID(batch_id);
 }
@@ -912,6 +917,12 @@ BatchID TransferEngine::allocateBatchID(size_t batch_size) {
     } else {
         return impl_->allocateBatchID(batch_size);
     }
+}
+
+BatchID TransferEngine::allocateBatchID(
+    size_t batch_size, std::shared_ptr<TransferCancellation> cancellation) {
+    if (use_tent_) return INVALID_BATCH_ID;
+    return impl_->allocateBatchID(batch_size, std::move(cancellation));
 }
 
 Status TransferEngine::freeBatchID(BatchID batch_id) {

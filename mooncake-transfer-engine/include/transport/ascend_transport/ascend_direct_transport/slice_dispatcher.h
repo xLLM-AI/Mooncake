@@ -100,6 +100,7 @@ class RoceDummyRealSliceDispatcher : public ISliceDispatcher {
 
     struct SliceTask {
         std::vector<Transport::Slice*> slices;
+        std::shared_ptr<void> work_owner;
     };
     size_t num_engines_;
     std::vector<aclrtContext> local_engine_contexts_;

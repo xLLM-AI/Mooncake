@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cstdlib>
+#include <limits>
+#include <stdexcept>
 #include <string_view>
 
 #include <glog/logging.h>
@@ -66,6 +69,22 @@ bool TryParseProducerView(std::string_view value,
     return true;
 }
 
+size_t ConfiguredTransactionBytes() {
+    // Matches the default etcd max-request-bytes. Operators changing that
+    // limit must configure this budget too; Redis can use a larger budget.
+    size_t limit = 1536 * 1024;
+    if (const char* value = std::getenv("MC_HA_MAX_TXN_BYTES")) {
+        const std::string_view text(value);
+        const auto parsed =
+            std::from_chars(text.data(), text.data() + text.size(), limit);
+        if (parsed.ec != std::errc() ||
+            parsed.ptr != text.data() + text.size() || limit == 0)
+            throw std::invalid_argument(
+                "MC_HA_MAX_TXN_BYTES must be positive bytes");
+    }
+    return limit;
+}
+
 bool IsAmbiguousTxnError(ErrorCode error) {
     return error == ErrorCode::ETCD_OPERATION_ERROR;
 }
@@ -74,9 +93,52 @@ bool IsAmbiguousTxnError(ErrorCode error) {
 
 OpLogBatchStorage::OpLogBatchStorage(std::string cluster_id,
                                      HaKvBackend& backend)
-    : cluster_id_(std::move(cluster_id)), backend_(backend) {
+    : cluster_id_(std::move(cluster_id)),
+      backend_(backend),
+      transaction_byte_limit_(std::min(ConfiguredTransactionBytes(),
+                                       backend.transactionByteLimit())) {
     cluster_id_valid_ =
         NormalizeAndValidateClusterId(cluster_id_) && !cluster_id_.empty();
+}
+
+size_t OpLogBatchStorage::TransactionEnvelopeBytes() const {
+    OpLogBatchRecord header;
+    header.batch_id = header.first_seq = header.last_seq = UINT64_MAX;
+    // 128 per op and 256 overall bound nested protobuf tags/varints.
+    // 16 pads checksum digit-width variation; payload/entry costs are separate.
+    return EncodeOpLogBatchRecord(header).size() + 16 + 256 + 4 * 128 +
+           BuildBatchRecordKey(cluster_id_, UINT64_MAX).size() +
+           3 * BuildDurablePrefixKey(cluster_id_).size() +
+           BuildProducerViewKey(cluster_id_).size() +
+           2 * EncodeDurablePrefix({UINT64_MAX, UINT64_MAX}).size() + 20;
+}
+
+size_t OpLogBatchStorage::EntryBytesUpperBound(const OpLogEntry& entry) const {
+    if (!ValidateOpLogBatchEntry(entry))
+        return std::numeric_limits<size_t>::max();
+    OpLogBatchRecord bound;
+    bound.batch_id = bound.first_seq = bound.last_seq = UINT64_MAX;
+    const size_t empty_header = EncodeOpLogBatchRecord(bound).size();
+    bound.entries = {entry};
+    auto& worst = bound.entries.front();
+    worst.sequence_id = worst.timestamp_ms = UINT64_MAX;
+    worst.checksum = worst.prefix_hash = UINT32_MAX;
+    // Remove the single-record envelope so it is charged once per batch,
+    // not once per entry. Include the comma and checksum-width variation.
+    return EncodeOpLogBatchRecord(bound).size() - empty_header + 17;
+}
+
+bool OpLogBatchStorage::CanWriteEntries(
+    const std::vector<OpLogEntry>& entries) const {
+    const size_t envelope = TransactionEnvelopeBytes();
+    if (entries.empty() || envelope > transaction_byte_limit_) return false;
+    size_t remaining = transaction_byte_limit_ - envelope;
+    for (const auto& entry : entries) {
+        const size_t bytes = EntryBytesUpperBound(entry);
+        if (bytes > remaining) return false;
+        remaining -= bytes;
+    }
+    return true;
 }
 
 ErrorCode OpLogBatchStorage::InitDurablePrefix(DurablePrefix& prefix) {
@@ -346,6 +408,7 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefixImpl(
         return ErrorCode::INVALID_PARAMS;
     }
     std::string reason;
+    if (!CanWriteEntries(batch.entries)) return ErrorCode::INVALID_PARAMS;
     if (!ValidateOpLogBatchRecordShape(batch, &reason)) {
         LOG(ERROR) << "Invalid OpLog batch record: " << reason;
         return ErrorCode::INVALID_PARAMS;

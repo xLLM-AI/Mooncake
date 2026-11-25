@@ -219,6 +219,12 @@ class TransferEngineImpl {
         return multi_transports_->allocateBatchID(batch_size);
     }
 
+    BatchID allocateBatchID(
+        size_t batch_size, std::shared_ptr<TransferCancellation> cancellation) {
+        return multi_transports_->allocateBatchID(batch_size,
+                                                  std::move(cancellation));
+    }
+
     Status freeBatchID(BatchID batch_id) {
         return multi_transports_->freeBatchID(batch_id, [this, batch_id] {
             // BatchID is pointer-derived. Remove side-table state before the
