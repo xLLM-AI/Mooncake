@@ -6431,6 +6431,56 @@ TEST_F(MasterServiceHATest, InvalidMountLogEntryLeavesNoSegmentOrClient) {
     EXPECT_EQ(segment.te_endpoint, batch.entries.front().object_key);
 }
 
+TEST_F(MasterServiceHATest,
+       RemountTransactionBudgetRejectsBeforePrimaryMutation) {
+    class BoundedBackend : public FakeBatchHaKvBackend {
+       public:
+        size_t transactionByteLimit() const override { return 4096; }
+    };
+    const std::string cluster = "remount-byte-budget";
+    auto backend = std::make_shared<BoundedBackend>();
+    MasterService service(BatchOpLogConfig(cluster, 1));
+    ASSERT_EQ(ErrorCode::OK, SetBatchOpLogBackend(service, backend));
+    const UUID client = generate_uuid();
+    Segment first = MakeSegment(std::string(400, 'a'));
+    Segment second = MakeSegment(std::string(400, 'b'),
+                                 kDefaultSegmentBase + kDefaultSegmentSize);
+    OpLogBatchStorage storage(cluster, *backend);
+    auto prepare = [](const Segment& segment) {
+        SegmentMountOp op{segment.name, segment.te_endpoint, segment.size,
+                          true};
+        auto bytes = struct_pack::serialize(op);
+        OpLogEntry entry;
+        entry.op_type = OpType::SEGMENT_MOUNT;
+        entry.tenant_id = "default";
+        entry.object_key = segment.name;
+        entry.payload.assign(bytes.begin(), bytes.end());
+        return entry;
+    };
+    ASSERT_TRUE(storage.CanWriteEntries({prepare(first)}));
+    ASSERT_TRUE(storage.CanWriteEntries({prepare(second)}));
+    ASSERT_FALSE(storage.CanWriteEntries({prepare(first), prepare(second)}));
+    auto result = service.ReMountSegment({first, second}, client);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    std::string name, endpoint;
+    auto& manager = MasterServiceTestPeer::SegmentManager(service);
+    EXPECT_FALSE(manager.GetSegmentBasicInfo(first.id, name, endpoint));
+    EXPECT_FALSE(manager.GetSegmentBasicInfo(second.id, name, endpoint));
+    EXPECT_FALSE(
+        MasterServiceTestPeer::ClientLivenessRecords(service).contains(client));
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(prefix.last_seq, 0u);
+    // Correcting size keeps count-cap bypass and atomic group recovery valid.
+    first.name = first.te_endpoint = "first";
+    second.name = second.te_endpoint = "second";
+    ASSERT_TRUE(service.ReMountSegment({first, second}, client));
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    EXPECT_EQ(batch.entries.size(), 2u);
+}
+
 TEST_F(MasterServiceHATest, InvalidRemountLogEntryRejectsTheWholeGroup) {
     const std::string cluster_id = "invalid_remount_log_entry";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();

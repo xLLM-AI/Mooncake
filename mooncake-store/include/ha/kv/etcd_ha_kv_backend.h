@@ -12,6 +12,7 @@ class EtcdHaKvBackend : public HaKvBackend {
                     size_t limit, std::vector<KvPair>& kvs) override;
     ErrorCode DeleteRange(std::string_view begin_key,
                           std::string_view end_key) override;
+    size_t transactionByteLimit() const override { return 32 * 1024 * 1024; }
     bool SupportsTxn() const override;
     ErrorCode Txn(const KvTxn& txn) override;
 };

@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -52,9 +53,14 @@ class TransferCancellation final {
         bool admitted;
     };
 
+    using Clock = std::chrono::steady_clock;
+    explicit TransferCancellation(
+        Clock::time_point deadline = Clock::time_point::max())
+        : deadline_(deadline) {}
+
     Admission acquireAdmission() {
         std::unique_lock<std::mutex> lock(mutex_);
-        return {std::move(lock), !cancelled_};
+        return {std::move(lock), !cancelled_ && Clock::now() < deadline_};
     }
     void cancel() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -62,12 +68,13 @@ class TransferCancellation final {
     }
     bool isCancelled() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return cancelled_;
+        return cancelled_ || Clock::now() >= deadline_;
     }
 
    private:
     mutable std::mutex mutex_;
     bool cancelled_ = false;
+    const Clock::time_point deadline_;
 };
 
 class RdmaEndPoint;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -46,6 +47,9 @@ class HaKvBackend {
     // Unsupported backends must return INVALID_PARAMS.
     virtual ErrorCode DeleteRange(std::string_view begin_key,
                                   std::string_view end_key) = 0;
+    virtual size_t transactionByteLimit() const {
+        return std::numeric_limits<size_t>::max();
+    }
     virtual bool SupportsTxn() const = 0;
     virtual ErrorCode Txn(const KvTxn& txn) = 0;
 };

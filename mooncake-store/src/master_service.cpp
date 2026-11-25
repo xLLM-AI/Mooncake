@@ -1150,6 +1150,8 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
             BuildSegmentMountOpLogEntry(segment, segment.te_endpoint);
         if (!prepared) return tl::make_unexpected(prepared.error());
         entry.emplace(std::move(*prepared));
+        if (!batch_oplog_storage_->CanWriteEntries({*entry}))
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         auto reserved = ReserveBatchOpLogSlot();
         if (!reserved) return tl::make_unexpected(reserved.error());
         reservation.emplace(std::move(reserved.value()));
@@ -1280,6 +1282,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             if (!prepared) return tl::make_unexpected(prepared.error());
             entries.push_back(std::move(*prepared));
         }
+        if (!batch_oplog_storage_->CanWriteEntries(entries))
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         auto reserved = ordered_oplog_writer_->ReserveBatch(
             segments.size(), /*allow_oversized_group=*/true);
         if (!reserved) return tl::make_unexpected(reserved.error());
@@ -3278,7 +3282,8 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
             entry->payload = std::string(bytes.begin(), bytes.end());
             // PrepareUnmountSegment destroys the allocator, so validating at
             // Commit would be too late to preserve state on a rejected entry.
-            if (!ValidateOpLogBatchEntry(*entry)) {
+            if (!ValidateOpLogBatchEntry(*entry) ||
+                !batch_oplog_storage_->CanWriteEntries({*entry})) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
         }
@@ -12285,6 +12290,15 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
     }
 
     OrderedOpLogWriterConfig writer_config;
+    const size_t envelope = storage->TransactionEnvelopeBytes();
+    if (envelope > storage->transactionByteLimit())
+        return ErrorCode::INVALID_PARAMS;
+    writer_config.max_transaction_bytes =
+        storage->transactionByteLimit() - envelope;
+    writer_config.entry_transaction_bytes =
+        [ptr = storage.get()](const OpLogEntry& entry) {
+            return ptr->EntryBytesUpperBound(entry);
+        };
     writer_config.max_entries_per_batch = oplog_batch_max_entries_;
     writer_config.initial_durable_prefix = durable_prefix;
     OpLogBatchStorage* storage_ptr = storage.get();

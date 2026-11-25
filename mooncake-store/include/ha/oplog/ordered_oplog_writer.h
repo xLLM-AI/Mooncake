@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -19,6 +20,8 @@ namespace mooncake {
 
 struct OrderedOpLogWriterConfig {
     size_t max_entries_per_batch{1024};
+    size_t max_transaction_bytes{std::numeric_limits<size_t>::max()};
+    std::function<size_t(const OpLogEntry&)> entry_transaction_bytes;
     DurablePrefix initial_durable_prefix{};
     std::chrono::milliseconds retry_timeout{0};
 };

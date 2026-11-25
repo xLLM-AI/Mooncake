@@ -13,6 +13,12 @@ class OpLogBatchStorage {
    public:
     OpLogBatchStorage(std::string cluster_id, HaKvBackend& backend);
 
+    // Conservative complete-transaction cost, including encoded payload,
+    // max-width sequencing metadata, prefix/fence and protobuf envelopes.
+    size_t EntryBytesUpperBound(const OpLogEntry& entry) const;
+    size_t TransactionEnvelopeBytes() const;
+    bool CanWriteEntries(const std::vector<OpLogEntry>& entries) const;
+    size_t transactionByteLimit() const { return transaction_byte_limit_; }
     ErrorCode InitDurablePrefix(DurablePrefix& prefix);
     ErrorCode ClaimProducerView(ViewVersionId producer_view_version);
     ErrorCode ValidateProducerView(ViewVersionId producer_view_version) const;
@@ -43,6 +49,7 @@ class OpLogBatchStorage {
     std::string cluster_id_;
     HaKvBackend& backend_;
     bool cluster_id_valid_{false};
+    size_t transaction_byte_limit_;
 };
 
 }  // namespace mooncake

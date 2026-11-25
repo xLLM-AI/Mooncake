@@ -3385,6 +3385,41 @@ TEST_F(AscendDirectTransportTest,
     EXPECT_EQ(adxl_mock::get_transfer_count(), 0);
 }
 
+TEST_F(AscendDirectTransportTest,
+       SyncAdmissionRejectsExpiredReadGrantDuringConnect) {
+    auto bootstrap = createTransport();
+    ASSERT_NE(bootstrap, nullptr);
+    TransferExecutorBase::InitParams params;
+    params.metadata = bootstrap->meta();
+    params.local_engine_device_ids = {0};
+    params.local_adxl_engine_names = {"leased-admission-local"};
+    params.local_engine_contexts = {ContextForDevice(0)};
+    SyncTransferExecutor executor(params);
+    ASSERT_EQ(executor.initialize(), 0);
+    auto owner = std::make_shared<Transport::BatchDesc>();
+    owner->cancellation = std::make_shared<TransferCancellation>(
+        TransferCancellation::Clock::now() + std::chrono::milliseconds(200));
+    Transport::Slice slice{};
+    slice.source_addr = test_buffer_src_;
+    slice.ascend_direct.dest_addr =
+        reinterpret_cast<uint64_t>(test_buffer_dst_);
+    slice.length = kTransferBufSize;
+    slice.work_references = std::make_shared<std::atomic<uint32_t>>(1);
+    slice.callback_batch_owner = owner;
+    bool connected = false;
+    adxl_mock::set_connect_hook([&] {
+        connected = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    });
+    const auto calls = adxl_mock::get_transfer_count();
+    EXPECT_NE(
+        executor.execute(0, "leased-admission-remote", adxl::READ, {&slice})
+            .ret,
+        0);
+    EXPECT_TRUE(connected);
+    EXPECT_EQ(adxl_mock::get_transfer_count(), calls);
+}
+
 TEST_F(AscendDirectTransportTest, SyncAdmissionRejectsRevocationDuringConnect) {
     auto bootstrap = createTransport();
     ASSERT_NE(bootstrap, nullptr);
